@@ -1,6 +1,6 @@
 # TLSServer
 
-A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every protocol layer — from the record framing and handshake state machine down to the elliptic-curve arithmetic and post-quantum key exchange — is written from scratch with zero external dependencies (except .NET's built-in AES-GCM and ChaCha20-Poly1305 AEAD primitives).
+A complete TLS 1.3 implementation in pure C# targeting .NET 7+ . Every protocol layer — from the record framing and handshake state machine down to the elliptic-curve arithmetic and post-quantum key exchange — is written from scratch with zero external dependencies (except .NET's built-in AES-GCM and ChaCha20-Poly1305 AEAD primitives).
 
 > **Note:** AI driven prompt project.
 
@@ -56,7 +56,7 @@ TLSServer.sln
 │   ├── SessionTicket.cs   # PSK resumption store
 │   ├── CertificateCompression.cs  # RFC 8879 (Brotli + Zstd)
 │   ├── KeyLogger.cs       # SSLKEYLOGFILE support
-│   ├── Zstd/              # Pure managed Zstandard implementation
+│   ├── Zstd/              # Pure managed Zstandard implementation (See : 'https://github.com/oleg-st/ZstdSharp')
 │   └── ...
 ├── TLSServer/            # Synchronous server application
 ├── TLSClient/            # Synchronous client application
