@@ -1,4 +1,4 @@
-# TLSServer
+# Open-TLS1.3
 
 A complete TLS 1.3 implementation in pure C# targeting .NET 7+ . Every protocol layer — from the record framing and handshake state machine down to the elliptic-curve arithmetic and post-quantum key exchange — is written from scratch with zero external dependencies (except .NET's built-in AES-GCM and ChaCha20-Poly1305 AEAD primitives).
 
