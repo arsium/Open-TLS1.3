@@ -7,6 +7,7 @@ public sealed class TlsStream : IDisposable
 {
     private readonly TlsConnection _conn;
     private readonly TcpClient _tcp;
+    private bool _disposed;
 
     internal TlsStream(TlsConnection conn, TcpClient tcp)
     {
@@ -73,7 +74,9 @@ public sealed class TlsStream : IDisposable
     /// <summary>Send close_notify alert and close the underlying TCP connection.</summary>
     public void Close()
     {
-        _conn.SendAlert(AlertLevel.Warning, AlertDescription.CloseNotify);
+        if (_disposed) return;
+        _disposed = true;
+        try { _conn.SendAlert(AlertLevel.Warning, AlertDescription.CloseNotify); } catch { }
         _tcp.Close();
     }
 
@@ -118,7 +121,9 @@ public sealed class TlsStream : IDisposable
     /// <summary>Send close_notify alert and close the underlying TCP connection asynchronously.</summary>
     public async Task CloseAsync(CancellationToken ct = default)
     {
-        await _conn.SendAlertAsync(AlertLevel.Warning, AlertDescription.CloseNotify, ct).ConfigureAwait(false);
+        if (_disposed) return;
+        _disposed = true;
+        try { await _conn.SendAlertAsync(AlertLevel.Warning, AlertDescription.CloseNotify, ct).ConfigureAwait(false); } catch { }
         _tcp.Close();
     }
 }

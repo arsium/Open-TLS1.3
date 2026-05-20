@@ -304,6 +304,206 @@ public static class CertificateUtils
     }
 
     // ================================================================
+    //  PEM Import
+    // ================================================================
+
+    /// <summary>Parse PEM text into labeled DER blocks.</summary>
+    public static List<(string label, byte[] data)> ParsePemBlocks(string pem)
+    {
+        var blocks = new List<(string, byte[])>();
+        int pos = 0;
+        while (pos < pem.Length)
+        {
+            int beginIdx = pem.IndexOf("-----BEGIN ", pos, StringComparison.Ordinal);
+            if (beginIdx < 0) break;
+            int labelStart = beginIdx + "-----BEGIN ".Length;
+            int labelEnd = pem.IndexOf("-----", labelStart, StringComparison.Ordinal);
+            if (labelEnd < 0) break;
+            string label = pem[labelStart..labelEnd];
+            int dataStart = labelEnd + 5;
+
+            string endMarker = $"-----END {label}-----";
+            int endIdx = pem.IndexOf(endMarker, dataStart, StringComparison.Ordinal);
+            if (endIdx < 0) break;
+
+            string base64 = pem[dataStart..endIdx]
+                .Replace("\r", "").Replace("\n", "").Replace(" ", "").Replace("\t", "");
+            blocks.Add((label, Convert.FromBase64String(base64)));
+            pos = endIdx + endMarker.Length;
+        }
+        return blocks;
+    }
+
+    /// <summary>Import all certificates from PEM text. Returns DER-encoded certificates.</summary>
+    public static byte[][] ImportPemCertificates(string pem)
+    {
+        var blocks = ParsePemBlocks(pem);
+        var certs = new List<byte[]>();
+        foreach (var (label, data) in blocks)
+        {
+            if (label == "CERTIFICATE")
+                certs.Add(data);
+            else if (label is "PKCS7" or "CMS")
+                certs.AddRange(Pkcs7.Import(data));
+        }
+        return certs.ToArray();
+    }
+
+    /// <summary>
+    /// Import a TlsCertificate from PEM text containing certificate(s) and a private key.
+    /// Accepts any combination of CERTIFICATE, PRIVATE KEY, RSA PRIVATE KEY, EC PRIVATE KEY blocks.
+    /// Chain certificates (second CERTIFICATE onward) are stored in ChainCertificates.
+    /// </summary>
+    public static TlsCertificate ImportPem(string pem)
+    {
+        var blocks = ParsePemBlocks(pem);
+
+        var certs = new List<byte[]>();
+        byte[]? privateKey = null;
+        byte[]? publicKey = null;
+        SignatureScheme sigAlg = default;
+
+        foreach (var (label, data) in blocks)
+        {
+            switch (label)
+            {
+                case "CERTIFICATE":
+                    certs.Add(data);
+                    break;
+                case "PKCS7":
+                case "CMS":
+                    certs.AddRange(Pkcs7.Import(data));
+                    break;
+                case "PRIVATE KEY":
+                    if (privateKey == null)
+                        (privateKey, publicKey, sigAlg) = ImportPkcs8Key(data);
+                    break;
+                case "RSA PRIVATE KEY":
+                    if (privateKey == null)
+                        (privateKey, publicKey, sigAlg) = ImportRsaPrivateKey(data);
+                    break;
+                case "EC PRIVATE KEY":
+                    if (privateKey == null)
+                        (privateKey, publicKey, sigAlg) = ImportEcPrivateKey(data);
+                    break;
+            }
+        }
+
+        if (certs.Count == 0 || privateKey == null || publicKey == null)
+            throw new TlsException(AlertDescription.InternalError,
+                "PEM must contain at least one CERTIFICATE and one private key block");
+
+        return new TlsCertificate
+        {
+            DerData = certs[0],
+            PrivateKey = privateKey,
+            PublicKey = publicKey,
+            SignatureAlgorithm = sigAlg,
+            ChainCertificates = certs.Count > 1 ? certs.Skip(1).ToArray() : null
+        };
+    }
+
+    /// <summary>Import a private key from PEM text. Auto-detects PKCS#8, PKCS#1 RSA, or EC format.</summary>
+    public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportPrivateKeyPem(string pem)
+    {
+        var blocks = ParsePemBlocks(pem);
+        foreach (var (label, data) in blocks)
+        {
+            switch (label)
+            {
+                case "PRIVATE KEY": return ImportPkcs8Key(data);
+                case "RSA PRIVATE KEY": return ImportRsaPrivateKey(data);
+                case "EC PRIVATE KEY": return ImportEcPrivateKey(data);
+            }
+        }
+        throw new TlsException(AlertDescription.InternalError,
+            "PEM does not contain a recognized private key block");
+    }
+
+    // ================================================================
+    //  Standalone Key Import (DER)
+    // ================================================================
+
+    /// <summary>Import a PKCS#8 (PrivateKeyInfo) private key from full DER bytes.</summary>
+    public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportPkcs8Key(byte[] der)
+    {
+        var (_, seqContent, _) = Asn1.ReadTlv(der);
+        return Pkcs12.ParsePkcs8Key(seqContent);
+    }
+
+    /// <summary>Import a PKCS#1 RSA private key (RSAPrivateKey) from DER bytes.</summary>
+    public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportRsaPrivateKey(byte[] der)
+    {
+        using var rsa = RSA.Create();
+        rsa.ImportRSAPrivateKey(der, out _);
+        byte[] pubKey = rsa.ExportRSAPublicKey();
+        return (der, pubKey, SignatureScheme.RsaPssRsaeSha256);
+    }
+
+    /// <summary>Import an EC private key (RFC 5915 ECPrivateKey) from DER bytes.</summary>
+    public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportEcPrivateKey(byte[] der)
+    {
+        var (_, seqContent, _) = Asn1.ReadTlv(der);
+        var items = Asn1.ReadSequenceItems(seqContent);
+
+        byte[] privKey = items[1].value; // OCTET STRING = raw D scalar
+        byte[]? pubKey = null;
+
+        // Look for [1] publicKey BIT STRING
+        for (int i = 2; i < items.Count; i++)
+        {
+            if (items[i].tag == 0xA1)
+            {
+                var (_, bitStringTlv, _) = Asn1.ReadTlv(items[i].value);
+                pubKey = bitStringTlv[1..]; // skip unused-bits byte
+                break;
+            }
+        }
+
+        // If public key not embedded, derive from private key
+        if (pubKey == null)
+        {
+            using var ecdsa = ECDsa.Create();
+            ecdsa.ImportECPrivateKey(der, out _);
+            var p = ecdsa.ExportParameters(false);
+            pubKey = new byte[1 + p.Q.X!.Length + p.Q.Y!.Length];
+            pubKey[0] = 0x04;
+            Buffer.BlockCopy(p.Q.X!, 0, pubKey, 1, p.Q.X!.Length);
+            Buffer.BlockCopy(p.Q.Y!, 0, pubKey, 1 + p.Q.X!.Length, p.Q.Y!.Length);
+        }
+
+        return (privKey, pubKey, SignatureScheme.EcdsaSecp256r1Sha256);
+    }
+
+    /// <summary>
+    /// Import a private key from DER bytes, auto-detecting the format.
+    /// Supports PKCS#8, PKCS#1 RSA, and RFC 5915 EC.
+    /// </summary>
+    public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportPrivateKeyDer(byte[] der)
+    {
+        var (_, seqContent, _) = Asn1.ReadTlv(der);
+        var items = Asn1.ReadSequenceItems(seqContent);
+
+        if (items.Count < 2)
+            throw new TlsException(AlertDescription.DecodeError, "Invalid private key DER");
+
+        // PKCS#8: version(0) + AlgorithmIdentifier(SEQUENCE) + OCTET STRING
+        if (items[0].tag == Asn1.TagInteger && items[1].tag == Asn1.TagSequence)
+            return ImportPkcs8Key(der);
+
+        // EC RFC 5915: version(1) + privateKey(OCTET STRING)
+        if (items[0].tag == Asn1.TagInteger && items[0].value.Length == 1 && items[0].value[0] == 1
+            && items[1].tag == Asn1.TagOctetString)
+            return ImportEcPrivateKey(der);
+
+        // PKCS#1 RSA: version(0) + modulus(INTEGER) + publicExponent(INTEGER) + ...
+        if (items[0].tag == Asn1.TagInteger && items[1].tag == Asn1.TagInteger)
+            return ImportRsaPrivateKey(der);
+
+        throw new TlsException(AlertDescription.DecodeError, "Unrecognized private key format");
+    }
+
+    // ================================================================
     //  Signature utilities (for CertificateVerify)
     // ================================================================
 
@@ -440,7 +640,9 @@ public static class CertificateUtils
                 if (tbsItems[i].tag == 0xA3) { extIdx = i; break; }
             if (extIdx < 0) return sans;
 
-            var extensions = Asn1.ReadSequenceItems(tbsItems[extIdx].value);
+            // Strip the outer Extensions SEQUENCE wrapper before iterating individual extensions
+            var (_, extSeqContent, _) = Asn1.ReadTlv(tbsItems[extIdx].value);
+            var extensions = Asn1.ReadSequenceItems(extSeqContent);
             byte[] sanOidTlv = Asn1.Oid(OidSubjectAltName);
 
             foreach (var (_, extSeqValue) in extensions)

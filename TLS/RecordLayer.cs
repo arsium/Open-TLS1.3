@@ -133,6 +133,67 @@ public sealed class RecordLayer
         _stream.Flush();
     }
 
+    /// <summary>
+    /// Try to read and decrypt a record. Returns null if AEAD decryption fails
+    /// (used for trial decryption to skip rejected 0-RTT early data per RFC 8446 §4.2.10).
+    /// On failure, the cipher sequence number is NOT advanced.
+    /// CCS records are returned as-is (no decryption attempted).
+    /// </summary>
+    public (ContentType type, byte[] payload)? TryReadRecord()
+    {
+        byte[] header = BinaryHelper.ReadExact(_stream, 5);
+        var outerType = (ContentType)header[0];
+        ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
+
+        if (length > TlsConst.MaxCiphertextLength)
+            throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
+
+        byte[] payload = BinaryHelper.ReadExact(_stream, length);
+
+        if (_readCipher != null && outerType == ContentType.ApplicationData)
+        {
+            if (!_readCipher.TryDecrypt(payload, header, out byte[]? plaintext))
+                return null;
+
+            int end = plaintext!.Length - 1;
+            while (end >= 0 && plaintext[end] == 0) end--;
+            if (end < 0) return null;
+
+            byte rawType = plaintext[end];
+            return ((ContentType)rawType, plaintext[..end]);
+        }
+
+        return (outerType, payload);
+    }
+
+    /// <summary>Async version of TryReadRecord for trial decryption.</summary>
+    public async Task<(ContentType type, byte[] payload)?> TryReadRecordAsync(CancellationToken ct = default)
+    {
+        byte[] header = await BinaryHelper.ReadExactAsync(_stream, 5, ct).ConfigureAwait(false);
+        var outerType = (ContentType)header[0];
+        ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
+
+        if (length > TlsConst.MaxCiphertextLength)
+            throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
+
+        byte[] payload = await BinaryHelper.ReadExactAsync(_stream, length, ct).ConfigureAwait(false);
+
+        if (_readCipher != null && outerType == ContentType.ApplicationData)
+        {
+            if (!_readCipher.TryDecrypt(payload, header, out byte[]? plaintext))
+                return null;
+
+            int end = plaintext!.Length - 1;
+            while (end >= 0 && plaintext[end] == 0) end--;
+            if (end < 0) return null;
+
+            byte rawType = plaintext[end];
+            return ((ContentType)rawType, plaintext[..end]);
+        }
+
+        return (outerType, payload);
+    }
+
     // ================================================================
     //  Async methods
     // ================================================================

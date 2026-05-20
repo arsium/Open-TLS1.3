@@ -34,6 +34,9 @@ public sealed class TlsConnection
     private bool _sentCcs;
     private bool _closed;
 
+    // Write-side thread safety (protects all record writes post-handshake)
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
     public bool IsHandshakeComplete { get; private set; }
 
     /// <summary>DER-encoded peer certificate (server cert on client side, client cert on server side).</summary>
@@ -247,6 +250,7 @@ public sealed class TlsConnection
         {
             byte[] chHash = _transcript.GetHash();
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
+            if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
             _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
 
@@ -792,6 +796,7 @@ public sealed class TlsConnection
                 var earlyTranscript = new TranscriptHash(_keySchedule.HashAlgorithm);
                 earlyTranscript.Update(chMsg);
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
+                if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
                 _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
 
@@ -803,7 +808,7 @@ public sealed class TlsConnection
                     var (type, payload) = _record.ReadRecord();
                     if (type == ContentType.ApplicationData)
                     {
-                        if (earlyBuf.Length <= pskMaxEarlyData)
+                        if (earlyBuf.Length + payload.Length <= pskMaxEarlyData)
                             earlyBuf.Write(payload);
                         // If over limit, discard but keep reading until EndOfEarlyData
                     }
@@ -823,6 +828,33 @@ public sealed class TlsConnection
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
             _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+
+            // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
+            // When the client offered early_data but we rejected it, the client may have
+            // already sent early data records (encrypted under early keys). We use trial
+            // decryption with the handshake key: records that fail AEAD are early data to discard;
+            // the first record that succeeds is the start of handshake messages.
+            if (!accept0Rtt && ch.OffersEarlyData)
+            {
+                long skipped = 0;
+                while (skipped < _maxEarlyDataSize + TlsConst.MaxCiphertextLength)
+                {
+                    var result = _record.TryReadRecord();
+                    if (result == null)
+                    {
+                        skipped += TlsConst.MaxCiphertextLength; // conservative bound
+                        continue;
+                    }
+                    var (type, payload) = result.Value;
+                    if (type == ContentType.ChangeCipherSpec) continue;
+                    if (type == ContentType.Handshake)
+                    {
+                        foreach (var m in HandshakeMessages.SplitMessages(payload))
+                            _hsBuffer.Enqueue(m);
+                    }
+                    break;
+                }
+            }
 
             // 16. Receive EndOfEarlyData from buffer (already read under early keys)
             if (accept0Rtt)
@@ -978,10 +1010,15 @@ public sealed class TlsConnection
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
 
-        byte[] context = RandomNumberGenerator.GetBytes(16);
-        _pendingPostHsContext = context;
-        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
-        _record.WriteRecord(ContentType.Handshake, crMsg);
+        _writeLock.Wait();
+        try
+        {
+            byte[] context = RandomNumberGenerator.GetBytes(16);
+            _pendingPostHsContext = context;
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
+            _record.WriteRecord(ContentType.Handshake, crMsg);
+        }
+        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1048,43 +1085,55 @@ public sealed class TlsConnection
         return ReadAppData();
     }
 
-    /// <summary>Write application data (fragments automatically at 16 KiB).</summary>
+    /// <summary>Write application data (fragments automatically at 16 KiB). Thread-safe.</summary>
     public void Write(byte[] data, int offset, int count)
     {
-        int pos = offset;
-        int end = offset + count;
-        while (pos < end)
+        _writeLock.Wait();
+        try
         {
-            int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
-            _record.WriteRecord(ContentType.ApplicationData, data[pos..(pos + chunk)]);
-            pos += chunk;
+            int pos = offset;
+            int end = offset + count;
+            while (pos < end)
+            {
+                int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
+                _record.WriteRecord(ContentType.ApplicationData, data[pos..(pos + chunk)]);
+                pos += chunk;
+            }
         }
+        finally { _writeLock.Release(); }
     }
 
     public void SendAlert(AlertLevel level, AlertDescription desc)
     {
+        _writeLock.Wait();
         try { _record.WriteRecord(ContentType.Alert, new[] { (byte)level, (byte)desc }); }
         catch { /* best-effort on close */ }
+        finally { _writeLock.Release(); }
     }
 
-    /// <summary>Send a KeyUpdate message and rotate our write key.</summary>
+    /// <summary>Send a KeyUpdate message and rotate our write key. Thread-safe.</summary>
     public void SendKeyUpdate(bool requestUpdate)
     {
-        byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
-        _record.WriteRecord(ContentType.Handshake, kuMsg);
-
-        if (_isServer)
+        _writeLock.Wait();
+        try
         {
-            _keySchedule!.UpdateServerAppTrafficSecret();
-            var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
-        }
+            byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
+            _record.WriteRecord(ContentType.Handshake, kuMsg);
+
+            if (_isServer)
+            {
+                _keySchedule!.UpdateServerAppTrafficSecret();
+                var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            }
         else
         {
             _keySchedule!.UpdateClientAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
             _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
         }
+        }
+        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1604,16 +1653,16 @@ public sealed class TlsConnection
 
     private void HandleAlert(byte[] data)
     {
-        if (data.Length >= 2)
+        if (data.Length < 2)
+            throw new TlsException(AlertDescription.DecodeError, "Malformed alert record (too short)");
+
+        var desc = (AlertDescription)data[1];
+        if (desc == AlertDescription.CloseNotify)
         {
-            var desc = (AlertDescription)data[1];
-            if (desc == AlertDescription.CloseNotify)
-            {
-                _closed = true;
-                return;
-            }
-            throw new TlsException(desc, $"Received alert: {(AlertLevel)data[0]} {desc}");
+            _closed = true;
+            return;
         }
+        throw new TlsException(desc, $"Received alert: {(AlertLevel)data[0]} {desc}");
     }
 
     [DoesNotReturn]
@@ -1706,8 +1755,10 @@ public sealed class TlsConnection
 
     internal async Task SendAlertAsync(AlertLevel level, AlertDescription desc, CancellationToken ct = default)
     {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try { await _record.WriteRecordAsync(ContentType.Alert, new[] { (byte)level, (byte)desc }, ct).ConfigureAwait(false); }
         catch { /* best-effort on close */ }
+        finally { _writeLock.Release(); }
     }
 
     private async Task SendNewSessionTicketAsync(CancellationToken ct = default)
@@ -1770,37 +1821,47 @@ public sealed class TlsConnection
         return await ReadAppDataAsync(ct).ConfigureAwait(false);
     }
 
-    /// <summary>Write application data asynchronously (fragments automatically at 16 KiB).</summary>
+    /// <summary>Write application data asynchronously (fragments automatically at 16 KiB). Thread-safe.</summary>
     public async Task WriteAsync(byte[] data, int offset, int count, CancellationToken ct = default)
     {
-        int pos = offset;
-        int end = offset + count;
-        while (pos < end)
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
-            await _record.WriteRecordAsync(ContentType.ApplicationData, data[pos..(pos + chunk)], ct).ConfigureAwait(false);
-            pos += chunk;
+            int pos = offset;
+            int end = offset + count;
+            while (pos < end)
+            {
+                int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
+                await _record.WriteRecordAsync(ContentType.ApplicationData, data[pos..(pos + chunk)], ct).ConfigureAwait(false);
+                pos += chunk;
+            }
         }
+        finally { _writeLock.Release(); }
     }
 
-    /// <summary>Send a KeyUpdate message asynchronously and rotate our write key.</summary>
+    /// <summary>Send a KeyUpdate message asynchronously and rotate our write key. Thread-safe.</summary>
     public async Task SendKeyUpdateAsync(bool requestUpdate, CancellationToken ct = default)
     {
-        byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
-        await _record.WriteRecordAsync(ContentType.Handshake, kuMsg, ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
+            await _record.WriteRecordAsync(ContentType.Handshake, kuMsg, ct).ConfigureAwait(false);
 
-        if (_isServer)
-        {
-            _keySchedule!.UpdateServerAppTrafficSecret();
-            var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            if (_isServer)
+            {
+                _keySchedule!.UpdateServerAppTrafficSecret();
+                var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            }
+            else
+            {
+                _keySchedule!.UpdateClientAppTrafficSecret();
+                var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            }
         }
-        else
-        {
-            _keySchedule!.UpdateClientAppTrafficSecret();
-            var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
-        }
+        finally { _writeLock.Release(); }
     }
 
     /// <summary>Server: request client authentication post-handshake (async).</summary>
@@ -1809,10 +1870,15 @@ public sealed class TlsConnection
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
 
-        byte[] context = RandomNumberGenerator.GetBytes(16);
-        _pendingPostHsContext = context;
-        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
-        await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            byte[] context = RandomNumberGenerator.GetBytes(16);
+            _pendingPostHsContext = context;
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
+            await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
+        }
+        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1905,6 +1971,7 @@ public sealed class TlsConnection
         {
             byte[] chHash = _transcript.GetHash();
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
+            if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
             _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
 
@@ -2427,6 +2494,7 @@ public sealed class TlsConnection
                 var earlyTranscript = new TranscriptHash(_keySchedule.HashAlgorithm);
                 earlyTranscript.Update(chMsg);
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
+                if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
                 _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
 
@@ -2437,7 +2505,7 @@ public sealed class TlsConnection
                     var (type, payload) = await _record.ReadRecordAsync(ct).ConfigureAwait(false);
                     if (type == ContentType.ApplicationData)
                     {
-                        if (earlyBuf.Length <= pskMaxEarlyData)
+                        if (earlyBuf.Length + payload.Length <= pskMaxEarlyData)
                             earlyBuf.Write(payload);
                     }
                     else if (type == ContentType.Handshake)
@@ -2456,6 +2524,29 @@ public sealed class TlsConnection
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
             _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+
+            // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
+            if (!accept0Rtt && ch.OffersEarlyData)
+            {
+                long skipped = 0;
+                while (skipped < _maxEarlyDataSize + TlsConst.MaxCiphertextLength)
+                {
+                    var result = await _record.TryReadRecordAsync(ct).ConfigureAwait(false);
+                    if (result == null)
+                    {
+                        skipped += TlsConst.MaxCiphertextLength;
+                        continue;
+                    }
+                    var (type, payload) = result.Value;
+                    if (type == ContentType.ChangeCipherSpec) continue;
+                    if (type == ContentType.Handshake)
+                    {
+                        foreach (var m in HandshakeMessages.SplitMessages(payload))
+                            _hsBuffer.Enqueue(m);
+                    }
+                    break;
+                }
+            }
 
             // 16. EndOfEarlyData
             if (accept0Rtt)

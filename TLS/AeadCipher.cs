@@ -72,6 +72,40 @@ public sealed class AeadCipher : IDisposable
         return plaintext;
     }
 
+    /// <summary>Try to decrypt; returns false (without advancing seqNum) on authentication failure.</summary>
+    public bool TryDecrypt(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, out byte[]? plaintext)
+    {
+        int ctLen = encrypted.Length - TlsConst.AeadTagLength;
+        if (ctLen < 0) { plaintext = null; return false; }
+
+        byte[] nonce = BuildNonce();
+        var ciphertext = encrypted[..ctLen];
+        var tag = encrypted[ctLen..];
+        byte[] buf = new byte[ctLen];
+
+        try
+        {
+            if (_isChaCha20)
+            {
+                using var chacha = new ChaCha20Poly1305(_key);
+                chacha.Decrypt(nonce, ciphertext, tag, buf, aad);
+            }
+            else
+            {
+                using var aes = new AesGcm(_key, TlsConst.AeadTagLength);
+                aes.Decrypt(nonce, ciphertext, tag, buf, aad);
+            }
+            _seqNum++;
+            plaintext = buf;
+            return true;
+        }
+        catch (CryptographicException)
+        {
+            plaintext = null;
+            return false;
+        }
+    }
+
     /// <summary>nonce = IV XOR padded_sequence_number</summary>
     private byte[] BuildNonce()
     {

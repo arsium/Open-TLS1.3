@@ -55,26 +55,30 @@ public sealed class TlsServer : IDisposable
             throw new InvalidOperationException("Call Listen() first");
 
         var tcp = _listener.AcceptTcpClient();
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+        try
+        {
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: true, _certificate,
-            requireClientCert: RequireClientCertificate, caCertificate: CaCertificate);
+            var conn = new TlsConnection(stream, isServer: true, _certificate,
+                requireClientCert: RequireClientCertificate, caCertificate: CaCertificate);
 
-        if (TicketEncryption != null)
-            conn.EnableServerTickets(TicketEncryption, Accept0Rtt, MaxEarlyDataSize);
-        if (AlpnProtocols != null)
-            conn.SetAlpnProtocols(AlpnProtocols);
-        if (UseCertificateCompression)
-            conn.EnableCertificateCompression();
-        if (PaddingBlockSize > 0)
-            conn.PaddingBlockSize = PaddingBlockSize;
+            if (TicketEncryption != null)
+                conn.EnableServerTickets(TicketEncryption, Accept0Rtt, MaxEarlyDataSize);
+            if (AlpnProtocols != null)
+                conn.SetAlpnProtocols(AlpnProtocols);
+            if (UseCertificateCompression)
+                conn.EnableCertificateCompression();
+            if (PaddingBlockSize > 0)
+                conn.PaddingBlockSize = PaddingBlockSize;
 
-        conn.HandshakeAsServer();
+            conn.HandshakeAsServer();
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     /// <summary>Accept one TCP connection asynchronously, perform the TLS handshake, return an encrypted stream.</summary>
@@ -84,26 +88,30 @@ public sealed class TlsServer : IDisposable
             throw new InvalidOperationException("Call Listen() first");
 
         var tcp = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+        try
+        {
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: true, _certificate,
-            requireClientCert: RequireClientCertificate, caCertificate: CaCertificate);
+            var conn = new TlsConnection(stream, isServer: true, _certificate,
+                requireClientCert: RequireClientCertificate, caCertificate: CaCertificate);
 
-        if (TicketEncryption != null)
-            conn.EnableServerTickets(TicketEncryption, Accept0Rtt, MaxEarlyDataSize);
-        if (AlpnProtocols != null)
-            conn.SetAlpnProtocols(AlpnProtocols);
-        if (UseCertificateCompression)
-            conn.EnableCertificateCompression();
-        if (PaddingBlockSize > 0)
-            conn.PaddingBlockSize = PaddingBlockSize;
+            if (TicketEncryption != null)
+                conn.EnableServerTickets(TicketEncryption, Accept0Rtt, MaxEarlyDataSize);
+            if (AlpnProtocols != null)
+                conn.SetAlpnProtocols(AlpnProtocols);
+            if (UseCertificateCompression)
+                conn.EnableCertificateCompression();
+            if (PaddingBlockSize > 0)
+                conn.PaddingBlockSize = PaddingBlockSize;
 
-        await conn.HandshakeAsServerAsync(ct).ConfigureAwait(false);
+            await conn.HandshakeAsServerAsync(ct).ConfigureAwait(false);
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     public void Stop() => _listener?.Stop();

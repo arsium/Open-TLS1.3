@@ -27,6 +27,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)TlsServer.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)TlsStream.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Pkcs12.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Pkcs7.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)SessionTicket.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)MlKem768.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)EcdhP384.cs" />

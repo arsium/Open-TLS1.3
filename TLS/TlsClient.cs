@@ -25,19 +25,23 @@ public sealed class TlsClient
     public TlsStream Connect(string host, int port, byte[]? earlyData = null)
     {
         var tcp = new TcpClient();
-        tcp.Connect(host, port);
+        try
+        {
+            tcp.Connect(host, port);
 
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: false);
-        ConfigureConnection(conn, host);
-        if (earlyData != null) conn.SetEarlyData(earlyData);
-        conn.HandshakeAsClient(host);
+            var conn = new TlsConnection(stream, isServer: false);
+            ConfigureConnection(conn, host);
+            if (earlyData != null) conn.SetEarlyData(earlyData);
+            conn.HandshakeAsClient(host);
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     /// <summary>
@@ -47,19 +51,23 @@ public sealed class TlsClient
     public TlsStream Connect(string host, int port, TlsCertificate clientCertificate, byte[]? earlyData = null)
     {
         var tcp = new TcpClient();
-        tcp.Connect(host, port);
+        try
+        {
+            tcp.Connect(host, port);
 
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: false, certificate: clientCertificate);
-        ConfigureConnection(conn, host);
-        if (earlyData != null) conn.SetEarlyData(earlyData);
-        conn.HandshakeAsClient(host);
+            var conn = new TlsConnection(stream, isServer: false, certificate: clientCertificate);
+            ConfigureConnection(conn, host);
+            if (earlyData != null) conn.SetEarlyData(earlyData);
+            conn.HandshakeAsClient(host);
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     // ================================================================
@@ -73,19 +81,23 @@ public sealed class TlsClient
     public async Task<TlsStream> ConnectAsync(string host, int port, byte[]? earlyData = null, CancellationToken ct = default)
     {
         var tcp = new TcpClient();
-        await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
+        try
+        {
+            await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
 
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: false);
-        ConfigureConnection(conn, host);
-        if (earlyData != null) conn.SetEarlyData(earlyData);
-        await conn.HandshakeAsClientAsync(host, ct).ConfigureAwait(false);
+            var conn = new TlsConnection(stream, isServer: false);
+            ConfigureConnection(conn, host);
+            if (earlyData != null) conn.SetEarlyData(earlyData);
+            await conn.HandshakeAsClientAsync(host, ct).ConfigureAwait(false);
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     /// <summary>
@@ -94,19 +106,23 @@ public sealed class TlsClient
     public async Task<TlsStream> ConnectAsync(string host, int port, TlsCertificate clientCertificate, byte[]? earlyData = null, CancellationToken ct = default)
     {
         var tcp = new TcpClient();
-        await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
+        try
+        {
+            await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
 
-        var stream = tcp.GetStream();
-        int origTimeout = stream.ReadTimeout;
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
+            var stream = tcp.GetStream();
+            int origTimeout = stream.ReadTimeout;
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = HandshakeTimeoutMs;
 
-        var conn = new TlsConnection(stream, isServer: false, certificate: clientCertificate);
-        ConfigureConnection(conn, host);
-        if (earlyData != null) conn.SetEarlyData(earlyData);
-        await conn.HandshakeAsClientAsync(host, ct).ConfigureAwait(false);
+            var conn = new TlsConnection(stream, isServer: false, certificate: clientCertificate);
+            ConfigureConnection(conn, host);
+            if (earlyData != null) conn.SetEarlyData(earlyData);
+            await conn.HandshakeAsClientAsync(host, ct).ConfigureAwait(false);
 
-        if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
-        return new TlsStream(conn, tcp);
+            if (HandshakeTimeoutMs > 0) stream.ReadTimeout = origTimeout;
+            return new TlsStream(conn, tcp);
+        }
+        catch { tcp.Dispose(); throw; }
     }
 
     private void ConfigureConnection(TlsConnection conn, string host)

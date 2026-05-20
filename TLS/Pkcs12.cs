@@ -319,7 +319,7 @@ public static class Pkcs12
     }
 
     /// <summary>Parse a PKCS#8 key — auto-detects EC vs RSA from the AlgorithmIdentifier.</summary>
-    private static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ParsePkcs8Key(byte[] pkcs8)
+    internal static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ParsePkcs8Key(byte[] pkcs8)
     {
         var items = Asn1.ReadSequenceItems(pkcs8);
         // items[1] = AlgorithmIdentifier SEQUENCE
@@ -347,7 +347,21 @@ public static class Pkcs12
                 }
             }
             if (pubKey == null)
-                throw new TlsException(AlertDescription.InternalError, "EC key missing public key in PFX");
+            {
+                // Derive public key from D scalar — rebuild ECPrivateKey with curve for .NET import
+                byte[] ecKeyWithCurve = Asn1.Sequence(
+                    Asn1.Integer(1),
+                    Asn1.OctetString(privKey),
+                    Asn1.Explicit(0, Asn1.Oid(OidSecp256r1))
+                );
+                using var ecdsa = System.Security.Cryptography.ECDsa.Create();
+                ecdsa.ImportECPrivateKey(ecKeyWithCurve, out _);
+                var p = ecdsa.ExportParameters(false);
+                pubKey = new byte[1 + p.Q.X!.Length + p.Q.Y!.Length];
+                pubKey[0] = 0x04;
+                Buffer.BlockCopy(p.Q.X!, 0, pubKey, 1, p.Q.X!.Length);
+                Buffer.BlockCopy(p.Q.Y!, 0, pubKey, 1 + p.Q.X!.Length, p.Q.Y!.Length);
+            }
 
             return (privKey, pubKey, SignatureScheme.EcdsaSecp256r1Sha256);
         }
