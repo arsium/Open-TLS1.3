@@ -58,10 +58,19 @@ public sealed class SessionTicketStore
     }
 }
 
-/// <summary>Server-side ticket encryption/decryption using AES-256-GCM, with 0-RTT anti-replay.</summary>
+/// <summary>Server-side ticket encryption/decryption using AES-256-GCM, with 0-RTT anti-replay and key rotation.</summary>
 public sealed class TicketEncryption
 {
-    private readonly byte[] _key;
+    private sealed class KeyEntry
+    {
+        public uint KeyId { get; init; }
+        public byte[] Key { get; init; } = null!;
+        public DateTime CreatedAt { get; init; }
+    }
+
+    private readonly List<KeyEntry> _keys = new();
+    private readonly object _keyLock = new();
+    private uint _nextKeyId;
 
     // Anti-replay: track used ticket hashes for 0-RTT single-use enforcement (RFC 8446 §8)
     private readonly Dictionary<string, DateTime> _usedTickets = new();
@@ -69,7 +78,31 @@ public sealed class TicketEncryption
 
     public TicketEncryption(byte[]? key = null)
     {
-        _key = key ?? RandomNumberGenerator.GetBytes(32);
+        byte[] k = key ?? RandomNumberGenerator.GetBytes(32);
+        _keys.Add(new KeyEntry { KeyId = 0, Key = k, CreatedAt = DateTime.UtcNow });
+        _nextKeyId = 1;
+    }
+
+    /// <summary>Generate a new encryption key. Old keys are retained for decrypting existing tickets.</summary>
+    public void RotateKey(byte[]? newKey = null)
+    {
+        lock (_keyLock)
+        {
+            byte[] k = newKey ?? RandomNumberGenerator.GetBytes(32);
+            _keys.Add(new KeyEntry { KeyId = _nextKeyId++, Key = k, CreatedAt = DateTime.UtcNow });
+        }
+    }
+
+    /// <summary>Remove keys older than the given duration. The current (newest) key is never removed.</summary>
+    public void PurgeOldKeys(TimeSpan maxAge)
+    {
+        lock (_keyLock)
+        {
+            if (_keys.Count <= 1) return;
+            var cutoff = DateTime.UtcNow - maxAge;
+            var current = _keys[^1];
+            _keys.RemoveAll(k => k.CreatedAt < cutoff && k != current);
+        }
     }
 
     /// <summary>
@@ -99,37 +132,48 @@ public sealed class TicketEncryption
         _lastCleanup = DateTime.UtcNow;
     }
 
-    /// <summary>Seal ticket plaintext into an encrypted blob (IV prepended).</summary>
+    /// <summary>Seal ticket plaintext into an encrypted blob: keyId(4) || IV(12) || ciphertext || tag(16).</summary>
     public byte[] Seal(byte[] plaintext)
     {
+        KeyEntry current;
+        lock (_keyLock) { current = _keys[^1]; }
+
         byte[] iv = RandomNumberGenerator.GetBytes(12);
         byte[] ciphertext = new byte[plaintext.Length];
         byte[] tag = new byte[16];
 
-        using var aes = new AesGcm(_key, 16);
+        using var aes = new AesGcm(current.Key, 16);
         aes.Encrypt(iv, plaintext, ciphertext, tag);
 
-        // IV(12) + ciphertext + tag(16)
-        byte[] result = new byte[12 + ciphertext.Length + 16];
-        Buffer.BlockCopy(iv, 0, result, 0, 12);
-        Buffer.BlockCopy(ciphertext, 0, result, 12, ciphertext.Length);
-        Buffer.BlockCopy(tag, 0, result, 12 + ciphertext.Length, 16);
+        byte[] result = new byte[4 + 12 + ciphertext.Length + 16];
+        result[0] = (byte)(current.KeyId >> 24);
+        result[1] = (byte)(current.KeyId >> 16);
+        result[2] = (byte)(current.KeyId >> 8);
+        result[3] = (byte)current.KeyId;
+        Buffer.BlockCopy(iv, 0, result, 4, 12);
+        Buffer.BlockCopy(ciphertext, 0, result, 16, ciphertext.Length);
+        Buffer.BlockCopy(tag, 0, result, 16 + ciphertext.Length, 16);
         return result;
     }
 
-    /// <summary>Open an encrypted ticket blob. Returns null if decryption fails.</summary>
+    /// <summary>Open an encrypted ticket blob. Returns null if decryption fails or key was rotated away.</summary>
     public byte[]? Open(byte[] blob)
     {
-        if (blob.Length < 12 + 16) return null;
+        if (blob.Length < 4 + 12 + 16) return null;
 
-        byte[] iv = blob[..12];
-        byte[] ciphertext = blob[12..^16];
+        uint keyId = BinaryHelper.ReadUInt32(blob.AsSpan(0));
+        KeyEntry? entry;
+        lock (_keyLock) { entry = _keys.Find(k => k.KeyId == keyId); }
+        if (entry == null) return null;
+
+        byte[] iv = blob[4..16];
+        byte[] ciphertext = blob[16..^16];
         byte[] tag = blob[^16..];
         byte[] plaintext = new byte[ciphertext.Length];
 
         try
         {
-            using var aes = new AesGcm(_key, 16);
+            using var aes = new AesGcm(entry.Key, 16);
             aes.Decrypt(iv, ciphertext, tag, plaintext);
             return plaintext;
         }

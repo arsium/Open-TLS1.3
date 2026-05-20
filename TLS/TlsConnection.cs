@@ -107,9 +107,14 @@ public sealed class TlsConnection
     private uint _maxEarlyDataSize;
 
     // Post-handshake auth
+    private PostHsAuthState _postHsAuthState = PostHsAuthState.None;
     private byte[]? _pendingPostHsContext;
     private byte[]? _serverFinishedHash; // Transcript-Hash(CH..SF), used for DeriveAppSecrets
     private byte[]? _postHandshakeBaseHash; // Transcript-Hash(CH..CF), used for post-handshake auth context (RFC 8446 §4.4.1)
+
+    // OCSP stapling
+    private bool _requestOcspStapling;  // client: request status_request extension
+    private byte[]? _ocspResponse;      // server: OCSP response to staple
 
     public TlsConnection(Stream stream, bool isServer, TlsCertificate? certificate = null,
         bool requireClientCert = false, TlsCertificate? caCertificate = null)
@@ -142,6 +147,15 @@ public sealed class TlsConnection
 
     /// <summary>Enable certificate compression (server-side, uses brotli).</summary>
     public void EnableCertificateCompression() => _useCertCompression = true;
+
+    /// <summary>Request OCSP stapling from the server (client-side). Must be called before handshake.</summary>
+    public void RequestOcspStapling() => _requestOcspStapling = true;
+
+    /// <summary>Set the OCSP response to staple in the Certificate message (server-side).</summary>
+    public void SetOcspResponse(byte[] response) => _ocspResponse = response;
+
+    /// <summary>OCSP response received from the server's Certificate message (client-side, null if not stapled).</summary>
+    public byte[]? PeerOcspResponse { get; private set; }
 
     // ================================================================
     //  Exporter Interface (RFC 8446 §7.5)
@@ -221,7 +235,8 @@ public sealed class TlsConnection
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
-                offer0Rtt, serverName, alpnProtocols: _alpnProtocols);
+                offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
+                requestOcspStapling: _requestOcspStapling);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -239,7 +254,7 @@ public sealed class TlsConnection
         else
         {
             chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                serverName, alpnProtocols: _alpnProtocols);
+                serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
         }
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
@@ -345,7 +360,8 @@ public sealed class TlsConnection
                 ch2Msg = HandshakeMessages.BuildClientHelloWithPsk(
                     clientRandom, sessionId, suites, keyShares,
                     _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
-                    false, serverName, sh.Cookie, _alpnProtocols); // no 0-RTT after HRR
+                    false, serverName, sh.Cookie, _alpnProtocols,
+                    requestOcspStapling: _requestOcspStapling); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -359,7 +375,8 @@ public sealed class TlsConnection
             else
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
-                    clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols);
+                    clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
+                    requestOcspStapling: _requestOcspStapling);
             }
             _record.WriteRecord(ContentType.Handshake, ch2Msg);
             _transcript.Update(ch2Msg);
@@ -492,11 +509,13 @@ public sealed class TlsConnection
         {
             (_, certBody) = HandshakeMessages.Unframe(nextMsg);
         }
-        var (_, serverCerts) = HandshakeMessages.ParseCertificateEx(certBody);
-        if (serverCerts.Count == 0)
+        var (_, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        if (serverCertEntries.Count == 0)
             AlertAndThrow(AlertDescription.CertificateRequired, "Server sent empty certificate");
-        byte[] serverCertDer = serverCerts[0];
+        byte[] serverCertDer = serverCertEntries[0].CertDer;
         PeerCertificateData = serverCertDer;
+        if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
+            PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
 
         // 12. CertificateVerify
@@ -892,8 +911,9 @@ public sealed class TlsConnection
             _transcript.Update(crMsg);
         }
 
-        // 15. Certificate (with chain, optionally compressed)
-        byte[] certMsg = HandshakeMessages.BuildCertificate(_certificate.DerData, _certificate.ChainCertificates);
+        // 15. Certificate (with chain, optionally compressed, optionally OCSP-stapled)
+        byte[]? stapleResponse = (ch.RequestsOcspStapling && _ocspResponse != null) ? _ocspResponse : null;
+        byte[] certMsg = HandshakeMessages.BuildCertificate(_certificate.DerData, _certificate.ChainCertificates, stapleResponse);
         if (certCompAlg != 0)
         {
             byte[] compMsg = HandshakeMessages.BuildCompressedCertificate(certMsg, certCompAlg);
@@ -937,11 +957,11 @@ public sealed class TlsConnection
             byte[] clientCertMsg = NextHandshake(HandshakeType.Certificate);
             _transcript.Update(clientCertMsg);
             var (_, clientCertBody) = HandshakeMessages.Unframe(clientCertMsg);
-            var (_, clientCerts) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
 
-            if (clientCerts.Count > 0)
+            if (clientCertEntries.Count > 0)
             {
-                byte[] clientCertDer = clientCerts[0];
+                byte[] clientCertDer = clientCertEntries[0].CertDer;
                 PeerCertificateData = clientCertDer;
 
                 if (_caCertificate != null)
@@ -1009,6 +1029,8 @@ public sealed class TlsConnection
     {
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
+        if (_postHsAuthState != PostHsAuthState.None)
+            throw new InvalidOperationException("A post-handshake auth flow is already in progress");
 
         _writeLock.Wait();
         try
@@ -1017,6 +1039,7 @@ public sealed class TlsConnection
             _pendingPostHsContext = context;
             byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
             _record.WriteRecord(ContentType.Handshake, crMsg);
+            _postHsAuthState = PostHsAuthState.AwaitingCertificate;
         }
         finally { _writeLock.Release(); }
     }
@@ -1040,7 +1063,9 @@ public sealed class TlsConnection
         byte[] ticket = _ticketEncryption.Seal(plaintext);
 
         byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
-        _record.WriteRecord(ContentType.Handshake, nstMsg);
+        _writeLock.Wait();
+        try { _record.WriteRecord(ContentType.Handshake, nstMsg); }
+        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1274,48 +1299,75 @@ public sealed class TlsConnection
 
     private void HandlePostHandshakeCert(byte[] fullMsg)
     {
-        if (!_isServer || _pendingPostHsContext == null) return;
+        if (!_isServer)
+            AlertAndThrow(AlertDescription.UnexpectedMessage, "Client received unexpected post-handshake Certificate");
+        if (_postHsAuthState != PostHsAuthState.AwaitingCertificate)
+            AlertAndThrow(AlertDescription.UnexpectedMessage, "Unexpected post-handshake Certificate");
 
         // Post-handshake transcript: message_hash(Transcript-Hash(CH..CF)) + CR + Certificate (RFC 8446 §4.4.1)
         _postHsTranscript = new TranscriptHash(_keySchedule!.HashAlgorithm);
         if (_postHandshakeBaseHash != null)
             _postHsTranscript.Update(HandshakeMessages.Frame(HandshakeType.MessageHash, _postHandshakeBaseHash));
-        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(_pendingPostHsContext, AdvertisedSigAlgs);
+        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(_pendingPostHsContext!, AdvertisedSigAlgs);
         _postHsTranscript.Update(crMsg);
         _postHsTranscript.Update(fullMsg);
 
         var (_, certBody) = HandshakeMessages.Unframe(fullMsg);
-        var (_, certs) = HandshakeMessages.ParseCertificateEx(certBody);
-        _postHsCertDer = certs.Count > 0 ? certs[0] : null;
+        var (_, certEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        _postHsCertDer = certEntries.Count > 0 ? certEntries[0].CertDer : null;
+
+        // Verify against CA if available
+        if (_postHsCertDer != null && _caCertificate != null)
+        {
+            var clientCertObj = new TlsCertificate
+            {
+                DerData = _postHsCertDer,
+                PrivateKey = Array.Empty<byte>(),
+                PublicKey = Array.Empty<byte>(),
+                SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
+            };
+            if (!CertificateUtils.VerifyChain(clientCertObj, _caCertificate))
+                AlertAndThrow(AlertDescription.BadCertificate, "Post-handshake client cert not signed by trusted CA");
+        }
+
+        _postHsAuthState = _postHsCertDer != null
+            ? PostHsAuthState.AwaitingCertificateVerify
+            : PostHsAuthState.AwaitingFinished;
     }
 
     private void HandlePostHandshakeCertVerify(byte[] fullMsg)
     {
-        if (_postHsTranscript == null || _postHsCertDer == null) return;
+        if (_postHsAuthState != PostHsAuthState.AwaitingCertificateVerify)
+            AlertAndThrow(AlertDescription.UnexpectedMessage, "Unexpected post-handshake CertificateVerify");
 
-        byte[] preHash = _postHsTranscript.GetHash();
+        byte[] preHash = _postHsTranscript!.GetHash();
         var (_, cvBody) = HandshakeMessages.Unframe(fullMsg);
         var (scheme, sig) = HandshakeMessages.ParseCertificateVerify(cvBody);
         ValidateSignatureScheme(scheme);
 
-        var (pubKey, _) = CertificateUtils.ParseCertificatePublicKey(_postHsCertDer);
+        var (pubKey, _) = CertificateUtils.ParseCertificatePublicKey(_postHsCertDer!);
         byte[] cvContent = HandshakeMessages.BuildCertVerifyContent("TLS 1.3, client CertificateVerify", preHash);
         if (!CertificateUtils.Verify(cvContent, sig, pubKey, scheme))
             AlertAndThrow(AlertDescription.DecryptError, "Post-handshake CertificateVerify failed");
 
         _postHsTranscript.Update(fullMsg);
         PeerCertificateData = _postHsCertDer;
+        ValidatePeerCertificate(_postHsCertDer!, null);
+
+        _postHsAuthState = PostHsAuthState.AwaitingFinished;
     }
 
     private void HandlePostHandshakeFinished(byte[] body)
     {
-        if (_postHsTranscript == null) return;
+        if (_postHsAuthState != PostHsAuthState.AwaitingFinished)
+            AlertAndThrow(AlertDescription.UnexpectedMessage, "Unexpected post-handshake Finished");
 
         byte[] expected = _keySchedule!.ComputeFinishedVerifyData(
-            _keySchedule.ClientAppTrafficSecret!, _postHsTranscript.GetHash());
+            _keySchedule.ClientAppTrafficSecret!, _postHsTranscript!.GetHash());
         if (!CryptographicOperations.FixedTimeEquals(body, expected))
             AlertAndThrow(AlertDescription.DecryptError, "Post-handshake Finished failed");
 
+        _postHsAuthState = PostHsAuthState.None;
         _pendingPostHsContext = null;
         _postHsTranscript = null;
         _postHsCertDer = null;
@@ -1776,7 +1828,9 @@ public sealed class TlsConnection
         byte[] ticket = _ticketEncryption.Seal(plaintext);
 
         byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
-        await _record.WriteRecordAsync(ContentType.Handshake, nstMsg, ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try { await _record.WriteRecordAsync(ContentType.Handshake, nstMsg, ct).ConfigureAwait(false); }
+        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1869,6 +1923,8 @@ public sealed class TlsConnection
     {
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
+        if (_postHsAuthState != PostHsAuthState.None)
+            throw new InvalidOperationException("A post-handshake auth flow is already in progress");
 
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -1877,6 +1933,7 @@ public sealed class TlsConnection
             _pendingPostHsContext = context;
             byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
+            _postHsAuthState = PostHsAuthState.AwaitingCertificate;
         }
         finally { _writeLock.Release(); }
     }
@@ -1942,7 +1999,8 @@ public sealed class TlsConnection
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
-                offer0Rtt, serverName, alpnProtocols: _alpnProtocols);
+                offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
+                requestOcspStapling: _requestOcspStapling);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -1960,7 +2018,7 @@ public sealed class TlsConnection
         else
         {
             chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                serverName, alpnProtocols: _alpnProtocols);
+                serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
         }
 
         await _record.WriteRecordAsync(ContentType.Handshake, chMsg, ct).ConfigureAwait(false);
@@ -2064,7 +2122,8 @@ public sealed class TlsConnection
                 ch2Msg = HandshakeMessages.BuildClientHelloWithPsk(
                     clientRandom, sessionId, suites, keyShares,
                     _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
-                    false, serverName, sh.Cookie, _alpnProtocols); // no 0-RTT after HRR
+                    false, serverName, sh.Cookie, _alpnProtocols,
+                    requestOcspStapling: _requestOcspStapling); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -2078,7 +2137,8 @@ public sealed class TlsConnection
             else
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
-                    clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols);
+                    clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
+                    requestOcspStapling: _requestOcspStapling);
             }
             await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
             _transcript.Update(ch2Msg);
@@ -2203,11 +2263,13 @@ public sealed class TlsConnection
         {
             (_, certBody) = HandshakeMessages.Unframe(nextMsg);
         }
-        var (_, serverCerts) = HandshakeMessages.ParseCertificateEx(certBody);
-        if (serverCerts.Count == 0)
+        var (_, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        if (serverCertEntries.Count == 0)
             AlertAndThrow(AlertDescription.CertificateRequired, "Server sent empty certificate");
-        byte[] serverCertDer = serverCerts[0];
+        byte[] serverCertDer = serverCertEntries[0].CertDer;
         PeerCertificateData = serverCertDer;
+        if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
+            PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
 
         // 12. CertificateVerify
@@ -2584,8 +2646,9 @@ public sealed class TlsConnection
             _transcript.Update(crMsg);
         }
 
-        // 15. Certificate (with chain, optionally compressed)
-        byte[] certMsg = HandshakeMessages.BuildCertificate(_certificate.DerData, _certificate.ChainCertificates);
+        // 15. Certificate (with chain, optionally compressed, optionally OCSP-stapled)
+        byte[]? stapleResponse = (ch.RequestsOcspStapling && _ocspResponse != null) ? _ocspResponse : null;
+        byte[] certMsg = HandshakeMessages.BuildCertificate(_certificate.DerData, _certificate.ChainCertificates, stapleResponse);
         if (certCompAlg != 0)
         {
             byte[] compMsg = HandshakeMessages.BuildCompressedCertificate(certMsg, certCompAlg);
@@ -2629,11 +2692,11 @@ public sealed class TlsConnection
             byte[] clientCertMsg = await NextHandshakeAsync(HandshakeType.Certificate, ct).ConfigureAwait(false);
             _transcript.Update(clientCertMsg);
             var (_, clientCertBody) = HandshakeMessages.Unframe(clientCertMsg);
-            var (_, clientCerts) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
 
-            if (clientCerts.Count > 0)
+            if (clientCertEntries.Count > 0)
             {
-                byte[] clientCertDer = clientCerts[0];
+                byte[] clientCertDer = clientCertEntries[0].CertDer;
                 PeerCertificateData = clientCertDer;
 
                 if (_caCertificate != null)

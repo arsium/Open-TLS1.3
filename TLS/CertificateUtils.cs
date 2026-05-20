@@ -39,6 +39,7 @@ public static class CertificateUtils
     private const string OidAuthorityKeyId = "2.5.29.35";
     private const string OidServerAuth = "1.3.6.1.5.5.7.3.1";
     private const string OidClientAuth = "1.3.6.1.5.5.7.3.2";
+    private const string OidOcspBasic = "1.3.6.1.5.5.7.48.1.1";
 
     // ================================================================
     //  ECDSA Certificate generation
@@ -900,5 +901,161 @@ public static class CertificateUtils
             }
         }
         return "Unknown";
+    }
+
+    // ================================================================
+    //  OCSP Response Verification (RFC 6960)
+    // ================================================================
+
+    /// <summary>
+    /// Verify an OCSP response against the leaf certificate and issuer CA.
+    /// Returns the revocation status of the certificate.
+    /// </summary>
+    public static OcspStatus VerifyOcspResponse(byte[] ocspResponseDer, byte[] certDer, TlsCertificate caCert)
+    {
+        try
+        {
+            // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, responseBytes [0] EXPLICIT SEQUENCE }
+            var (_, ocspRespValue, _) = Asn1.ReadTlv(ocspResponseDer);
+            var ocspItems = Asn1.ReadSequenceItems(ocspRespValue);
+            if (ocspItems.Count < 2) return OcspStatus.InvalidResponse;
+
+            // responseStatus must be 0 (successful)
+            if (ocspItems[0].value.Length != 1 || ocspItems[0].value[0] != 0)
+                return OcspStatus.InvalidResponse;
+
+            // responseBytes: [0] EXPLICIT → SEQUENCE { responseType OID, response OCTET STRING }
+            var (_, respBytesSeq, _) = Asn1.ReadTlv(ocspItems[1].value);
+            var respBytesItems = Asn1.ReadSequenceItems(respBytesSeq);
+            if (respBytesItems.Count < 2) return OcspStatus.InvalidResponse;
+
+            // Verify responseType is id-pkix-ocsp-basic
+            byte[] respTypeOid = Asn1.Wrap(respBytesItems[0].tag, respBytesItems[0].value);
+            if (!respTypeOid.AsSpan().SequenceEqual(Asn1.Oid(OidOcspBasic)))
+                return OcspStatus.InvalidResponse;
+
+            // response is OCTET STRING containing BasicOCSPResponse DER
+            byte[] basicRespDer = respBytesItems[1].value;
+
+            // BasicOCSPResponse ::= SEQUENCE { tbsResponseData, signatureAlgorithm, signature, [0] certs OPTIONAL }
+            var (_, basicValue, _) = Asn1.ReadTlv(basicRespDer);
+            var basicItems = Asn1.ReadSequenceItems(basicValue);
+            if (basicItems.Count < 3) return OcspStatus.InvalidResponse;
+
+            byte[] tbsResponseDataDer = Asn1.Wrap(basicItems[0].tag, basicItems[0].value);
+            byte[] sigAlgValue = basicItems[1].value;
+            byte[] signatureBits = basicItems[2].value;
+            if (signatureBits.Length < 2) return OcspStatus.InvalidResponse;
+            byte[] signatureBytes = signatureBits[1..]; // skip unused-bits byte
+
+            // Determine signature algorithm from OID
+            var sigAlgItems = Asn1.ReadSequenceItems(sigAlgValue);
+            byte[] sigOidTlv = Asn1.Wrap(sigAlgItems[0].tag, sigAlgItems[0].value);
+            byte[] ecdsaSha256Oid = Asn1.Oid(OidEcdsaSha256);
+            byte[] rsaSha256Oid = Asn1.Oid(OidRsaSha256);
+
+            // Verify signature using CA public key
+            bool sigValid;
+            if (sigOidTlv.AsSpan().SequenceEqual(ecdsaSha256Oid))
+            {
+                using var ecdsa = ImportEcdsaPubKey(caCert.PublicKey);
+                sigValid = ecdsa.VerifyData(tbsResponseDataDer, signatureBytes,
+                    HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+            }
+            else if (sigOidTlv.AsSpan().SequenceEqual(rsaSha256Oid))
+            {
+                using var rsa = RSA.Create();
+                rsa.ImportRSAPublicKey(caCert.PublicKey, out _);
+                sigValid = rsa.VerifyData(tbsResponseDataDer, signatureBytes,
+                    HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+            else
+            {
+                return OcspStatus.InvalidResponse; // unsupported sig algorithm
+            }
+
+            if (!sigValid) return OcspStatus.InvalidResponse;
+
+            // Parse tbsResponseData → responses (SEQUENCE OF SingleResponse)
+            var tbsItems = Asn1.ReadSequenceItems(basicItems[0].value);
+            // tbsResponseData: [0] version OPTIONAL, responderID, producedAt, responses, [1] extensions OPTIONAL
+            // version [0] is optional — skip if present
+            int idx = 0;
+            if (tbsItems.Count > 0 && tbsItems[0].tag == 0xA0) idx++; // skip version
+            idx++; // skip responderID
+            idx++; // skip producedAt
+
+            if (idx >= tbsItems.Count) return OcspStatus.InvalidResponse;
+            var responses = Asn1.ReadSequenceItems(tbsItems[idx].value);
+            if (responses.Count == 0) return OcspStatus.InvalidResponse;
+
+            // Extract leaf cert serial number for matching
+            byte[] targetSerial = ParseCertificateSerialNumber(certDer);
+
+            // Search for matching SingleResponse
+            foreach (var (_, singleRespValue) in responses)
+            {
+                var srItems = Asn1.ReadSequenceItems(singleRespValue);
+                if (srItems.Count < 3) continue;
+
+                // certID: SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+                var certIdItems = Asn1.ReadSequenceItems(srItems[0].value);
+                if (certIdItems.Count < 4) continue;
+                byte[] respSerial = certIdItems[3].value;
+
+                // Match serial number
+                if (!respSerial.AsSpan().SequenceEqual(targetSerial.AsSpan())) continue;
+
+                // certStatus: [0]=good, [1]=revoked, [2]=unknown
+                byte statusTag = srItems[1].tag;
+                if (statusTag == 0x80 || statusTag == 0xA0) // IMPLICIT/EXPLICIT [0] = good
+                {
+                    // Check freshness: thisUpdate (index 2) and nextUpdate (index 3, optional [0])
+                    if (srItems.Count > 3 && srItems[3].tag == 0xA0)
+                    {
+                        var (_, nextUpdateValue, _) = Asn1.ReadTlv(srItems[3].value);
+                        string nextUpdateStr = System.Text.Encoding.ASCII.GetString(nextUpdateValue);
+                        if (TryParseGeneralizedTime(nextUpdateStr, out var nextUpdate))
+                        {
+                            if (DateTime.UtcNow > nextUpdate)
+                                return OcspStatus.InvalidResponse; // stale response
+                        }
+                    }
+                    return OcspStatus.Good;
+                }
+                if (statusTag == 0x81 || statusTag == 0xA1) return OcspStatus.Revoked;
+                if (statusTag == 0x82 || statusTag == 0xA2) return OcspStatus.Unknown;
+            }
+
+            return OcspStatus.Unknown; // no matching SingleResponse found
+        }
+        catch
+        {
+            return OcspStatus.InvalidResponse;
+        }
+    }
+
+    /// <summary>Extract the serial number bytes from a DER certificate.</summary>
+    private static byte[] ParseCertificateSerialNumber(byte[] certDer)
+    {
+        var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
+        var certItems = Asn1.ReadSequenceItems(certSeqValue);
+        var tbsItems = Asn1.ReadSequenceItems(certItems[0].value);
+        // serialNumber is after [0] version (if present)
+        int serialIdx = (tbsItems[0].tag == 0xA0) ? 1 : 0;
+        return tbsItems[serialIdx].value; // INTEGER value bytes
+    }
+
+    private static bool TryParseGeneralizedTime(string s, out DateTime result)
+    {
+        result = default;
+        // GeneralizedTime: YYYYMMDDHHmmssZ or UTCTime: YYMMDDHHmmssZ
+        if (s.Length == 15 && s[14] == 'Z')
+            return DateTime.TryParseExact(s, "yyyyMMddHHmmss'Z'", null,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out result);
+        if (s.Length == 13 && s[12] == 'Z')
+            return DateTime.TryParseExact(s, "yyMMddHHmmss'Z'", null,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out result);
+        return false;
     }
 }

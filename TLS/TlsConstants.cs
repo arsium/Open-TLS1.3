@@ -30,6 +30,7 @@ public enum HandshakeType : byte
 public enum ExtensionType : ushort
 {
     ServerName = 0,
+    StatusRequest = 5,
     SupportedGroups = 10,
     SignatureAlgorithms = 13,
     Alpn = 16,
@@ -92,6 +93,18 @@ public enum AlertDescription : byte
     MissingExtension = 109,
     CertificateRequired = 116,
     UnsupportedExtension = 110
+}
+
+/// <summary>OCSP response status for a certificate.</summary>
+public enum OcspStatus { Good, Revoked, Unknown, InvalidResponse }
+
+/// <summary>State machine for post-handshake client authentication flow.</summary>
+public enum PostHsAuthState
+{
+    None,
+    AwaitingCertificate,
+    AwaitingCertificateVerify,
+    AwaitingFinished
 }
 
 public sealed class TlsException : Exception

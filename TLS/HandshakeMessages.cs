@@ -44,10 +44,11 @@ public static class HandshakeMessages
 
     public static byte[] BuildClientHello(byte[] clientRandom, byte[] sessionId,
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
-        string? serverName = null, byte[]? cookie = null, string[]? alpnProtocols = null)
+        string? serverName = null, byte[]? cookie = null, string[]? alpnProtocols = null,
+        bool requestOcspStapling = false)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-            serverName, cookie, null, false, alpnProtocols);
+            serverName, cookie, null, false, alpnProtocols, requestOcspStapling);
     }
 
     /// <summary>Build ClientHello with PSK and optional early_data extension.</summary>
@@ -55,10 +56,11 @@ public static class HandshakeMessages
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
         byte[] pskIdentity, uint obfuscatedAge, byte[] binderPlaceholder,
         bool offerEarlyData, string? serverName = null, byte[]? cookie = null,
-        string[]? alpnProtocols = null)
+        string[]? alpnProtocols = null, bool requestOcspStapling = false)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-            serverName, cookie, (pskIdentity, obfuscatedAge, binderPlaceholder), offerEarlyData, alpnProtocols);
+            serverName, cookie, (pskIdentity, obfuscatedAge, binderPlaceholder), offerEarlyData,
+            alpnProtocols, requestOcspStapling);
     }
 
     /// <summary>
@@ -84,7 +86,7 @@ public static class HandshakeMessages
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
         string? serverName, byte[]? cookie,
         (byte[] identity, uint age, byte[] binder)? psk, bool offerEarlyData,
-        string[]? alpnProtocols)
+        string[]? alpnProtocols, bool requestOcspStapling)
     {
         using var ms = new MemoryStream();
 
@@ -100,7 +102,7 @@ public static class HandshakeMessages
         ms.WriteByte(1); ms.WriteByte(0);                       // compression_methods = {null}
 
         byte[] ext = BuildClientHelloExtensions(keyShares, serverName, cookie,
-            psk, offerEarlyData, alpnProtocols);
+            psk, offerEarlyData, alpnProtocols, requestOcspStapling);
         BinaryHelper.WriteUInt16(ms, (ushort)ext.Length);       // extensions length
         ms.Write(ext);
 
@@ -128,6 +130,7 @@ public static class HandshakeMessages
         string? sni = null;
         byte[]? pskData = null;
         bool offersEarlyData = false;
+        bool requestsOcspStapling = false;
         string[]? alpnProtocols = null;
         ushort[]? certCompAlgorithms = null;
 
@@ -177,6 +180,10 @@ public static class HandshakeMessages
                 {
                     offersEarlyData = true;
                 }
+                else if (et == ExtensionType.StatusRequest)
+                {
+                    requestsOcspStapling = true;
+                }
                 else if (et == ExtensionType.Alpn)
                 {
                     var protos = new List<string>();
@@ -211,6 +218,7 @@ public static class HandshakeMessages
             ServerName = sni,
             PreSharedKeyData = pskData,
             OffersEarlyData = offersEarlyData,
+            RequestsOcspStapling = requestsOcspStapling,
             AlpnProtocols = alpnProtocols,
             CertCompressionAlgorithms = certCompAlgorithms
         };
@@ -512,8 +520,8 @@ public static class HandshakeMessages
     //  Certificate
     // ================================================================
 
-    /// <summary>Build a Certificate message with empty context (server). Optionally includes chain certs.</summary>
-    public static byte[] BuildCertificate(byte[] certDer, byte[][]? chainCerts = null)
+    /// <summary>Build a Certificate message with empty context (server). Optionally includes chain certs and OCSP response.</summary>
+    public static byte[] BuildCertificate(byte[] certDer, byte[][]? chainCerts = null, byte[]? ocspResponse = null)
     {
         using var ms = new MemoryStream();
         ms.WriteByte(0); // certificate_request_context (empty for server)
@@ -522,7 +530,7 @@ public static class HandshakeMessages
         // Leaf cert
         BinaryHelper.WriteUInt24(list, (uint)certDer.Length);
         list.Write(certDer);
-        BinaryHelper.WriteUInt16(list, 0); // per-cert extensions (none)
+        WritePerCertExtensions(list, ocspResponse); // OCSP staple on leaf only
 
         // Chain certs (CA, intermediates)
         if (chainCerts != null)
@@ -531,7 +539,7 @@ public static class HandshakeMessages
             {
                 BinaryHelper.WriteUInt24(list, (uint)cc.Length);
                 list.Write(cc);
-                BinaryHelper.WriteUInt16(list, 0);
+                BinaryHelper.WriteUInt16(list, 0); // no per-cert extensions
             }
         }
 
@@ -588,8 +596,8 @@ public static class HandshakeMessages
         return body[p..(p + (int)certLen)];
     }
 
-    /// <summary>Parse a Certificate message body, returning context and all certs in order (leaf first).</summary>
-    public static (byte[] context, List<byte[]> certs) ParseCertificateEx(byte[] body)
+    /// <summary>Parse a Certificate message body, returning context and all cert entries (leaf first) with per-cert extensions.</summary>
+    public static (byte[] context, List<CertEntry> entries) ParseCertificateEx(byte[] body)
     {
         int p = 0;
         int ctxLen = body[p++];
@@ -598,15 +606,28 @@ public static class HandshakeMessages
         uint listLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
         int listEnd = p + (int)listLen;
 
-        var certs = new List<byte[]>();
+        var entries = new List<CertEntry>();
         while (p < listEnd)
         {
             uint certLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
-            certs.Add(body[p..(p + (int)certLen)]); p += (int)certLen;
-            ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2 + extLen; // skip per-cert extensions
+            byte[] certDer = body[p..(p + (int)certLen)]; p += (int)certLen;
+
+            byte[]? ocspResponse = null;
+            ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+            int extEnd = p + extLen;
+            while (p < extEnd)
+            {
+                var extType = (ExtensionType)BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+                ushort extDataLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+                if (extType == ExtensionType.StatusRequest)
+                    ocspResponse = body[p..(p + extDataLen)];
+                p += extDataLen;
+            }
+
+            entries.Add(new CertEntry { CertDer = certDer, OcspResponse = ocspResponse });
         }
 
-        return (context, certs);
+        return (context, entries);
     }
 
     // ================================================================
@@ -836,7 +857,8 @@ public static class HandshakeMessages
         string? serverName, byte[]? cookie,
         (byte[] identity, uint age, byte[] binder)? psk = null,
         bool offerEarlyData = false,
-        string[]? alpnProtocols = null)
+        string[]? alpnProtocols = null,
+        bool requestOcspStapling = false)
     {
         using var ms = new MemoryStream();
 
@@ -851,6 +873,14 @@ public static class HandshakeMessages
             BinaryHelper.WriteUInt16(body, (ushort)nameBytes.Length);
             body.Write(nameBytes);
             WriteExtension(ms, ExtensionType.ServerName, body.ToArray());
+        }
+
+        // Status Request (OCSP stapling — RFC 6066 §8)
+        if (requestOcspStapling)
+        {
+            // CertificateStatusRequest: status_type=ocsp(1), responder_id_list=empty, request_extensions=empty
+            byte[] srBody = { 0x01, 0x00, 0x00, 0x00, 0x00 };
+            WriteExtension(ms, ExtensionType.StatusRequest, srBody);
         }
 
         // ALPN
@@ -971,6 +1001,25 @@ public static class HandshakeMessages
         ms.Write(data);
     }
 
+    /// <summary>Write per-certificate extensions (RFC 8446 §4.4.2.1). If ocspResponse is provided, writes status_request extension.</summary>
+    private static void WritePerCertExtensions(MemoryStream list, byte[]? ocspResponse)
+    {
+        if (ocspResponse != null)
+        {
+            using var extMs = new MemoryStream();
+            BinaryHelper.WriteUInt16(extMs, (ushort)ExtensionType.StatusRequest);
+            BinaryHelper.WriteUInt16(extMs, (ushort)ocspResponse.Length);
+            extMs.Write(ocspResponse);
+            byte[] extData = extMs.ToArray();
+            BinaryHelper.WriteUInt16(list, (ushort)extData.Length);
+            list.Write(extData);
+        }
+        else
+        {
+            BinaryHelper.WriteUInt16(list, 0); // no extensions
+        }
+    }
+
     private static (ExtensionType type, byte[] data, int newPos) ReadExtension(byte[] buf, int pos)
     {
         var type = (ExtensionType)BinaryHelper.ReadUInt16(buf.AsSpan(pos)); pos += 2;
@@ -1025,8 +1074,16 @@ public sealed class ParsedClientHello
     public string? ServerName { get; init; }
     public byte[]? PreSharedKeyData { get; init; }
     public bool OffersEarlyData { get; init; }
+    public bool RequestsOcspStapling { get; init; }
     public string[]? AlpnProtocols { get; init; }
     public ushort[]? CertCompressionAlgorithms { get; init; }
+}
+
+/// <summary>A certificate entry from a TLS Certificate message, with optional per-cert extensions.</summary>
+public sealed class CertEntry
+{
+    public byte[] CertDer { get; init; } = null!;
+    public byte[]? OcspResponse { get; init; }
 }
 
 public sealed class ParsedServerHello

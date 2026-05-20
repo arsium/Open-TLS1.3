@@ -33,6 +33,9 @@ public sealed class TlsStream : IDisposable
     /// <summary>Negotiated ALPN protocol, or null if ALPN was not used.</summary>
     public string? NegotiatedAlpn => _conn.NegotiatedAlpn;
 
+    /// <summary>OCSP response stapled by the server, or null if not provided.</summary>
+    public byte[]? PeerOcspResponse => _conn.PeerOcspResponse;
+
     /// <summary>Read decrypted data into buffer. Returns number of bytes read (0 = EOF from close_notify).</summary>
     public int Read(byte[] buffer, int offset = 0, int count = -1)
     {

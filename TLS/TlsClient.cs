@@ -17,6 +17,9 @@ public sealed class TlsClient
     /// <summary>Record padding block size for traffic analysis resistance. 0 = no padding (default).</summary>
     public int PaddingBlockSize { get; set; }
 
+    /// <summary>Request OCSP stapling from the server via the status_request extension.</summary>
+    public bool RequestOcspStapling { get; set; }
+
     /// <summary>
     /// Connect to a TLS 1.3 server.
     /// Performs the full handshake and returns an encrypted stream.
@@ -132,6 +135,9 @@ public sealed class TlsClient
 
         if (PaddingBlockSize > 0)
             conn.PaddingBlockSize = PaddingBlockSize;
+
+        if (RequestOcspStapling)
+            conn.RequestOcspStapling();
 
         if (TicketStore == null) return;
 

@@ -36,6 +36,9 @@ public sealed class TlsServer : IDisposable
     /// <summary>Record padding block size for traffic analysis resistance. 0 = no padding (default).</summary>
     public int PaddingBlockSize { get; set; }
 
+    /// <summary>DER-encoded OCSP response to staple in the Certificate message when the client requests it.</summary>
+    public byte[]? OcspResponse { get; set; }
+
     public TlsServer(TlsCertificate certificate)
     {
         _certificate = certificate;
@@ -72,6 +75,8 @@ public sealed class TlsServer : IDisposable
                 conn.EnableCertificateCompression();
             if (PaddingBlockSize > 0)
                 conn.PaddingBlockSize = PaddingBlockSize;
+            if (OcspResponse != null)
+                conn.SetOcspResponse(OcspResponse);
 
             conn.HandshakeAsServer();
 
@@ -105,6 +110,8 @@ public sealed class TlsServer : IDisposable
                 conn.EnableCertificateCompression();
             if (PaddingBlockSize > 0)
                 conn.PaddingBlockSize = PaddingBlockSize;
+            if (OcspResponse != null)
+                conn.SetOcspResponse(OcspResponse);
 
             await conn.HandshakeAsServerAsync(ct).ConfigureAwait(false);
 

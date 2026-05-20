@@ -160,6 +160,9 @@ public sealed class RecordLayer
             if (end < 0) return null;
 
             byte rawType = plaintext[end];
+            if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
+                return null; // invalid inner content type — treat as failed trial decryption
             return ((ContentType)rawType, plaintext[..end]);
         }
 
@@ -188,6 +191,9 @@ public sealed class RecordLayer
             if (end < 0) return null;
 
             byte rawType = plaintext[end];
+            if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
+                return null; // invalid inner content type — treat as failed trial decryption
             return ((ContentType)rawType, plaintext[..end]);
         }
 
