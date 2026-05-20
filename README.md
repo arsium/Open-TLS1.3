@@ -130,3 +130,6 @@ dotnet publish -c Release --project TLSServer
 | RFC 8879 | Certificate compression (Brotli, Zstandard) |
 | FIPS 203 | ML-KEM-768 (Module-Lattice Key Encapsulation) |
 | draft-ietf-tls-ecdhe-mlkem | X25519MLKEM768 hybrid key exchange |
+
+
+> **Note:** if you wanna a nuget package including DLLs, create a pull request
