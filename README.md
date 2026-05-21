@@ -2,7 +2,9 @@
 
 A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every protocol layer — from the record framing and handshake state machine down to the elliptic-curve arithmetic and post-quantum key exchange — is written from scratch with zero external dependencies (except .NET's built-in AES-GCM and ChaCha20-Poly1305 AEAD primitives).
 
-> **Note:** AI driven prompt project.
+> **Note 1 :** AI driven prompt project. 
+> **Note 2 :** if you wanna a nuget package including DLLs, create a pull request
+> **Note 3 :** more rfc compliance is planned to recent ones, even if some of them are only 'proposal' (9963, 9849, 9847, 9813, 9427, 9367, 9325, 9266, 9261, 9258, 9190, 9149, 8998, 8937).
 
 ## Features
 
@@ -130,6 +132,3 @@ dotnet publish -c Release --project TLSServer
 | RFC 8879 | Certificate compression (Brotli, Zstandard) |
 | FIPS 203 | ML-KEM-768 (Module-Lattice Key Encapsulation) |
 | draft-ietf-tls-ecdhe-mlkem | X25519MLKEM768 hybrid key exchange |
-
-
-> **Note:** if you wanna a nuget package including DLLs, create a pull request
