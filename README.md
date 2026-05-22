@@ -53,6 +53,12 @@ All elliptic-curve operations (point addition, doubling, scalar multiplication) 
 | TLS_GOSTR341112_256_WITH_MAGMA_MGM_L / _S | RFC 9367 |
 | TLS_SM4_GCM_SM3, TLS_SM4_CCM_SM3 | RFC 8998 |
 
+### Sources & lib directly imported from files
+
+- [OpenGost](https://github.com/sergezhigunov/OpenGost)
+- [ZstdSharp](https://github.com/oleg-st/ZstdSharp)
+- [BouncyCastle](https://github.com/bcgit/bc-csharp)
+
 ### Architecture
 
 ```
