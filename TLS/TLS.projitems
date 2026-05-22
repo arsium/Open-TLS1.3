@@ -12,6 +12,16 @@
     <Compile Include="$(MSBuildThisFileDirectory)TlsConstants.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)BinaryHelper.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Hkdf.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Hpke.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)EncryptedClientHello.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)GostCrypto.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mgm.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)GostKdf.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Sm3Kdf.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)GostEcdh.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Grease.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)ChineseCrypto.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Sm4Aead.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)AeadCipher.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)X25519.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Ed25519.cs" />
@@ -19,6 +29,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Asn1.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)CertificateUtils.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)RecordLayer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)RandomnessWrapper.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)TranscriptHash.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)KeySchedule.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)HandshakeMessages.cs" />
@@ -40,5 +51,9 @@
   <!-- ZstdSharp: pure managed C# zstd port (included as source for RFC 8879 cert compression) -->
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)Zstd\**\*.cs" />
+  </ItemGroup>
+  <!-- OpenGost: vendored managed GOST crypto (Grasshopper/Magma/Streebog/CMAC) -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)OpenGost\**\*.cs" />
   </ItemGroup>
 </Project>

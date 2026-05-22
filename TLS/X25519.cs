@@ -14,7 +14,7 @@ public static class X25519
 
     public static byte[] GeneratePrivateKey()
     {
-        byte[] key = RandomNumberGenerator.GetBytes(32);
+        byte[] key = RandomnessWrapper.GetKeyBytes(32);
         Clamp(key);
         return key;
     }

@@ -57,6 +57,8 @@ public sealed class TranscriptHash
         byte[] all = _data.ToArray();
         if (_algorithm == HashAlgorithmName.SHA256) return SHA256.HashData(all);
         if (_algorithm == HashAlgorithmName.SHA384) return SHA384.HashData(all);
+        if (GostKdf.IsStreebog(_algorithm)) return GostKdf.Hash(all);
+        if (Sm3Kdf.IsSm3(_algorithm)) return Sm3Kdf.Hash(all);
         throw new ArgumentException($"Unsupported hash: {_algorithm}");
     }
 }

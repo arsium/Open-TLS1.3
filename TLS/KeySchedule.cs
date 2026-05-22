@@ -31,6 +31,7 @@ public sealed class KeySchedule
     private readonly HashAlgorithmName _hash;
     private readonly int _hashLen;
     private readonly int _keyLen;
+    private readonly int _ivLen;
 
     private byte[] _earlySecret;
     private byte[] _handshakeSecret = null!;
@@ -48,6 +49,9 @@ public sealed class KeySchedule
     /// <summary>True when the negotiated cipher suite is ChaCha20-Poly1305.</summary>
     public bool IsChaCha20 { get; }
 
+    /// <summary>The AEAD algorithm for the negotiated cipher suite.</summary>
+    public AeadAlgorithm Aead { get; }
+
     /// <summary>The negotiated cipher suite.</summary>
     public CipherSuite Suite { get; }
 
@@ -56,11 +60,20 @@ public sealed class KeySchedule
         Suite = suite;
         IsChaCha20 = suite == CipherSuite.TLS_CHACHA20_POLY1305_SHA256;
 
-        (_hash, _hashLen, _keyLen) = suite switch
+        // (hash, hashLen, keyLen, ivLen, aead)
+        (_hash, _hashLen, _keyLen, _ivLen, Aead) = suite switch
         {
-            CipherSuite.TLS_AES_128_GCM_SHA256 => (HashAlgorithmName.SHA256, 32, 16),
-            CipherSuite.TLS_AES_256_GCM_SHA384 => (HashAlgorithmName.SHA384, 48, 32),
-            CipherSuite.TLS_CHACHA20_POLY1305_SHA256 => (HashAlgorithmName.SHA256, 32, 32),
+            CipherSuite.TLS_AES_128_GCM_SHA256 => (HashAlgorithmName.SHA256, 32, 16, 12, AeadAlgorithm.AesGcm),
+            CipherSuite.TLS_AES_256_GCM_SHA384 => (HashAlgorithmName.SHA384, 48, 32, 12, AeadAlgorithm.AesGcm),
+            CipherSuite.TLS_CHACHA20_POLY1305_SHA256 => (HashAlgorithmName.SHA256, 32, 32, 12, AeadAlgorithm.ChaCha20Poly1305),
+            CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L or
+            CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S
+                => (GostKdf.Streebog256Name, 32, 32, 16, AeadAlgorithm.MgmKuznyechik),
+            CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_L or
+            CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_S
+                => (GostKdf.Streebog256Name, 32, 32, 8, AeadAlgorithm.MgmMagma),
+            CipherSuite.TLS_SM4_GCM_SM3 => (Sm3Kdf.Sm3Name, 32, 16, 12, AeadAlgorithm.Sm4Gcm),
+            CipherSuite.TLS_SM4_CCM_SM3 => (Sm3Kdf.Sm3Name, 32, 16, 12, AeadAlgorithm.Sm4Ccm),
             _ => throw new TlsException(AlertDescription.HandshakeFailure, $"Unsupported suite: {suite}")
         };
 
@@ -146,7 +159,7 @@ public sealed class KeySchedule
     public (byte[] key, byte[] iv) DeriveKeyAndIv(byte[] trafficSecret)
     {
         byte[] key = Hkdf.ExpandLabel(_hash, trafficSecret, "key", Array.Empty<byte>(), _keyLen);
-        byte[] iv = Hkdf.ExpandLabel(_hash, trafficSecret, "iv", Array.Empty<byte>(), 12);
+        byte[] iv = Hkdf.ExpandLabel(_hash, trafficSecret, "iv", Array.Empty<byte>(), _ivLen);
         return (key, iv);
     }
 
@@ -155,6 +168,10 @@ public sealed class KeySchedule
     {
         byte[] finishedKey = Hkdf.ExpandLabel(_hash, baseKey, "finished",
             Array.Empty<byte>(), _hashLen);
+        if (GostKdf.IsStreebog(_hash))
+            return GostKdf.Hmac(finishedKey, transcriptHash);
+        if (Sm3Kdf.IsSm3(_hash))
+            return Sm3Kdf.Hmac(finishedKey, transcriptHash);
         using var hmac = IncrementalHash.CreateHMAC(_hash, finishedKey);
         hmac.AppendData(transcriptHash);
         return hmac.GetHashAndReset();
@@ -184,13 +201,10 @@ public sealed class KeySchedule
     {
         if (_hash == HashAlgorithmName.SHA256) return SHA256.HashData(data);
         if (_hash == HashAlgorithmName.SHA384) return SHA384.HashData(data);
+        if (GostKdf.IsStreebog(_hash)) return GostKdf.Hash(data);
+        if (Sm3Kdf.IsSm3(_hash)) return Sm3Kdf.Hash(data);
         throw new ArgumentException($"Unsupported hash: {_hash}");
     }
 
-    private byte[] HashEmpty()
-    {
-        if (_hash == HashAlgorithmName.SHA256) return SHA256.HashData(Array.Empty<byte>());
-        if (_hash == HashAlgorithmName.SHA384) return SHA384.HashData(Array.Empty<byte>());
-        throw new ArgumentException($"Unsupported hash: {_hash}");
-    }
+    private byte[] HashEmpty() => HashData(Array.Empty<byte>());
 }

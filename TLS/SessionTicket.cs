@@ -78,7 +78,7 @@ public sealed class TicketEncryption
 
     public TicketEncryption(byte[]? key = null)
     {
-        byte[] k = key ?? RandomNumberGenerator.GetBytes(32);
+        byte[] k = key ?? RandomnessWrapper.GetKeyBytes(32);
         _keys.Add(new KeyEntry { KeyId = 0, Key = k, CreatedAt = DateTime.UtcNow });
         _nextKeyId = 1;
     }
@@ -88,7 +88,7 @@ public sealed class TicketEncryption
     {
         lock (_keyLock)
         {
-            byte[] k = newKey ?? RandomNumberGenerator.GetBytes(32);
+            byte[] k = newKey ?? RandomnessWrapper.GetKeyBytes(32);
             _keys.Add(new KeyEntry { KeyId = _nextKeyId++, Key = k, CreatedAt = DateTime.UtcNow });
         }
     }
@@ -138,7 +138,7 @@ public sealed class TicketEncryption
         KeyEntry current;
         lock (_keyLock) { current = _keys[^1]; }
 
-        byte[] iv = RandomNumberGenerator.GetBytes(12);
+        byte[] iv = RandomnessWrapper.GetBytes(12);
         byte[] ciphertext = new byte[plaintext.Length];
         byte[] tag = new byte[16];
 

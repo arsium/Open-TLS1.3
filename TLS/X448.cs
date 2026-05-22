@@ -10,7 +10,7 @@ public static class X448
 
     public static byte[] GeneratePrivateKey()
     {
-        byte[] key = RandomNumberGenerator.GetBytes(56);
+        byte[] key = RandomnessWrapper.GetKeyBytes(56);
         Clamp(key);
         return key;
     }

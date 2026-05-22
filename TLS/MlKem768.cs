@@ -40,8 +40,8 @@ public static class MlKem768
     /// </returns>
     public static (byte[] encapsulationKey, byte[] decapsulationKey) KeyGen()
     {
-        byte[] d = RandomNumberGenerator.GetBytes(32);
-        byte[] z = RandomNumberGenerator.GetBytes(32);
+        byte[] d = RandomnessWrapper.GetKeyBytes(32);
+        byte[] z = RandomnessWrapper.GetKeyBytes(32);
         return KeyGenInternal(d, z);
     }
 
@@ -59,7 +59,7 @@ public static class MlKem768
             throw new TlsException(AlertDescription.IllegalParameter,
                 $"ML-KEM-768 encapsulation key must be {EkSize} bytes");
 
-        byte[] m = RandomNumberGenerator.GetBytes(32);
+        byte[] m = RandomnessWrapper.GetKeyBytes(32);
         return EncapsInternal(encapsulationKey, m);
     }
 

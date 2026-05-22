@@ -58,6 +58,7 @@ public sealed class TlsServer : IDisposable
             throw new InvalidOperationException("Call Listen() first");
 
         var tcp = _listener.AcceptTcpClient();
+        tcp.NoDelay = true;
         try
         {
             var stream = tcp.GetStream();
@@ -93,6 +94,7 @@ public sealed class TlsServer : IDisposable
             throw new InvalidOperationException("Call Listen() first");
 
         var tcp = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+        tcp.NoDelay = true;
         try
         {
             var stream = tcp.GetStream();

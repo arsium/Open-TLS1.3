@@ -20,6 +20,12 @@ public sealed class TlsClient
     /// <summary>Request OCSP stapling from the server via the status_request extension.</summary>
     public bool RequestOcspStapling { get; set; }
 
+    /// <summary>Override the cipher suites offered in ClientHello (in preference order). Null = stack default.</summary>
+    public CipherSuite[]? CipherSuites { get; set; }
+
+    /// <summary>Override the key-share groups offered in ClientHello (in preference order). Null = stack default.</summary>
+    public NamedGroup[]? NamedGroups { get; set; }
+
     /// <summary>
     /// Connect to a TLS 1.3 server.
     /// Performs the full handshake and returns an encrypted stream.
@@ -27,7 +33,7 @@ public sealed class TlsClient
     /// <param name="earlyData">Optional 0-RTT early data to send before the handshake completes. Check EarlyDataAccepted on the returned stream.</param>
     public TlsStream Connect(string host, int port, byte[]? earlyData = null)
     {
-        var tcp = new TcpClient();
+        var tcp = new TcpClient { NoDelay = true };
         try
         {
             tcp.Connect(host, port);
@@ -53,7 +59,7 @@ public sealed class TlsClient
     /// <param name="earlyData">Optional 0-RTT early data to send before the handshake completes. Check EarlyDataAccepted on the returned stream.</param>
     public TlsStream Connect(string host, int port, TlsCertificate clientCertificate, byte[]? earlyData = null)
     {
-        var tcp = new TcpClient();
+        var tcp = new TcpClient { NoDelay = true };
         try
         {
             tcp.Connect(host, port);
@@ -83,7 +89,7 @@ public sealed class TlsClient
     /// </summary>
     public async Task<TlsStream> ConnectAsync(string host, int port, byte[]? earlyData = null, CancellationToken ct = default)
     {
-        var tcp = new TcpClient();
+        var tcp = new TcpClient { NoDelay = true };
         try
         {
             await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
@@ -108,7 +114,7 @@ public sealed class TlsClient
     /// </summary>
     public async Task<TlsStream> ConnectAsync(string host, int port, TlsCertificate clientCertificate, byte[]? earlyData = null, CancellationToken ct = default)
     {
-        var tcp = new TcpClient();
+        var tcp = new TcpClient { NoDelay = true };
         try
         {
             await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
@@ -138,6 +144,12 @@ public sealed class TlsClient
 
         if (RequestOcspStapling)
             conn.RequestOcspStapling();
+
+        if (CipherSuites != null)
+            conn.SetOfferedCipherSuites(CipherSuites);
+
+        if (NamedGroups != null)
+            conn.SetOfferedGroups(NamedGroups);
 
         if (TicketStore == null) return;
 

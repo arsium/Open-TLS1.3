@@ -18,6 +18,9 @@ public sealed class RecordLayer
     /// </summary>
     public int PaddingBlockSize { get; set; }
 
+    /// <summary>RFC 8449: max plaintext bytes per outgoing record (peer's record_size_limit − 1). Default 2^14.</summary>
+    public int MaxSendPlaintext { get; set; } = TlsConst.MaxPlaintextLength;
+
     public RecordLayer(Stream stream)
     {
         _stream = stream;
@@ -41,6 +44,9 @@ public sealed class RecordLayer
         _writeCipher?.Dispose();
         _writeCipher = null;
     }
+
+    /// <summary>RFC 8446 §5.5: true when the current write cipher has reached the rekey watermark.</summary>
+    public bool WriteCipherNeedsKeyUpdate => _writeCipher is { NeedsKeyUpdate: true };
 
     /// <summary>Read one TLS record, decrypting if a read cipher is active.</summary>
     public (ContentType type, byte[] payload) ReadRecord()
@@ -83,7 +89,7 @@ public sealed class RecordLayer
             int offset = 0;
             while (offset < data.Length)
             {
-                int chunkLen = Math.Min(data.Length - offset, TlsConst.MaxPlaintextLength);
+                int chunkLen = Math.Min(data.Length - offset, MaxSendPlaintext);
 
                 // Build inner plaintext: chunk ‖ content_type ‖ padding_zeros
                 int innerLen = chunkLen + 1; // +1 for content type
@@ -93,7 +99,7 @@ public sealed class RecordLayer
                 Buffer.BlockCopy(data, offset, inner, 0, chunkLen);
                 inner[chunkLen] = (byte)type;
 
-                int encLen = inner.Length + TlsConst.AeadTagLength;
+                int encLen = inner.Length + _writeCipher.TagLength;
                 byte[] header = BuildHeader(ContentType.ApplicationData, (ushort)encLen);
 
                 byte[] encrypted = _writeCipher.Encrypt(inner, header);
@@ -110,7 +116,7 @@ public sealed class RecordLayer
             int offset = 0;
             while (offset < data.Length)
             {
-                int chunkLen = Math.Min(data.Length - offset, TlsConst.MaxPlaintextLength);
+                int chunkLen = Math.Min(data.Length - offset, MaxSendPlaintext);
                 byte[] header = BuildHeader(type, (ushort)chunkLen);
 
                 _stream.Write(header);
@@ -244,7 +250,7 @@ public sealed class RecordLayer
             int offset = 0;
             while (offset < data.Length)
             {
-                int chunkLen = Math.Min(data.Length - offset, TlsConst.MaxPlaintextLength);
+                int chunkLen = Math.Min(data.Length - offset, MaxSendPlaintext);
 
                 int innerLen = chunkLen + 1;
                 if (PaddingBlockSize > 0)
@@ -253,7 +259,7 @@ public sealed class RecordLayer
                 Buffer.BlockCopy(data, offset, inner, 0, chunkLen);
                 inner[chunkLen] = (byte)type;
 
-                int encLen = inner.Length + TlsConst.AeadTagLength;
+                int encLen = inner.Length + _writeCipher.TagLength;
                 byte[] header = BuildHeader(ContentType.ApplicationData, (ushort)encLen);
 
                 byte[] encrypted = _writeCipher.Encrypt(inner, header);
@@ -269,7 +275,7 @@ public sealed class RecordLayer
             int offset = 0;
             while (offset < data.Length)
             {
-                int chunkLen = Math.Min(data.Length - offset, TlsConst.MaxPlaintextLength);
+                int chunkLen = Math.Min(data.Length - offset, MaxSendPlaintext);
                 byte[] header = BuildHeader(type, (ushort)chunkLen);
 
                 await _stream.WriteAsync(header, ct).ConfigureAwait(false);

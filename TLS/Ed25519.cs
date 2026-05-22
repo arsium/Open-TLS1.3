@@ -32,7 +32,7 @@ public static class Ed25519
     /// <summary>Generates a 32-byte random seed (private key).</summary>
     public static byte[] GeneratePrivateKey()
     {
-        return RandomNumberGenerator.GetBytes(32);
+        return RandomnessWrapper.GetKeyBytes(32);
     }
 
     /// <summary>Derives the 32-byte compressed public key from a 32-byte seed.</summary>

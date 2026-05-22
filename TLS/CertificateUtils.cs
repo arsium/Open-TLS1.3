@@ -1,5 +1,6 @@
 namespace TLS;
 
+using System.Numerics;
 using System.Security.Cryptography;
 
 /// <summary>
@@ -18,6 +19,10 @@ public sealed class TlsCertificate
     public byte[][]? ChainCertificates { get; init; }
 
     public bool IsRsa => SignatureAlgorithm is SignatureScheme.RsaPssRsaeSha256 or SignatureScheme.RsaPssRsaeSha384;
+
+    public bool IsGost => CertificateUtils.IsGostScheme(SignatureAlgorithm);
+
+    public bool IsSm2 => SignatureAlgorithm == SignatureScheme.Sm2Sm3;
 }
 
 public enum CertificateProfile { CA, Server, Client }
@@ -533,7 +538,43 @@ public static class CertificateUtils
                     return rsa.SignData(data, HashAlgorithmName.SHA384, RSASignaturePadding.Pss);
                 }
 
+            // RFC 9963 §3: Legacy RSASSA-PKCS1-v1_5 (certificate verification only)
+            case SignatureScheme.RsaPkcs1Sha256:
+                using (var rsa = RSA.Create())
+                {
+                    rsa.ImportRSAPrivateKey(privateKey, out _);
+                    return rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                }
+
+            case SignatureScheme.RsaPkcs1Sha384:
+                using (var rsa = RSA.Create())
+                {
+                    rsa.ImportRSAPrivateKey(privateKey, out _);
+                    return rsa.SignData(data, HashAlgorithmName.SHA384, RSASignaturePadding.Pkcs1);
+                }
+
+            case SignatureScheme.RsaPkcs1Sha512:
+                using (var rsa = RSA.Create())
+                {
+                    rsa.ImportRSAPrivateKey(privateKey, out _);
+                    return rsa.SignData(data, HashAlgorithmName.SHA512, RSASignaturePadding.Pkcs1);
+                }
+
             default:
+                if (IsGostScheme(scheme))
+                {
+                    var (_, _, is512) = GostParams(scheme);
+                    byte[] h = is512 ? GostCrypto.Streebog.Hash512(data) : GostCrypto.Streebog.Hash256(data);
+                    using (var g = ImportGostKey(privateKey, publicKey, scheme))
+                        return g.SignHash(h);
+                }
+                if (scheme == SignatureScheme.Sm2Sm3)
+                {
+                    var (r, s) = ChineseCrypto.SM2.Sign(ChineseCrypto.SM2.Sm2P256, privateKey, data, Sm2TlsId);
+                    return Asn1.Sequence(
+                        Asn1.Integer(new BigInteger(r, isUnsigned: true, isBigEndian: true)),
+                        Asn1.Integer(new BigInteger(s, isUnsigned: true, isBigEndian: true)));
+                }
                 throw new TlsException(AlertDescription.HandshakeFailure, $"Unsupported sign scheme: {scheme}");
         }
     }
@@ -566,7 +607,43 @@ public static class CertificateUtils
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA384, RSASignaturePadding.Pss);
                     }
 
+                // RFC 9963 §3: Legacy RSASSA-PKCS1-v1_5 (certificate verification only)
+                case SignatureScheme.RsaPkcs1Sha256:
+                    using (var rsa = RSA.Create())
+                    {
+                        rsa.ImportRSAPublicKey(publicKey, out _);
+                        return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                    }
+
+                case SignatureScheme.RsaPkcs1Sha384:
+                    using (var rsa = RSA.Create())
+                    {
+                        rsa.ImportRSAPublicKey(publicKey, out _);
+                        return rsa.VerifyData(data, signature, HashAlgorithmName.SHA384, RSASignaturePadding.Pkcs1);
+                    }
+
+                case SignatureScheme.RsaPkcs1Sha512:
+                    using (var rsa = RSA.Create())
+                    {
+                        rsa.ImportRSAPublicKey(publicKey, out _);
+                        return rsa.VerifyData(data, signature, HashAlgorithmName.SHA512, RSASignaturePadding.Pkcs1);
+                    }
+
                 default:
+                    if (IsGostScheme(scheme))
+                    {
+                        var (_, _, is512) = GostParams(scheme);
+                        byte[] h = is512 ? GostCrypto.Streebog.Hash512(data) : GostCrypto.Streebog.Hash256(data);
+                        using (var g = ImportGostKey(null, publicKey, scheme))
+                            return g.VerifyHash(h, signature);
+                    }
+                    if (scheme == SignatureScheme.Sm2Sm3)
+                    {
+                        var seq = Asn1.ReadSequenceItems(Asn1.ReadTlv(signature).value);
+                        byte[] r = ToFixed(seq[0].value, 32);
+                        byte[] s = ToFixed(seq[1].value, 32);
+                        return ChineseCrypto.SM2.Verify(ChineseCrypto.SM2.Sm2P256, publicKey, data, r, s, Sm2TlsId);
+                    }
                     throw new TlsException(AlertDescription.HandshakeFailure, $"Unsupported verify scheme: {scheme}");
             }
         }
@@ -574,6 +651,161 @@ public static class CertificateUtils
         {
             return false; // key/scheme mismatch or corrupt signature
         }
+    }
+
+    // ================================================================
+    //  GOST R 34.10-2012 signatures + certificates (RFC 9367 / RFC 4491)
+    // ================================================================
+
+    private const string OidGost256 = "1.2.643.7.1.1.1.1";   // id-tc26-gost3410-12-256
+    private const string OidGost512 = "1.2.643.7.1.1.1.2";   // id-tc26-gost3410-12-512
+    private const string OidStreebog256 = "1.2.643.7.1.1.2.2";
+    private const string OidStreebog512 = "1.2.643.7.1.1.2.3";
+
+    internal static bool IsGostScheme(SignatureScheme s) =>
+        s is SignatureScheme.Gostr34102012_256a or SignatureScheme.Gostr34102012_256b
+          or SignatureScheme.Gostr34102012_256c or SignatureScheme.Gostr34102012_256d
+          or SignatureScheme.Gostr34102012_512a or SignatureScheme.Gostr34102012_512b
+          or SignatureScheme.Gostr34102012_512c;
+
+    // scheme → (curve OID, coordinate size in bytes, is-512)
+    private static (string curveOid, int size, bool is512) GostParams(SignatureScheme s) => s switch
+    {
+        SignatureScheme.Gostr34102012_256a => ("1.2.643.7.1.2.1.1.1", 32, false),
+        SignatureScheme.Gostr34102012_256b => ("1.2.643.2.2.35.1", 32, false),
+        SignatureScheme.Gostr34102012_256c => ("1.2.643.2.2.35.2", 32, false),
+        SignatureScheme.Gostr34102012_256d => ("1.2.643.2.2.35.3", 32, false),
+        SignatureScheme.Gostr34102012_512a => ("1.2.643.7.1.2.1.2.1", 64, true),
+        SignatureScheme.Gostr34102012_512b => ("1.2.643.7.1.2.1.2.2", 64, true),
+        SignatureScheme.Gostr34102012_512c => ("1.2.643.7.1.2.1.2.3", 64, true),
+        _ => throw new TlsException(AlertDescription.HandshakeFailure, $"Not a GOST scheme: {s}")
+    };
+
+    private static SignatureScheme MatchGostCurveOid(byte[] curveOidTlv)
+    {
+        foreach (var oid in new[] {
+            "1.2.643.7.1.2.1.1.1", "1.2.643.2.2.35.1", "1.2.643.2.2.35.2", "1.2.643.2.2.35.3",
+            "1.2.643.7.1.2.1.2.1", "1.2.643.7.1.2.1.2.2", "1.2.643.7.1.2.1.2.3" })
+            if (curveOidTlv.AsSpan().SequenceEqual(Asn1.Oid(oid)))
+                return CurveOidToScheme(oid);
+        throw new TlsException(AlertDescription.HandshakeFailure, "Unknown GOST curve in certificate");
+    }
+
+    private static SignatureScheme CurveOidToScheme(string curveOid) => curveOid switch
+    {
+        "1.2.643.7.1.2.1.1.1" => SignatureScheme.Gostr34102012_256a,
+        "1.2.643.2.2.35.1" => SignatureScheme.Gostr34102012_256b,
+        "1.2.643.2.2.35.2" => SignatureScheme.Gostr34102012_256c,
+        "1.2.643.2.2.35.3" => SignatureScheme.Gostr34102012_256d,
+        "1.2.643.7.1.2.1.2.1" => SignatureScheme.Gostr34102012_512a,
+        "1.2.643.7.1.2.1.2.2" => SignatureScheme.Gostr34102012_512b,
+        "1.2.643.7.1.2.1.2.3" => SignatureScheme.Gostr34102012_512c,
+        _ => throw new TlsException(AlertDescription.HandshakeFailure, $"Unknown GOST curve OID: {curveOid}")
+    };
+
+    // PublicKey layout: Q.X(LE) ‖ Q.Y(LE); PrivateKey: D(LE) — both as exported by GostECDsaManaged.
+    private static OpenGost.Security.Cryptography.GostECDsaManaged ImportGostKey(
+        byte[]? privateKey, byte[] publicKey, SignatureScheme scheme)
+    {
+        var (curveOid, size, _) = GostParams(scheme);
+        var p = new ECParameters
+        {
+            Curve = ECCurve.CreateFromValue(curveOid),
+            Q = new ECPoint { X = publicKey[..size], Y = publicKey[size..(2 * size)] },
+            D = privateKey,
+        };
+        return new OpenGost.Security.Cryptography.GostECDsaManaged(p);
+    }
+
+    /// <summary>Generate a GOST keypair + X.509 certificate signed by an (ECDSA/RSA) CA.</summary>
+    public static TlsCertificate IssueGostCertificate(string commonName, TlsCertificate ca,
+        CertificateProfile profile, SignatureScheme scheme = SignatureScheme.Gostr34102012_256a, int validDays = 365)
+    {
+        var (curveOid, size, _) = GostParams(scheme);
+        using var g = new OpenGost.Security.Cryptography.GostECDsaManaged();
+        g.GenerateKey(ECCurve.CreateFromValue(curveOid));
+        var p = g.ExportParameters(true);
+        byte[] pub = new byte[2 * size];
+        Buffer.BlockCopy(p.Q.X!, 0, pub, 0, size);
+        Buffer.BlockCopy(p.Q.Y!, 0, pub, size, size);
+        byte[] priv = p.D!;
+
+        string caCommonName = ExtractCommonName(ca.DerData);
+        var extensions = BuildIssuedExtensions(commonName, ca.PublicKey, profile);
+        byte[] spki = BuildGostSpki(pub, scheme);
+        byte[] cert = SignCertWithCa(caCommonName, commonName, spki, extensions, ca, validDays);
+
+        return new TlsCertificate
+        {
+            DerData = cert,
+            PrivateKey = priv,
+            PublicKey = pub,
+            SignatureAlgorithm = scheme,
+            ChainCertificates = new[] { ca.DerData }
+        };
+    }
+
+    // RFC 4491 GOST SubjectPublicKeyInfo: BIT STRING wraps a DER OCTET STRING of X(LE)‖Y(LE).
+    private static byte[] BuildGostSpki(byte[] pub, SignatureScheme scheme)
+    {
+        var (curveOid, _, is512) = GostParams(scheme);
+        return Asn1.Sequence(
+            Asn1.Sequence(
+                Asn1.Oid(is512 ? OidGost512 : OidGost256),
+                Asn1.Sequence(
+                    Asn1.Oid(curveOid),
+                    Asn1.Oid(is512 ? OidStreebog512 : OidStreebog256))),
+            Asn1.BitString(Asn1.OctetString(pub)));
+    }
+
+    // ================================================================
+    //  SM2 signatures + certificates (GB/T 32918 / RFC 8998)
+    // ================================================================
+
+    // RFC 8998 §3.1: SM2 identifier for TLS 1.3 handshake (CertificateVerify) signatures.
+    private const string Sm2TlsId = "TLSv1.3+GM+Cipher+Suite";
+    private const string OidSm2Curve = "1.2.156.10197.1.301"; // sm2p256v1 / curveSM2
+
+    private static byte[] ToFixed(byte[] derInt, int size)
+    {
+        // strip a DER leading sign-zero / extra zeros, then left-pad to size
+        int start = 0;
+        while (start < derInt.Length - 1 && derInt[start] == 0) start++;
+        int len = derInt.Length - start;
+        byte[] r = new byte[size];
+        Buffer.BlockCopy(derInt, start, r, size - len, Math.Min(len, size));
+        return r;
+    }
+
+    /// <summary>Generate an SM2 keypair + X.509 certificate signed by an (ECDSA/RSA) CA.</summary>
+    public static TlsCertificate IssueSm2Certificate(string commonName, TlsCertificate ca,
+        CertificateProfile profile, int validDays = 365)
+    {
+        var (priv, pub) = ChineseCrypto.SM2.GenerateKeyPair();   // priv: d(32 BE), pub: X‖Y (64 BE)
+        string caCommonName = ExtractCommonName(ca.DerData);
+        var extensions = BuildIssuedExtensions(commonName, ca.PublicKey, profile);
+        byte[] spki = BuildSm2Spki(pub);
+        byte[] cert = SignCertWithCa(caCommonName, commonName, spki, extensions, ca, validDays);
+
+        return new TlsCertificate
+        {
+            DerData = cert,
+            PrivateKey = priv,
+            PublicKey = pub,
+            SignatureAlgorithm = SignatureScheme.Sm2Sm3,
+            ChainCertificates = new[] { ca.DerData }
+        };
+    }
+
+    // SM2 SubjectPublicKeyInfo: id-ecPublicKey + sm2 curve OID, BIT STRING(0x04‖X‖Y) uncompressed point.
+    private static byte[] BuildSm2Spki(byte[] pubXY)
+    {
+        byte[] uncompressed = new byte[1 + pubXY.Length];
+        uncompressed[0] = 0x04;
+        Buffer.BlockCopy(pubXY, 0, uncompressed, 1, pubXY.Length);
+        return Asn1.Sequence(
+            Asn1.Sequence(Asn1.Oid(OidEcPublicKey), Asn1.Oid(OidSm2Curve)),
+            Asn1.BitString(uncompressed));
     }
 
     public static (byte[] publicKey, SignatureScheme sigAlg) ParseCertificatePublicKey(byte[] certDer)
@@ -592,7 +824,11 @@ public static class CertificateUtils
 
         if (algOidTlv.AsSpan().SequenceEqual(ecOidTlv))
         {
-            byte[] pubKey = spkiItems[1].value[1..]; // skip unused-bits byte
+            byte[] pubKey = spkiItems[1].value[1..]; // skip unused-bits byte → 0x04‖X‖Y
+            // SM2 uses id-ecPublicKey with the sm2 curve OID; distinguish from secp256r1.
+            if (algItems.Count > 1 && Asn1.Wrap(algItems[1].tag, algItems[1].value)
+                    .AsSpan().SequenceEqual(Asn1.Oid(OidSm2Curve)))
+                return (pubKey[1..], SignatureScheme.Sm2Sm3); // strip 0x04 → X‖Y
             return (pubKey, SignatureScheme.EcdsaSecp256r1Sha256);
         }
 
@@ -600,6 +836,19 @@ public static class CertificateUtils
         {
             byte[] rsaPubKeyDer = spkiItems[1].value[1..]; // skip unused-bits → DER RSAPublicKey
             return (rsaPubKeyDer, SignatureScheme.RsaPssRsaeSha256);
+        }
+
+        if (algOidTlv.AsSpan().SequenceEqual(Asn1.Oid(OidGost256)) ||
+            algOidTlv.AsSpan().SequenceEqual(Asn1.Oid(OidGost512)))
+        {
+            // parameters SEQUENCE: first OID is the curve (param set)
+            var gostParamItems = Asn1.ReadSequenceItems(algItems[1].value);
+            byte[] curveOidTlv = Asn1.Wrap(gostParamItems[0].tag, gostParamItems[0].value);
+            SignatureScheme scheme = MatchGostCurveOid(curveOidTlv);
+            // subjectPublicKey BIT STRING → strip unused-bits byte → DER OCTET STRING → X(LE)‖Y(LE)
+            byte[] octetTlv = spkiItems[1].value[1..];
+            var (_, keyOctets, _) = Asn1.ReadTlv(octetTlv);
+            return (keyOctets, scheme);
         }
 
         throw new TlsException(AlertDescription.HandshakeFailure, "Unsupported certificate key algorithm");
@@ -696,7 +945,7 @@ public static class CertificateUtils
         Func<byte[], byte[]> signTbs, int validDays)
     {
         var now = DateTime.UtcNow;
-        byte[] serial = RandomNumberGenerator.GetBytes(16);
+        byte[] serial = RandomnessWrapper.GetBytes(16);
         serial[0] &= 0x7F;
 
         byte[] tbsCert = Asn1.Sequence(

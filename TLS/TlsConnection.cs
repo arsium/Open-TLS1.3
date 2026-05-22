@@ -61,7 +61,17 @@ public sealed class TlsConnection
         SignatureScheme.EcdsaSecp384r1Sha384,
         SignatureScheme.Ed25519,
         SignatureScheme.RsaPssRsaeSha256,
-        SignatureScheme.RsaPssRsaeSha384
+        SignatureScheme.RsaPssRsaeSha384,
+        // RFC 9367 GOST R 34.10-2012 signature schemes
+        SignatureScheme.Gostr34102012_256a,
+        SignatureScheme.Gostr34102012_256b,
+        SignatureScheme.Gostr34102012_256c,
+        SignatureScheme.Gostr34102012_256d,
+        SignatureScheme.Gostr34102012_512a,
+        SignatureScheme.Gostr34102012_512b,
+        SignatureScheme.Gostr34102012_512c,
+        // RFC 8998 SM2 signature scheme
+        SignatureScheme.Sm2Sm3
     };
 
     // Supported named groups in preference order
@@ -71,11 +81,26 @@ public sealed class TlsConnection
         NamedGroup.X25519,
         NamedGroup.X448,
         NamedGroup.Secp256r1,
-        NamedGroup.Secp384r1
+        NamedGroup.Secp384r1,
+        // RFC 9367 GOST curves (lower preference; selected when a client offers only these)
+        NamedGroup.GC256A,
+        NamedGroup.GC256B,
+        NamedGroup.GC256C,
+        NamedGroup.GC256D,
+        NamedGroup.GC512A,
+        NamedGroup.GC512B,
+        NamedGroup.GC512C,
+        // RFC 8998 Chinese SM2 curve
+        NamedGroup.Curvesm2
     };
 
     // ALPN
     private string[]? _alpnProtocols;      // offered protocols (client) or accepted protocols (server)
+    private CipherSuite[]? _offeredSuites;  // client: override the default offered cipher suite list
+    private NamedGroup[]? _offeredGroups;   // client: override the default offered key-share groups
+    private byte[]? _gostKexPriv;           // client: ephemeral GOST ECDH private key (if a GOST group offered)
+    private string? _gostKexCurveOid;       // client: curve OID for _gostKexPriv
+    private byte[]? _sm2KexPriv;            // client: ephemeral SM2 ECDH private key (if curveSM2 offered)
     private string? _negotiatedAlpn;       // result of negotiation
 
     /// <summary>Negotiated ALPN protocol, or null if ALPN was not used.</summary>
@@ -100,11 +125,13 @@ public sealed class TlsConnection
 
     // PSK / Resumption
     private SessionTicket? _pskTicket;       // client: ticket to offer
+    private ExternalPsk? _externalPsk;       // RFC 9258: external PSK for import
     private byte[]? _earlyData;              // client: data to send as 0-RTT
     private TicketEncryption? _ticketEncryption; // server: ticket sealing key
     private bool _enableTickets;
     private bool _accept0Rtt;
     private uint _maxEarlyDataSize;
+    private ushort _ticketRequestCount;      // RFC 9149: client-requested ticket count
 
     // Post-handshake auth
     private PostHsAuthState _postHsAuthState = PostHsAuthState.None;
@@ -115,6 +142,11 @@ public sealed class TlsConnection
     // OCSP stapling
     private bool _requestOcspStapling;  // client: request status_request extension
     private byte[]? _ocspResponse;      // server: OCSP response to staple
+
+    // ECH (Encrypted Client Hello)
+    private EncryptedClientHello.EchConfig[]? _echConfigs;    // client: ECH configurations
+    private byte[]? _echPrivateKey;                           // server: ECH decryption key
+    private EncryptedClientHello.EchClientContext? _echContext; // client: ECH encryption context
 
     public TlsConnection(Stream stream, bool isServer, TlsCertificate? certificate = null,
         bool requireClientCert = false, TlsCertificate? caCertificate = null)
@@ -129,6 +161,9 @@ public sealed class TlsConnection
 
     /// <summary>Configure PSK resumption for client (ticket to offer).</summary>
     public void SetClientTicket(SessionTicket ticket) => _pskTicket = ticket;
+
+    /// <summary>Import external PSK for client/server use (RFC 9258).</summary>
+    public void ImportExternalPsk(ExternalPsk psk) => _externalPsk = psk;
 
     /// <summary>Set early data to send as 0-RTT (client only). Must be called before handshake.</summary>
     public void SetEarlyData(byte[] data) => _earlyData = data;
@@ -145,6 +180,88 @@ public sealed class TlsConnection
     /// <summary>Set ALPN protocols to offer (client) or accept (server).</summary>
     public void SetAlpnProtocols(string[] protocols) => _alpnProtocols = protocols;
 
+    /// <summary>Client: override the cipher suites offered in ClientHello (in preference order).</summary>
+    public void SetOfferedCipherSuites(CipherSuite[] suites) => _offeredSuites = suites;
+
+    /// <summary>Client: override the key-share groups offered in ClientHello (in preference order).</summary>
+    public void SetOfferedGroups(NamedGroup[] groups) => _offeredGroups = groups;
+
+    // Build the ClientHello key_share list, honoring an optional offered-groups override.
+    // GOST groups generate a fresh ephemeral (stored for the later shared-secret computation).
+    private (NamedGroup, byte[])[] BuildClientKeyShares(
+        byte[] hybridPub, byte[] x25519Pub, byte[] x448Pub, byte[] p256Pub, byte[] p384Pub)
+    {
+        var offered = _offeredGroups ?? new[]
+        {
+            NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
+            NamedGroup.Secp256r1, NamedGroup.Secp384r1
+        };
+        var list = new List<(NamedGroup, byte[])>();
+        foreach (var g in offered)
+        {
+            switch (g)
+            {
+                case NamedGroup.X25519MLKEM768: list.Add((g, hybridPub)); break;
+                case NamedGroup.X25519: list.Add((g, x25519Pub)); break;
+                case NamedGroup.X448: list.Add((g, x448Pub)); break;
+                case NamedGroup.Secp256r1: list.Add((g, p256Pub)); break;
+                case NamedGroup.Secp384r1: list.Add((g, p384Pub)); break;
+                case NamedGroup.Curvesm2:
+                {
+                    var (priv, pub) = ChineseCrypto.SM2.EcdhGenerateKeyPair();
+                    _sm2KexPriv = priv;
+                    list.Add((g, pub));
+                    break;
+                }
+                default:
+                    string? oid = GostGroupCurveOid(g);
+                    if (oid != null)
+                    {
+                        var (priv, pub) = GostEcdh.GenerateKeyPair(oid);
+                        _gostKexPriv = priv;
+                        _gostKexCurveOid = oid;
+                        list.Add((g, pub));
+                    }
+                    break;
+            }
+        }
+        return list.ToArray();
+    }
+
+    // RFC 8446 §4.1.3: abort if ServerHello.random carries a version-downgrade sentinel.
+    private static readonly byte[] DowngradeSentinel12 = { 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01 };
+    private static readonly byte[] DowngradeSentinel11 = { 0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00 };
+    private void CheckDowngradeSentinel(byte[] serverRandom)
+    {
+        if (serverRandom.Length < 8) return;
+        var tail = serverRandom.AsSpan(serverRandom.Length - 8);
+        if (tail.SequenceEqual(DowngradeSentinel12) || tail.SequenceEqual(DowngradeSentinel11))
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "TLS version-downgrade sentinel detected (RFC 8446 §4.1.3)");
+    }
+
+    // RFC 8449: clamp our outgoing record size to the peer's advertised record_size_limit.
+    private void ApplyPeerRecordSizeLimit(ushort limit)
+    {
+        if (limit == 0) return; // not negotiated
+        if (limit < 64)
+            AlertAndThrow(AlertDescription.IllegalParameter, "record_size_limit below 64");
+        _record.MaxSendPlaintext = Math.Min(TlsConst.MaxPlaintextLength, limit - 1);
+    }
+
+    /// <summary>Curve OID for a RFC 9367 GOST named group, or null if not a GOST group.</summary>
+    internal static string? GostGroupCurveOid(NamedGroup g) => g switch
+    {
+        NamedGroup.GC256A => "1.2.643.7.1.2.1.1.1",
+        NamedGroup.GC256B => "1.2.643.2.2.35.1",
+        NamedGroup.GC256C => "1.2.643.2.2.35.2",
+        NamedGroup.GC256D => "1.2.643.2.2.35.3",
+        NamedGroup.GC512A => "1.2.643.7.1.2.1.2.1",
+        NamedGroup.GC512B => "1.2.643.7.1.2.1.2.2",
+        NamedGroup.GC512C => "1.2.643.7.1.2.1.2.3",
+        _ => null
+    };
+
     /// <summary>Enable certificate compression (server-side, uses brotli).</summary>
     public void EnableCertificateCompression() => _useCertCompression = true;
 
@@ -158,6 +275,23 @@ public sealed class TlsConnection
     public byte[]? PeerOcspResponse { get; private set; }
 
     // ================================================================
+    //  ECH Configuration API (RFC 9849)
+    // ================================================================
+
+    /// <summary>Configure ECH for client (set ECHConfigList from server).</summary>
+    public void SetEchConfigs(EncryptedClientHello.EchConfig[] configs) => _echConfigs = configs;
+
+    /// <summary>Configure ECH for server (set private key for ECH decryption).</summary>
+    public void SetEchPrivateKey(byte[] privateKey)
+    {
+        if (privateKey.Length != 32) throw new ArgumentException("ECH private key must be 32 bytes (X25519)");
+        _echPrivateKey = privateKey;
+    }
+
+    /// <summary>True if ECH was used in this connection.</summary>
+    public bool IsEchConnection => _echContext != null;
+
+    // ================================================================
     //  Exporter Interface (RFC 8446 §7.5)
     // ================================================================
 
@@ -167,6 +301,204 @@ public sealed class TlsConnection
         if (!IsHandshakeComplete || _keySchedule?.ExporterMasterSecret == null)
             throw new InvalidOperationException("Handshake not complete");
         return _keySchedule.ExportKeyingMaterial(label, context, length);
+    }
+
+    // ================================================================
+    //  TLS Channel Binding Interface (RFC 9266)
+    // ================================================================
+
+    private byte[]? _clientFinishedValue;
+    private byte[]? _serverFinishedValue;
+
+    /// <summary>Get TLS channel binding data for the specified binding type (RFC 9266).</summary>
+    public byte[] GetChannelBinding(ChannelBindingType bindingType)
+    {
+        if (!IsHandshakeComplete)
+            throw new InvalidOperationException("Handshake not complete");
+
+        return bindingType switch
+        {
+            ChannelBindingType.TlsFinished => GetTlsFinishedBinding(),
+            ChannelBindingType.TlsUnique => GetTlsUniqueBinding(),
+            ChannelBindingType.TlsServerEndPoint => GetTlsServerEndPointBinding(),
+            ChannelBindingType.TlsExporter => GetTlsExporterBinding(),
+            _ => throw new ArgumentException($"Unsupported channel binding type: {bindingType}")
+        };
+    }
+
+    private byte[] GetTlsFinishedBinding()
+    {
+        // RFC 9266 §3.1: TLS-Finished uses the verify_data from the Finished message
+        // For TLS 1.3, use the peer's Finished verify_data (server's for client, client's for server)
+        byte[]? peerFinished = _isServer ? _clientFinishedValue : _serverFinishedValue;
+        if (peerFinished == null)
+            throw new InvalidOperationException("Peer Finished message not available");
+        return peerFinished;
+    }
+
+    private byte[] GetTlsUniqueBinding()
+    {
+        // RFC 9266 §3.2: TLS-Unique not defined for TLS 1.3, use TLS-Exporter instead
+        return GetTlsExporterBinding();
+    }
+
+    private byte[] GetTlsServerEndPointBinding()
+    {
+        // RFC 9266 §3.3: TLS-Server-End-Point uses hash of server certificate
+        if (PeerCertificateData == null)
+            throw new InvalidOperationException("No peer certificate available");
+
+        // Use SHA-256 for certificate hashing (RFC 9266 recommendation)
+        using var hasher = SHA256.Create();
+        return hasher.ComputeHash(PeerCertificateData);
+    }
+
+    private byte[] GetTlsExporterBinding()
+    {
+        // RFC 9266 §3.4: TLS-Exporter uses the TLS exporter with specific label
+        return ExportKeyingMaterial("EXPORTER-Channel-Binding", Array.Empty<byte>(), 32);
+    }
+
+    // ================================================================
+    //  External PSK Importer (RFC 9258)
+    // ================================================================
+
+    /// <summary>Derive PSK from external key material (RFC 9258).</summary>
+    private static byte[] DeriveExternalPskKey(byte[] externalKey, CipherSuite suite)
+    {
+        // RFC 9258 §3: PSK = HKDF-Extract(salt=0, IKM=external_key)
+        var hashAlg = suite switch
+        {
+            CipherSuite.TLS_AES_128_GCM_SHA256 or CipherSuite.TLS_CHACHA20_POLY1305_SHA256 => HashAlgorithmName.SHA256,
+            CipherSuite.TLS_AES_256_GCM_SHA384 => HashAlgorithmName.SHA384,
+            _ => throw new ArgumentException($"Unsupported cipher suite for external PSK: {suite}")
+        };
+
+        int hashLen = hashAlg.Name switch
+        {
+            "SHA256" => 32,
+            "SHA384" => 48,
+            _ => throw new ArgumentException($"Unsupported hash algorithm: {hashAlg.Name}")
+        };
+
+        byte[] salt = new byte[hashLen]; // salt = 0^hash_len
+        return Hkdf.Extract(hashAlg, externalKey, salt);
+    }
+
+    // ================================================================
+    //  Exported Authenticators (RFC 9261)
+    // ================================================================
+
+    /// <summary>Generate exported authenticator for certificate (RFC 9261).</summary>
+    public byte[] ExportAuthenticator(TlsCertificate certificate, byte[] context, bool isServer = true)
+    {
+        if (!IsHandshakeComplete || _keySchedule?.ExporterMasterSecret == null)
+            throw new InvalidOperationException("Handshake not complete");
+
+        // RFC 9261 §3.1: Derive authenticator traffic secret
+        string label = isServer ? "EXPORTER-server authenticator" : "EXPORTER-client authenticator";
+        byte[] authSecret = ExportKeyingMaterial(label, context, _keySchedule.HashLen);
+
+        // Build CertificateVerify-style structure
+        string signContext = isServer ? "TLS 1.3, server authenticator" : "TLS 1.3, client authenticator";
+        byte[] signContent = HandshakeMessages.BuildCertVerifyContent(signContext, context);
+        byte[] signature = CertificateUtils.Sign(signContent, certificate.PrivateKey,
+            certificate.PublicKey, certificate.SignatureAlgorithm);
+
+        // Build exported authenticator structure (simplified Certificate + CertificateVerify)
+        using var ms = new MemoryStream();
+
+        // Certificate message structure
+        BinaryHelper.WriteUInt24(ms, 0); // certificate_request_context length = 0
+
+        // Certificate entries
+        int totalCertLen = certificate.DerData.Length + 3 + 2; // cert + len + ext_len
+        foreach (var chainCert in certificate.ChainCertificates)
+            totalCertLen += chainCert.Length + 3 + 2;
+
+        BinaryHelper.WriteUInt24(ms, (uint)totalCertLen);
+
+        // Write primary certificate
+        BinaryHelper.WriteUInt24(ms, (uint)certificate.DerData.Length);
+        ms.Write(certificate.DerData);
+        BinaryHelper.WriteUInt16(ms, 0); // extensions length = 0
+
+        // Write chain certificates
+        foreach (var chainCert in certificate.ChainCertificates)
+        {
+            BinaryHelper.WriteUInt24(ms, (uint)chainCert.Length);
+            ms.Write(chainCert);
+            BinaryHelper.WriteUInt16(ms, 0); // extensions length = 0
+        }
+
+        // CertificateVerify structure
+        BinaryHelper.WriteUInt16(ms, (ushort)certificate.SignatureAlgorithm);
+        BinaryHelper.WriteUInt16(ms, (ushort)signature.Length);
+        ms.Write(signature);
+
+        return ms.ToArray();
+    }
+
+    /// <summary>Verify exported authenticator (RFC 9261).</summary>
+    public bool VerifyExportedAuthenticator(byte[] authenticator, byte[] context, bool isServer = true,
+        TlsCertificate? caCertificate = null)
+    {
+        if (!IsHandshakeComplete || _keySchedule?.ExporterMasterSecret == null)
+            throw new InvalidOperationException("Handshake not complete");
+
+        try
+        {
+            // Parse authenticator structure
+            int pos = 0;
+
+            // Skip certificate_request_context
+            int contextLen = (int)BinaryHelper.ReadUInt24(authenticator.AsSpan(pos)); pos += 3;
+            pos += contextLen; // should be 0
+
+            // Parse certificate list
+            int certListLen = (int)BinaryHelper.ReadUInt24(authenticator.AsSpan(pos)); pos += 3;
+
+            if (certListLen == 0) return false; // No certificates
+
+            // Extract first certificate
+            int firstCertLen = (int)BinaryHelper.ReadUInt24(authenticator.AsSpan(pos)); pos += 3;
+            byte[] certDer = authenticator[pos..(pos + firstCertLen)]; pos += firstCertLen;
+            int extLen = (int)BinaryHelper.ReadUInt16(authenticator.AsSpan(pos)); pos += 2;
+            pos += extLen; // skip extensions
+
+            // Skip remaining certificates in chain
+            while (pos < 3 + 3 + certListLen)
+            {
+                int nextCertLen = (int)BinaryHelper.ReadUInt24(authenticator.AsSpan(pos)); pos += 3;
+                pos += nextCertLen;
+                int nextExtLen = (int)BinaryHelper.ReadUInt16(authenticator.AsSpan(pos)); pos += 2;
+                pos += nextExtLen;
+            }
+
+            // Parse CertificateVerify
+            var sigAlg = (SignatureScheme)BinaryHelper.ReadUInt16(authenticator.AsSpan(pos)); pos += 2;
+            int sigLen = BinaryHelper.ReadUInt16(authenticator.AsSpan(pos)); pos += 2;
+            byte[] signature = authenticator[pos..(pos + sigLen)];
+
+            // Verify certificate chain if CA provided
+            if (caCertificate != null)
+            {
+                var cert = new TlsCertificate { DerData = certDer };
+                if (!CertificateUtils.VerifyChain(cert, caCertificate))
+                    return false;
+            }
+
+            // Verify signature
+            var tempCert = new TlsCertificate { DerData = certDer };
+            string signContext = isServer ? "TLS 1.3, server authenticator" : "TLS 1.3, client authenticator";
+            byte[] signContent = HandshakeMessages.BuildCertVerifyContent(signContext, context);
+
+            return CertificateUtils.Verify(signContent, signature, tempCert.PublicKey, sigAlg);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // ================================================================
@@ -189,24 +521,17 @@ public sealed class TlsConnection
         Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
         Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
 
-        byte[] clientRandom = RandomNumberGenerator.GetBytes(32);
+        byte[] clientRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = clientRandom;
-        byte[] sessionId = RandomNumberGenerator.GetBytes(32);
+        byte[] sessionId = RandomnessWrapper.GetBytes(32);
 
-        var suites = new[]
+        var suites = _offeredSuites ?? new[]
         {
             CipherSuite.TLS_AES_256_GCM_SHA384,
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
             CipherSuite.TLS_AES_128_GCM_SHA256
         };
-        var keyShares = new (NamedGroup, byte[])[]
-        {
-            (NamedGroup.X25519MLKEM768, hybridPub),
-            (NamedGroup.X25519, x25519Pub),
-            (NamedGroup.X448, x448Pub),
-            (NamedGroup.Secp256r1, p256Pub),
-            (NamedGroup.Secp384r1, p384Pub)
-        };
+        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub);
 
         // 2. Build ClientHello (with PSK if available)
         byte[] chMsg;
@@ -251,10 +576,64 @@ public sealed class TlsConnection
             byte[] binder = HandshakeMessages.ComputePskBinder(binderKey, truncatedHash, _keySchedule.HashAlgorithm);
             HandshakeMessages.PatchPskBinder(chMsg, binder);
         }
+        else if (_externalPsk != null)
+        {
+            // RFC 9258: Use imported external PSK
+            psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+
+            _keySchedule = new KeySchedule(_externalPsk.Suite, psk);
+            _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
+
+            // Build CH with placeholder binder
+            int binderLen = _keySchedule.HashLen;
+            byte[] placeholder = new byte[binderLen];
+            offer0Rtt = _externalPsk.MaxEarlyDataSize > 0;
+
+            chMsg = HandshakeMessages.BuildClientHelloWithPsk(
+                clientRandom, sessionId, suites, keyShares,
+                _externalPsk.Identity, 0, placeholder, // External PSK age is always 0
+                offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
+                requestOcspStapling: _requestOcspStapling);
+
+            // Compute and patch the real binder
+            int bindersLen = HandshakeMessages.PskBindersTailLength(binderLen);
+            byte[] truncatedCh = chMsg[..^bindersLen];
+
+            var binderTranscript = new TranscriptHash(_keySchedule.HashAlgorithm);
+            binderTranscript.Update(truncatedCh);
+            byte[] truncatedHash = binderTranscript.GetHash();
+
+            byte[] binderKey = _keySchedule.DeriveBinderKey();
+            byte[] binder = HandshakeMessages.ComputePskBinder(binderKey, truncatedHash, _keySchedule.HashAlgorithm);
+            HandshakeMessages.PatchPskBinder(chMsg, binder);
+        }
         else
         {
-            chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+            // Check if ECH should be used
+            if (_echConfigs != null && _echConfigs.Length > 0 && serverName != null)
+            {
+                var echConfig = _echConfigs[0]; // Use first available config
+
+                // Build inner ClientHello with real server name
+                byte[] innerCh = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
+                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+
+                // Build outer ClientHello template with public name
+                string publicName = System.Text.Encoding.UTF8.GetString(echConfig.PublicName);
+                byte[] outerTemplate = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
+                    publicName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+
+                // Encrypt ClientHello using ECH
+                var (outerCh, echContext) = EncryptedClientHello.EncryptClientHello(innerCh, echConfig, outerTemplate);
+                _echContext = echContext;
+                chMsg = outerCh;
+            }
+            else
+            {
+                // Normal ClientHello without ECH
+                chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
+                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+            }
         }
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
@@ -267,7 +646,7 @@ public sealed class TlsConnection
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
             if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
-            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
+            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
 
             // Write actual early data under early traffic keys
             if (_earlyData != null && _earlyData.Length > 0)
@@ -289,6 +668,7 @@ public sealed class TlsConnection
         byte[] shMsg = NextHandshake(HandshakeType.ServerHello);
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
+        if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
 
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
@@ -387,6 +767,7 @@ public sealed class TlsConnection
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
+            CheckDowngradeSentinel(sh.ServerRandom);
             if (sh.CipherSuite != _keySchedule.Suite)
                 AlertAndThrow(AlertDescription.IllegalParameter, "Cipher suite changed after HRR");
         }
@@ -419,7 +800,7 @@ public sealed class TlsConnection
 
         // 7. Install server handshake read cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.IsChaCha20));
+        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
 
         // 8. EncryptedExtensions
         byte[] eeMsg = NextHandshake(HandshakeType.EncryptedExtensions);
@@ -429,6 +810,7 @@ public sealed class TlsConnection
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
+        ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
         EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
 
         // 9. If PSK resumption: skip to Finished (no Certificate/CertificateVerify)
@@ -443,6 +825,9 @@ public sealed class TlsConnection
                 _keySchedule.ServerHandshakeTrafficSecret!, preFinHash);
             if (!CryptographicOperations.FixedTimeEquals(sfBody, expectedSF))
                 AlertAndThrow(AlertDescription.DecryptError, "Server Finished verification failed");
+
+            // Store server finished for channel binding
+            _serverFinishedValue = expectedSF;
 
             _transcript.Update(sfMsg);
             _serverFinishedHash = _transcript.GetHash();
@@ -463,13 +848,16 @@ public sealed class TlsConnection
 
             // Now switch to handshake keys for Finished
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
 
             byte[] cfVerify = _keySchedule.ComputeFinishedVerifyData(
                 _keySchedule.ClientHandshakeTrafficSecret!, _transcript.GetHash());
             byte[] cfMsg = HandshakeMessages.BuildFinished(cfVerify);
             _record.WriteRecord(ContentType.Handshake, cfMsg);
             _transcript.Update(cfMsg);
+
+            // Store client finished for channel binding
+            _clientFinishedValue = cfVerify;
 
             byte[] fullHash = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHash);
@@ -487,7 +875,7 @@ public sealed class TlsConnection
         {
             _transcript.Update(nextMsg);
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
-            var (ctx, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
             certReqContext = ctx;
             nextMsg = NextHandshakeAny(out nextType);
         }
@@ -543,6 +931,9 @@ public sealed class TlsConnection
         if (!CryptographicOperations.FixedTimeEquals(sfBody2, expectedSF2))
             AlertAndThrow(AlertDescription.DecryptError, "Server Finished verification failed");
 
+        // Store server finished for channel binding
+        _serverFinishedValue = expectedSF2;
+
         _transcript.Update(sfMsg2);
 
         // 14. Derive application secrets
@@ -555,7 +946,7 @@ public sealed class TlsConnection
             _record.WriteChangeCipherSpec();
 
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.IsChaCha20));
+        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
 
         // 16. If mTLS: send client Certificate [+ CertificateVerify]
         if (certReqContext != null)
@@ -591,6 +982,9 @@ public sealed class TlsConnection
         _record.WriteRecord(ContentType.Handshake, cfMsg2);
         _transcript.Update(cfMsg2);
 
+        // Store client finished for channel binding
+        _clientFinishedValue = cfVerify2;
+
         // 18. Derive resumption master secret + switch to app keys
         byte[] fullHash2 = _transcript.GetHash();
         _keySchedule.DeriveResumptionMasterSecret(fullHash2);
@@ -614,6 +1008,22 @@ public sealed class TlsConnection
         var (_, chBody) = HandshakeMessages.Unframe(chMsg);
         var ch = HandshakeMessages.ParseClientHello(chBody);
 
+        // 1b. Try ECH decryption if this is an outer ClientHello
+        if (ch.IsOuterClientHello && _echPrivateKey != null && _echConfigs != null)
+        {
+            byte[]? innerChBody = EncryptedClientHello.DecryptClientHello(chBody, _echPrivateKey, _echConfigs);
+            if (innerChBody != null)
+            {
+                // Successfully decrypted ECH - use inner ClientHello
+                ch = HandshakeMessages.ParseClientHello(innerChBody);
+                // Note: We continue using the outer ClientHello for transcript hash as per RFC 9849
+            }
+            // If decryption failed, continue with outer ClientHello (will likely fail later)
+        }
+
+        // RFC 9149: Store ticket request count
+        _ticketRequestCount = ch.TicketRequestCount;
+
         // 2-3. Try PSK resumption first — PSK determines the cipher suite (RFC 8446 §4.2.11)
         CipherSuite suite = default;
         byte[]? psk = null;
@@ -621,57 +1031,94 @@ public sealed class TlsConnection
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
 
-        if (ch.PreSharedKeyData != null && _ticketEncryption != null)
+        if (ch.PreSharedKeyData != null && (_ticketEncryption != null || _externalPsk != null))
         {
             var (identities, ages, binders) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
             for (int i = 0; i < identities.Length; i++)
             {
-                byte[]? plaintext = _ticketEncryption.Open(identities[i]);
-                if (plaintext == null) continue;
-
-                var decoded = TicketEncryption.DecodeTicketState(plaintext);
-                if (decoded == null) continue;
-                var (resumptionSecret, ticketSuite, ageAdd, issuedAt, maxEarly) = decoded.Value;
-
-                // Ticket suite must be offered by client and supported by us
-                if (Array.IndexOf(ch.CipherSuites, ticketSuite) < 0) continue;
-                if (!IsSupportedSuite(ticketSuite)) continue;
-                var elapsed = DateTime.UtcNow - issuedAt;
-                if (elapsed.TotalSeconds > 604800) continue; // max 7 days
-
-                // Validate obfuscated ticket age (RFC 8446 §4.2.11.1)
-                uint reportedAgeMs = ages[i] - ageAdd;
-                uint expectedAgeMs = (uint)Math.Min(elapsed.TotalMilliseconds, uint.MaxValue);
-                long ageDelta = (long)reportedAgeMs - (long)expectedAgeMs;
-                if (ageDelta < 0) ageDelta = -ageDelta;
-                if (ageDelta > 10_000) continue; // reject if age mismatch > 10 seconds
-
-                // resumptionSecret from ticket is already the derived PSK
-                psk = resumptionSecret;
-                var hashAlg = ticketSuite == CipherSuite.TLS_AES_256_GCM_SHA384
-                    ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
-
-                // Verify binder
-                var tempKs = new KeySchedule(ticketSuite, psk);
-                byte[] binderKey = tempKs.DeriveBinderKey();
-
-                // Truncated transcript: CH up to the binders
-                int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                byte[] truncatedCh = chMsg[..^bindersLen];
-                var binderTranscript = new TranscriptHash(hashAlg);
-                binderTranscript.Update(truncatedCh);
-                byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
-                    binderKey, binderTranscript.GetHash(), hashAlg);
-
-                if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                // Try session ticket first
+                byte[]? plaintext = _ticketEncryption?.Open(identities[i]);
+                if (plaintext != null)
                 {
-                    isPskResumption = true;
-                    suite = ticketSuite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
-                    pskMaxEarlyData = maxEarly;
-                    // 0-RTT anti-replay: only accept if ticket hasn't been used before (RFC 8446 §8)
-                    accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
-                        && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
-                    break;
+                    var decoded = TicketEncryption.DecodeTicketState(plaintext);
+                    if (decoded == null) continue;
+                    var (resumptionSecret, ticketSuite, ageAdd, issuedAt, maxEarly) = decoded.Value;
+
+                    // Ticket suite must be offered by client and supported by us
+                    if (Array.IndexOf(ch.CipherSuites, ticketSuite) < 0) continue;
+                    if (!IsSupportedSuite(ticketSuite)) continue;
+                    var elapsed = DateTime.UtcNow - issuedAt;
+                    if (elapsed.TotalSeconds > 604800) continue; // max 7 days
+
+                    // Validate obfuscated ticket age (RFC 8446 §4.2.11.1)
+                    uint reportedAgeMs = ages[i] - ageAdd;
+                    uint expectedAgeMs = (uint)Math.Min(elapsed.TotalMilliseconds, uint.MaxValue);
+                    long ageDelta = (long)reportedAgeMs - (long)expectedAgeMs;
+                    if (ageDelta < 0) ageDelta = -ageDelta;
+                    if (ageDelta > 10_000) continue; // reject if age mismatch > 10 seconds
+
+                    // resumptionSecret from ticket is already the derived PSK
+                    psk = resumptionSecret;
+                    var hashAlg = ticketSuite == CipherSuite.TLS_AES_256_GCM_SHA384
+                        ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
+
+                    // Verify binder
+                    var tempKs = new KeySchedule(ticketSuite, psk);
+                    byte[] binderKey = tempKs.DeriveBinderKey();
+
+                    // Truncated transcript: CH up to the binders
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
+                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    var binderTranscript = new TranscriptHash(hashAlg);
+                    binderTranscript.Update(truncatedCh);
+                    byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
+                        binderKey, binderTranscript.GetHash(), hashAlg);
+
+                    if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                    {
+                        isPskResumption = true;
+                        suite = ticketSuite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
+                        pskMaxEarlyData = maxEarly;
+                        // 0-RTT anti-replay: only accept if ticket hasn't been used before (RFC 8446 §8)
+                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
+                            && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
+                        break;
+                    }
+                }
+                // Try external PSK if ticket didn't match (RFC 9258)
+                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(_externalPsk.Identity.AsSpan()))
+                {
+                    // External PSK suite must be offered by client and supported by us
+                    if (Array.IndexOf(ch.CipherSuites, _externalPsk.Suite) < 0) continue;
+                    if (!IsSupportedSuite(_externalPsk.Suite)) continue;
+
+                    // External PSK age must be 0 (RFC 9258)
+                    if (ages[i] != 0) continue;
+
+                    psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+                    var hashAlg = _externalPsk.Suite == CipherSuite.TLS_AES_256_GCM_SHA384
+                        ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
+
+                    // Verify binder
+                    var tempKs = new KeySchedule(_externalPsk.Suite, psk);
+                    byte[] binderKey = tempKs.DeriveBinderKey();
+
+                    // Truncated transcript: CH up to the binders
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
+                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    var binderTranscript = new TranscriptHash(hashAlg);
+                    binderTranscript.Update(truncatedCh);
+                    byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
+                        binderKey, binderTranscript.GetHash(), hashAlg);
+
+                    if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                    {
+                        isPskResumption = true;
+                        suite = _externalPsk.Suite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
+                        pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
+                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0;
+                        break;
+                    }
                 }
             }
         }
@@ -758,7 +1205,7 @@ public sealed class TlsConnection
         // 7. Generate server key share and compute shared secret
         byte[] shared = ComputeServerSharedSecret(group, clientKey, out byte[] sPub);
 
-        byte[] serverRandom = RandomNumberGenerator.GetBytes(32);
+        byte[] serverRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = ch.ClientRandom;
 
         // 8. Send ServerHello (with PSK extension if resuming)
@@ -783,15 +1230,18 @@ public sealed class TlsConnection
 
         // 11. Install server handshake write cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.IsChaCha20));
+        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
 
         // 12. EncryptedExtensions (with ALPN and cert compression negotiation)
         string? negotiatedAlpn = NegotiateAlpn(ch.AlpnProtocols);
         _negotiatedAlpn = negotiatedAlpn;
         ushort certCompAlg = NegotiateCertCompression(ch.CertCompressionAlgorithms);
-        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg);
+        // RFC 8449: echo a record_size_limit only if the client offered one; honor the client's limit.
+        ushort rslToSend = ch.RecordSizeLimit > 0 ? (ushort)TlsConst.MaxPlaintextLength : (ushort)0;
+        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg, rslToSend);
         _record.WriteRecord(ContentType.Handshake, eeMsg);
         _transcript.Update(eeMsg);
+        ApplyPeerRecordSizeLimit(ch.RecordSizeLimit);
 
         if (isPskResumption)
         {
@@ -803,6 +1253,9 @@ public sealed class TlsConnection
             byte[] sfMsg = HandshakeMessages.BuildFinished(sfVerify);
             _record.WriteRecord(ContentType.Handshake, sfMsg);
             _transcript.Update(sfMsg);
+
+            // Store server finished for channel binding
+            _serverFinishedValue = sfVerify;
 
             _serverFinishedHash = _transcript.GetHash();
             _keySchedule.DeriveAppSecrets(_serverFinishedHash);
@@ -817,7 +1270,7 @@ public sealed class TlsConnection
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
                 if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
-                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
+                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
 
                 // Read early data records until EndOfEarlyData
                 using var earlyBuf = new MemoryStream();
@@ -846,7 +1299,7 @@ public sealed class TlsConnection
 
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
 
             // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
             // When the client offered early_data but we rejected it, the client may have
@@ -891,6 +1344,9 @@ public sealed class TlsConnection
             if (!CryptographicOperations.FixedTimeEquals(cfBody, expectedCF))
                 AlertAndThrow(AlertDescription.DecryptError, "Client Finished verification failed");
 
+            // Store client finished for channel binding
+            _clientFinishedValue = expectedCF;
+
             _transcript.Update(cfMsg);
             byte[] fullHashPsk = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHashPsk);
@@ -899,7 +1355,7 @@ public sealed class TlsConnection
             IsHandshakeComplete = true;
             IsResumed = true;
 
-            if (_enableTickets) SendNewSessionTicket();
+            if (_enableTickets && _ticketRequestCount > 0) SendNewSessionTicket(_ticketRequestCount);
             return;
         }
 
@@ -942,6 +1398,9 @@ public sealed class TlsConnection
         _record.WriteRecord(ContentType.Handshake, sfMsg2);
         _transcript.Update(sfMsg2);
 
+        // Store server finished for channel binding
+        _serverFinishedValue = sfVerify2;
+
         // 18. Derive application secrets
         _serverFinishedHash = _transcript.GetHash();
         _keySchedule.DeriveAppSecrets(_serverFinishedHash);
@@ -949,7 +1408,7 @@ public sealed class TlsConnection
 
         // 19. Install client handshake read cipher
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.IsChaCha20));
+        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
 
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
@@ -1008,6 +1467,9 @@ public sealed class TlsConnection
         if (!CryptographicOperations.FixedTimeEquals(cfBody2, expectedCF2))
             AlertAndThrow(AlertDescription.DecryptError, "Client Finished verification failed");
 
+        // Store client finished for channel binding
+        _clientFinishedValue = expectedCF2;
+
         _transcript.Update(cfMsg2);
 
         // 22. Derive resumption master secret + switch to app keys
@@ -1017,7 +1479,7 @@ public sealed class TlsConnection
         InstallAppKeys();
         IsHandshakeComplete = true;
 
-        if (_enableTickets) SendNewSessionTicket();
+        if (_enableTickets && _ticketRequestCount > 0) SendNewSessionTicket(_ticketRequestCount);
     }
 
     // ================================================================
@@ -1035,7 +1497,7 @@ public sealed class TlsConnection
         _writeLock.Wait();
         try
         {
-            byte[] context = RandomNumberGenerator.GetBytes(16);
+            byte[] context = RandomnessWrapper.GetBytes(16);
             _pendingPostHsContext = context;
             byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
             _record.WriteRecord(ContentType.Handshake, crMsg);
@@ -1048,24 +1510,27 @@ public sealed class TlsConnection
     //  Session Ticket (server sends after handshake)
     // ================================================================
 
-    private void SendNewSessionTicket()
+    private void SendNewSessionTicket(ushort count = 1)
     {
         if (_ticketEncryption == null || _keySchedule?.ResumptionMasterSecret == null) return;
 
-        byte[] nonce = RandomNumberGenerator.GetBytes(8);
-        byte[] ticketPsk = _keySchedule.DerivePsk(nonce);
+        for (int i = 0; i < count; i++)
+        {
+            byte[] nonce = RandomnessWrapper.GetBytes(8);
+            byte[] ticketPsk = _keySchedule.DerivePsk(nonce);
 
-        uint lifetime = 86400; // 24 hours
-        uint ageAdd = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(4));
+            uint lifetime = 86400; // 24 hours
+            uint ageAdd = BitConverter.ToUInt32(RandomnessWrapper.GetBytes(4));
 
-        byte[] plaintext = TicketEncryption.EncodeTicketState(
-            ticketPsk, _keySchedule.Suite, ageAdd, DateTime.UtcNow, _maxEarlyDataSize);
-        byte[] ticket = _ticketEncryption.Seal(plaintext);
+            byte[] plaintext = TicketEncryption.EncodeTicketState(
+                ticketPsk, _keySchedule.Suite, ageAdd, DateTime.UtcNow, _maxEarlyDataSize);
+            byte[] ticket = _ticketEncryption.Seal(plaintext);
 
-        byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
-        _writeLock.Wait();
-        try { _record.WriteRecord(ContentType.Handshake, nstMsg); }
-        finally { _writeLock.Release(); }
+            byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
+            _writeLock.Wait();
+            try { _record.WriteRecord(ContentType.Handshake, nstMsg); }
+            finally { _writeLock.Release(); }
+        }
     }
 
     // ================================================================
@@ -1123,6 +1588,11 @@ public sealed class TlsConnection
                 int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
                 _record.WriteRecord(ContentType.ApplicationData, data[pos..(pos + chunk)]);
                 pos += chunk;
+
+                // RFC 8446 §5.5: automatically initiate KeyUpdate as we approach the
+                // per-key usage limit. Only meaningful once the handshake is complete.
+                if (IsHandshakeComplete && _record.WriteCipherNeedsKeyUpdate)
+                    RotateOwnWriteKeyLocked(requestUpdate: false);
             }
         }
         finally { _writeLock.Release(); }
@@ -1140,25 +1610,28 @@ public sealed class TlsConnection
     public void SendKeyUpdate(bool requestUpdate)
     {
         _writeLock.Wait();
-        try
-        {
-            byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
-            _record.WriteRecord(ContentType.Handshake, kuMsg);
+        try { RotateOwnWriteKeyLocked(requestUpdate); }
+        finally { _writeLock.Release(); }
+    }
 
-            if (_isServer)
-            {
-                _keySchedule!.UpdateServerAppTrafficSecret();
-                var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
-            }
+    /// <summary>Send KeyUpdate + rotate our own write key. Caller MUST hold _writeLock.</summary>
+    private void RotateOwnWriteKeyLocked(bool requestUpdate)
+    {
+        byte[] kuMsg = HandshakeMessages.BuildKeyUpdate(requestUpdate);
+        _record.WriteRecord(ContentType.Handshake, kuMsg);
+
+        if (_isServer)
+        {
+            _keySchedule!.UpdateServerAppTrafficSecret();
+            var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
+            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+        }
         else
         {
             _keySchedule!.UpdateClientAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
         }
-        }
-        finally { _writeLock.Release(); }
     }
 
     // ================================================================
@@ -1253,7 +1726,7 @@ public sealed class TlsConnection
     private void HandlePostHandshakeCertRequest(byte[] body)
     {
         if (_isServer) return;
-        var (ctx, _) = HandshakeMessages.ParseCertificateRequest(body);
+        var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(body);
 
         // Build post-handshake transcript: message_hash(Transcript-Hash(CH..CF)) + CR (RFC 8446 §4.4.1)
         var phTranscript = new TranscriptHash(_keySchedule!.HashAlgorithm);
@@ -1381,13 +1854,13 @@ public sealed class TlsConnection
         {
             _keySchedule!.UpdateClientAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead));
         }
         else
         {
             _keySchedule!.UpdateServerAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead));
         }
 
         if (updateRequested) SendKeyUpdate(false);
@@ -1449,28 +1922,41 @@ public sealed class TlsConnection
     {
         var (sk, si) = _keySchedule!.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
         var (ck, ci) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-        bool chacha = _keySchedule.IsChaCha20;
+        var aead = _keySchedule.Aead;
 
         if (_isServer)
         {
-            _record.SetWriteCipher(new AeadCipher(sk, si, chacha));
-            _record.SetReadCipher(new AeadCipher(ck, ci, chacha));
+            _record.SetWriteCipher(new AeadCipher(sk, si, aead));
+            _record.SetReadCipher(new AeadCipher(ck, ci, aead));
         }
         else
         {
-            _record.SetReadCipher(new AeadCipher(sk, si, chacha));
-            _record.SetWriteCipher(new AeadCipher(ck, ci, chacha));
+            _record.SetReadCipher(new AeadCipher(sk, si, aead));
+            _record.SetWriteCipher(new AeadCipher(ck, ci, aead));
         }
     }
 
     /// <summary>Client-side shared secret computation supporting all groups including hybrid ML-KEM.</summary>
-    private static byte[] ComputeClientSharedSecret(
+    private byte[] ComputeClientSharedSecret(
         NamedGroup group, byte[] peerKey,
         byte[] x25519Priv, byte[] x25519Pub,
         byte[] p256Priv, byte[] p256Pub,
         byte[] p384Priv, byte[] p384Pub,
         byte[] x448Priv, byte[] mlkemDk)
     {
+        string? gostOid = GostGroupCurveOid(group);
+        if (gostOid != null)
+        {
+            if (_gostKexPriv == null)
+                throw new TlsException(AlertDescription.IllegalParameter, $"No GOST ephemeral for group: {group}");
+            return GostEcdh.ComputeSharedSecret(_gostKexPriv, peerKey, gostOid);
+        }
+        if (group == NamedGroup.Curvesm2)
+        {
+            if (_sm2KexPriv == null)
+                throw new TlsException(AlertDescription.IllegalParameter, "No SM2 ephemeral for curveSM2");
+            return ChineseCrypto.SM2.EcdhSharedSecret(_sm2KexPriv, peerKey);
+        }
         return group switch
         {
             NamedGroup.X25519 => X25519.SharedSecret(x25519Priv, peerKey),
@@ -1556,8 +2042,23 @@ public sealed class TlsConnection
                 Buffer.BlockCopy(x25519Shared, 0, combined, mlkemShared.Length, x25519Shared.Length);
                 return combined;
             }
+            case NamedGroup.Curvesm2:
+            {
+                var (sPriv, sPub) = ChineseCrypto.SM2.EcdhGenerateKeyPair();
+                serverPublicKey = sPub;
+                return ChineseCrypto.SM2.EcdhSharedSecret(sPriv, clientKey);
+            }
             default:
+            {
+                string? gostOid = GostGroupCurveOid(group);
+                if (gostOid != null)
+                {
+                    var (sPriv, sPub) = GostEcdh.GenerateKeyPair(gostOid);
+                    serverPublicKey = sPub;
+                    return GostEcdh.ComputeSharedSecret(sPriv, clientKey, gostOid);
+                }
                 throw new TlsException(AlertDescription.IllegalParameter, $"Unsupported key share group: {group}");
+            }
         }
     }
 
@@ -1574,12 +2075,18 @@ public sealed class TlsConnection
 
     private string? NegotiateAlpn(string[]? clientProtocols)
     {
-        if (clientProtocols == null || _alpnProtocols == null) return null;
-        // Server picks first match in server preference order
+        // If client did not advertise ALPN, server cannot select.
+        if (clientProtocols == null || clientProtocols.Length == 0) return null;
+        // If server does not support ALPN at all, don't include extension.
+        if (_alpnProtocols == null || _alpnProtocols.Length == 0) return null;
+        // Server picks first match in server preference order.
         foreach (var sp in _alpnProtocols)
             foreach (var cp in clientProtocols)
                 if (sp == cp) return sp;
-        return null; // no match — ALPN not used
+        // RFC 7301 §3.2: client offered ALPN, server supports it, but no overlap.
+        // Server MUST abort with fatal no_application_protocol(120).
+        throw new TlsException(AlertDescription.NoApplicationProtocol,
+            "ALPN: no overlap between client and server protocols");
     }
 
     private ushort NegotiateCertCompression(ushort[]? clientAlgorithms)
@@ -1593,7 +2100,13 @@ public sealed class TlsConnection
     private static bool IsSupportedSuite(CipherSuite s) =>
         s is CipherSuite.TLS_AES_128_GCM_SHA256
             or CipherSuite.TLS_AES_256_GCM_SHA384
-            or CipherSuite.TLS_CHACHA20_POLY1305_SHA256;
+            or CipherSuite.TLS_CHACHA20_POLY1305_SHA256
+            or CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L
+            or CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_L
+            or CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S
+            or CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_S
+            or CipherSuite.TLS_SM4_GCM_SM3
+            or CipherSuite.TLS_SM4_CCM_SM3;
 
     private static CipherSuite SelectCipherSuite(CipherSuite[] clientSuites)
     {
@@ -1601,7 +2114,13 @@ public sealed class TlsConnection
         {
             CipherSuite.TLS_AES_256_GCM_SHA384,
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-            CipherSuite.TLS_AES_128_GCM_SHA256
+            CipherSuite.TLS_AES_128_GCM_SHA256,
+            CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L,
+            CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_L,
+            CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S,
+            CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_S,
+            CipherSuite.TLS_SM4_GCM_SM3,
+            CipherSuite.TLS_SM4_CCM_SM3
         };
         foreach (var s in pref)
             if (Array.IndexOf(clientSuites, s) >= 0) return s;
@@ -1813,24 +2332,27 @@ public sealed class TlsConnection
         finally { _writeLock.Release(); }
     }
 
-    private async Task SendNewSessionTicketAsync(CancellationToken ct = default)
+    private async Task SendNewSessionTicketAsync(ushort count = 1, CancellationToken ct = default)
     {
         if (_ticketEncryption == null || _keySchedule?.ResumptionMasterSecret == null) return;
 
-        byte[] nonce = RandomNumberGenerator.GetBytes(8);
-        byte[] ticketPsk = _keySchedule.DerivePsk(nonce);
+        for (int i = 0; i < count; i++)
+        {
+            byte[] nonce = RandomnessWrapper.GetBytes(8);
+            byte[] ticketPsk = _keySchedule.DerivePsk(nonce);
 
-        uint lifetime = 86400;
-        uint ageAdd = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(4));
+            uint lifetime = 86400;
+            uint ageAdd = BitConverter.ToUInt32(RandomnessWrapper.GetBytes(4));
 
-        byte[] plaintext = TicketEncryption.EncodeTicketState(
-            ticketPsk, _keySchedule.Suite, ageAdd, DateTime.UtcNow, _maxEarlyDataSize);
-        byte[] ticket = _ticketEncryption.Seal(plaintext);
+            byte[] plaintext = TicketEncryption.EncodeTicketState(
+                ticketPsk, _keySchedule.Suite, ageAdd, DateTime.UtcNow, _maxEarlyDataSize);
+            byte[] ticket = _ticketEncryption.Seal(plaintext);
 
-        byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try { await _record.WriteRecordAsync(ContentType.Handshake, nstMsg, ct).ConfigureAwait(false); }
-        finally { _writeLock.Release(); }
+            byte[] nstMsg = HandshakeMessages.BuildNewSessionTicket(lifetime, ageAdd, nonce, ticket, _maxEarlyDataSize);
+            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+            try { await _record.WriteRecordAsync(ContentType.Handshake, nstMsg, ct).ConfigureAwait(false); }
+            finally { _writeLock.Release(); }
+        }
     }
 
     // ================================================================
@@ -1906,13 +2428,13 @@ public sealed class TlsConnection
             {
                 _keySchedule!.UpdateServerAppTrafficSecret();
                 var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
             }
             else
             {
                 _keySchedule!.UpdateClientAppTrafficSecret();
                 var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.IsChaCha20));
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
             }
         }
         finally { _writeLock.Release(); }
@@ -1929,7 +2451,7 @@ public sealed class TlsConnection
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            byte[] context = RandomNumberGenerator.GetBytes(16);
+            byte[] context = RandomnessWrapper.GetBytes(16);
             _pendingPostHsContext = context;
             byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
@@ -1958,24 +2480,17 @@ public sealed class TlsConnection
         Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
         Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
 
-        byte[] clientRandom = RandomNumberGenerator.GetBytes(32);
+        byte[] clientRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = clientRandom;
-        byte[] sessionId = RandomNumberGenerator.GetBytes(32);
+        byte[] sessionId = RandomnessWrapper.GetBytes(32);
 
-        var suites = new[]
+        var suites = _offeredSuites ?? new[]
         {
             CipherSuite.TLS_AES_256_GCM_SHA384,
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
             CipherSuite.TLS_AES_128_GCM_SHA256
         };
-        var keyShares = new (NamedGroup, byte[])[]
-        {
-            (NamedGroup.X25519MLKEM768, hybridPub),
-            (NamedGroup.X25519, x25519Pub),
-            (NamedGroup.X448, x448Pub),
-            (NamedGroup.Secp256r1, p256Pub),
-            (NamedGroup.Secp384r1, p384Pub)
-        };
+        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub);
 
         // 2. Build ClientHello (with PSK if available)
         byte[] chMsg;
@@ -2031,7 +2546,7 @@ public sealed class TlsConnection
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
             if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
-            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
+            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
 
             if (_earlyData != null && _earlyData.Length > 0)
             {
@@ -2051,6 +2566,7 @@ public sealed class TlsConnection
         byte[] shMsg = await NextHandshakeAsync(HandshakeType.ServerHello, ct).ConfigureAwait(false);
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
+        if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
 
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
@@ -2149,6 +2665,7 @@ public sealed class TlsConnection
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
+            CheckDowngradeSentinel(sh.ServerRandom);
             if (sh.CipherSuite != _keySchedule.Suite)
                 AlertAndThrow(AlertDescription.IllegalParameter, "Cipher suite changed after HRR");
         }
@@ -2178,7 +2695,7 @@ public sealed class TlsConnection
 
         // 7. Install server handshake read cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.IsChaCha20));
+        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
 
         // 8. EncryptedExtensions
         byte[] eeMsg = await NextHandshakeAsync(HandshakeType.EncryptedExtensions, ct).ConfigureAwait(false);
@@ -2188,6 +2705,7 @@ public sealed class TlsConnection
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
+        ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
         EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
 
         // 9. PSK resumption: skip to Finished
@@ -2217,7 +2735,7 @@ public sealed class TlsConnection
             }
 
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
 
             byte[] cfVerify = _keySchedule.ComputeFinishedVerifyData(
                 _keySchedule.ClientHandshakeTrafficSecret!, _transcript.GetHash());
@@ -2241,7 +2759,7 @@ public sealed class TlsConnection
         {
             _transcript.Update(nextMsg);
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
-            var (ctx, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
             certReqContext = ctx;
             (nextMsg, nextType) = await NextHandshakeAnyAsync(ct).ConfigureAwait(false);
         }
@@ -2309,7 +2827,7 @@ public sealed class TlsConnection
             await _record.WriteChangeCipherSpecAsync(ct).ConfigureAwait(false);
 
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.IsChaCha20));
+        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
 
         // 16. If mTLS: send client Certificate [+ CertificateVerify]
         if (certReqContext != null)
@@ -2367,6 +2885,9 @@ public sealed class TlsConnection
         _transcript.Update(chMsg);
         var (_, chBody) = HandshakeMessages.Unframe(chMsg);
         var ch = HandshakeMessages.ParseClientHello(chBody);
+
+        // RFC 9149: Store ticket request count
+        _ticketRequestCount = ch.TicketRequestCount;
 
         // 2-3. Try PSK resumption first
         CipherSuite suite = default;
@@ -2502,7 +3023,7 @@ public sealed class TlsConnection
         // 7. Generate server key share and compute shared secret
         byte[] shared = ComputeServerSharedSecret(group, clientKey, out byte[] sPub);
 
-        byte[] serverRandom = RandomNumberGenerator.GetBytes(32);
+        byte[] serverRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = ch.ClientRandom;
 
         // 8. Send ServerHello (with PSK extension if resuming)
@@ -2527,7 +3048,7 @@ public sealed class TlsConnection
 
         // 11. Install server handshake write cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.IsChaCha20));
+        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
 
         // 12. EncryptedExtensions (with ALPN and cert compression negotiation)
         string? negotiatedAlpn = NegotiateAlpn(ch.AlpnProtocols);
@@ -2558,7 +3079,7 @@ public sealed class TlsConnection
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
                 if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
-                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.IsChaCha20));
+                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
 
                 using var earlyBuf = new MemoryStream();
                 bool gotEndOfEarlyData = false;
@@ -2585,7 +3106,7 @@ public sealed class TlsConnection
 
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.IsChaCha20));
+            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
 
             // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
             if (!accept0Rtt && ch.OffersEarlyData)
@@ -2634,7 +3155,7 @@ public sealed class TlsConnection
             IsHandshakeComplete = true;
             IsResumed = true;
 
-            if (_enableTickets) await SendNewSessionTicketAsync(ct).ConfigureAwait(false);
+            if (_enableTickets && _ticketRequestCount > 0) await SendNewSessionTicketAsync(_ticketRequestCount, ct).ConfigureAwait(false);
             return;
         }
 
@@ -2684,7 +3205,7 @@ public sealed class TlsConnection
 
         // 19. Install client handshake read cipher
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.IsChaCha20));
+        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
 
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
@@ -2752,6 +3273,6 @@ public sealed class TlsConnection
         InstallAppKeys();
         IsHandshakeComplete = true;
 
-        if (_enableTickets) await SendNewSessionTicketAsync(ct).ConfigureAwait(false);
+        if (_enableTickets && _ticketRequestCount > 0) await SendNewSessionTicketAsync(_ticketRequestCount, ct).ConfigureAwait(false);
     }
 }

@@ -1,0 +1,14 @@
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\bin\Debug\net9.0\TLSClientAsync.exe
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\bin\Debug\net9.0\TLSClientAsync.deps.json
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\bin\Debug\net9.0\TLSClientAsync.runtimeconfig.json
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\bin\Debug\net9.0\TLSClientAsync.dll
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\bin\Debug\net9.0\TLSClientAsync.pdb
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.AssemblyInfoInputs.cache
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.AssemblyInfo.cs
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.csproj.CoreCompileInputs.cache
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.dll
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\refint\TLSClientAsync.dll
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.pdb
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\TLSClientAsync.genruntimeconfig.cache
+C:\Users\arsium\Desktop\Exploit\TLSServer\TLSClientAsync\obj\Debug\net9.0\ref\TLSClientAsync.dll

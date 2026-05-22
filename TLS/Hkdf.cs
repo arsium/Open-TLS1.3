@@ -11,6 +11,11 @@ public static class Hkdf
         if (salt == null || salt.Length == 0)
             salt = new byte[HashLen(hash)];
 
+        if (GostKdf.IsStreebog(hash))
+            return GostKdf.Hmac(salt, ikm);
+        if (Sm3Kdf.IsSm3(hash))
+            return Sm3Kdf.Hmac(salt, ikm);
+
         using var hmac = IncrementalHash.CreateHMAC(hash, salt);
         hmac.AppendData(ikm);
         return hmac.GetHashAndReset();
@@ -24,13 +29,26 @@ public static class Hkdf
         byte[] result = new byte[length];
         byte[] prev = Array.Empty<byte>();
 
+        bool streebog = GostKdf.IsStreebog(hash);
+        bool sm3 = Sm3Kdf.IsSm3(hash);
         for (int i = 1; i <= n; i++)
         {
-            using var hmac = IncrementalHash.CreateHMAC(hash, prk);
-            hmac.AppendData(prev);
-            hmac.AppendData(info);
-            hmac.AppendData(new[] { (byte)i });
-            prev = hmac.GetHashAndReset();
+            if (streebog || sm3)
+            {
+                byte[] msg = new byte[prev.Length + info.Length + 1];
+                Buffer.BlockCopy(prev, 0, msg, 0, prev.Length);
+                Buffer.BlockCopy(info, 0, msg, prev.Length, info.Length);
+                msg[^1] = (byte)i;
+                prev = streebog ? GostKdf.Hmac(prk, msg) : Sm3Kdf.Hmac(prk, msg);
+            }
+            else
+            {
+                using var hmac = IncrementalHash.CreateHMAC(hash, prk);
+                hmac.AppendData(prev);
+                hmac.AppendData(info);
+                hmac.AppendData(new[] { (byte)i });
+                prev = hmac.GetHashAndReset();
+            }
 
             int off = (i - 1) * hashLen;
             Buffer.BlockCopy(prev, 0, result, off, Math.Min(hashLen, length - off));
@@ -73,6 +91,8 @@ public static class Hkdf
     {
         if (hash == HashAlgorithmName.SHA256) return 32;
         if (hash == HashAlgorithmName.SHA384) return 48;
+        if (GostKdf.IsStreebog(hash)) return 32;
+        if (Sm3Kdf.IsSm3(hash)) return 32;
         throw new ArgumentException($"Unsupported hash algorithm: {hash}");
     }
 }

@@ -65,7 +65,7 @@ public static class Pkcs12
         );
 
         // ---- MAC ----
-        byte[] macSalt = RandomNumberGenerator.GetBytes(20);
+        byte[] macSalt = RandomnessWrapper.GetBytes(20);
         int iterations = 2048;
         byte[] macKey = Pkcs12Kdf(PasswordToBmp(password), macSalt, iterations, 3, 20);
 
