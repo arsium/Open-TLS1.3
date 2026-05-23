@@ -1,0 +1,60 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+﻿using System;
+using System.IO;
+
+namespace Org.BouncyCastle.Asn1
+{
+    /// <summary>Parser for a DL encoded BIT STRING.</summary>
+    internal class DLBitStringParser
+        : Asn1BitStringParser
+    {
+        private readonly DefiniteLengthInputStream m_stream;
+
+        private int m_padBits = 0;
+
+        internal DLBitStringParser(DefiniteLengthInputStream stream)
+        {
+            m_stream = stream;
+        }
+
+        public Stream GetBitStream() => GetBitStream(octetAligned: false);
+
+        public Stream GetOctetStream() => GetBitStream(octetAligned: true);
+
+        public int PadBits => m_padBits;
+
+        public Asn1Object ToAsn1Object()
+        {
+            try
+            {
+                return DerBitString.CreatePrimitive(m_stream.ToArray());
+            }
+            catch (IOException e)
+            {
+                throw new Asn1ParsingException("IOException converting stream to byte array", e);
+            }
+        }
+
+        private Stream GetBitStream(bool octetAligned)
+        {
+            int length = m_stream.Remaining;
+            if (length < 1)
+                throw new InvalidOperationException("content octets cannot be empty");
+
+            m_padBits = m_stream.ReadByte();
+            if (m_padBits > 0)
+            {
+                if (length < 2)
+                    throw new InvalidOperationException("zero length data with non-zero pad bits");
+                if (m_padBits > 7)
+                    throw new InvalidOperationException("pad bits cannot be greater than 7 or less than 0");
+                if (octetAligned)
+                    throw new IOException("expected octet-aligned bitstring, but found padBits: " + m_padBits);
+            }
+
+            return m_stream;
+        }
+    }
+}

@@ -1,0 +1,46 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+﻿using System;
+using Org.BouncyCastle.Utilities;
+
+namespace Org.BouncyCastle.Crypto.Digests
+{
+    public class Gost3411_2012_512Digest:Gost3411_2012Digest
+    {
+		private readonly static byte[] IV = {
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+
+		public override string AlgorithmName
+		{
+			get { return "GOST3411-2012-512"; }
+		}
+
+        public Gost3411_2012_512Digest():base(IV)
+        {
+        }
+
+		public Gost3411_2012_512Digest(Gost3411_2012_512Digest other) : base(IV)
+		{
+            Reset(other);
+        }
+
+        public override int GetDigestSize()
+        {
+            return 64;
+        }
+
+		public override IMemoable Copy()
+		{
+			return new Gost3411_2012_512Digest(this);
+		}
+    }
+}

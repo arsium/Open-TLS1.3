@@ -1,0 +1,187 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+﻿using System;
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+using System.Numerics;
+using System.Runtime.InteropServices;
+#endif
+
+using Org.BouncyCastle.Math.Raw;
+
+namespace Org.BouncyCastle.Utilities
+{
+    public static class Bytes
+    {
+        public const int NumBits = 8;
+        public const int NumBytes = 1;
+
+        public static void CMov(int len, int cond, byte[] x, byte[] z)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            CMov(len, cond, x.AsSpan(), z.AsSpan());
+#else
+            uint m0 = Nat.CZero((uint)cond), m1 = ~m0;
+            for (int i = 0; i < len; ++i)
+            {
+                uint x_i = x[i], z_i = z[i];
+                z[i] = (byte)((z_i & m0) | (x_i & m1));
+            }
+#endif
+        }
+
+        public static void CMov(int len, int cond, byte[] x, int xOff, byte[] z, int zOff)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            CMov(len, cond, x.AsSpan(xOff), z.AsSpan(zOff));
+#else
+            uint m0 = Nat.CZero((uint)cond), m1 = ~m0;
+            for (int i = 0; i < len; ++i)
+            {
+                uint x_i = x[xOff + i], z_i = z[zOff + i];
+                z[zOff + i] = (byte)((z_i & m0) | (x_i & m1));
+            }
+#endif
+        }
+
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+        public static void CMov(int len, int cond, ReadOnlySpan<byte> x, Span<byte> z)
+        {
+            uint m0 = Nat.CZero((uint)cond), m1 = ~m0;
+            for (int i = 0; i < len; ++i)
+            {
+                uint x_i = x[i], z_i = z[i];
+                z[i] = (byte)((z_i & m0) | (x_i & m1));
+            }
+        }
+#endif
+
+        public static void Xor(int len, byte[] x, byte[] y, byte[] z)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            Xor(len, x.AsSpan(0, len), y.AsSpan(0, len), z.AsSpan(0, len));
+#else
+            for (int i = 0; i < len; ++i)
+            {
+                z[i] = (byte)(x[i] ^ y[i]);
+            }
+#endif
+        }
+
+        public static void Xor(int len, byte[] x, int xOff, byte[] y, int yOff, byte[] z, int zOff)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            Xor(len, x.AsSpan(xOff, len), y.AsSpan(yOff, len), z.AsSpan(zOff, len));
+#else
+            for (int i = 0; i < len; ++i)
+            {
+                z[zOff + i] = (byte)(x[xOff + i] ^ y[yOff + i]);
+            }
+#endif
+        }
+
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+        public static void Xor(int len, ReadOnlySpan<byte> x, ReadOnlySpan<byte> y, Span<byte> z)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated)
+            {
+                int limit = len - Vector<byte>.Count;
+                while (i <= limit)
+                {
+                    var vx = new Vector<byte>(x[i..]);
+                    var vy = new Vector<byte>(y[i..]);
+                    (vx ^ vy).CopyTo(z[i..]);
+                    i += Vector<byte>.Count;
+                }
+            }
+            {
+                int limit = len - 8;
+                while (i <= limit)
+                {
+                    ulong x64 = MemoryMarshal.Read<ulong>(x[i..]);
+                    ulong y64 = MemoryMarshal.Read<ulong>(y[i..]);
+                    ulong z64 = x64 ^ y64;
+#if NET8_0_OR_GREATER
+                    MemoryMarshal.Write(z[i..], in z64);
+#else
+                    MemoryMarshal.Write(z[i..], ref z64);
+#endif
+                    i += 8;
+                }
+            }
+            {
+                while (i < len)
+                {
+                    z[i] = (byte)(x[i] ^ y[i]);
+                    ++i;
+                }
+            }
+        }
+#endif
+
+        public static void XorTo(int len, byte[] x, byte[] z)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            XorTo(len, x.AsSpan(0, len), z.AsSpan(0, len));
+#else
+            for (int i = 0; i < len; ++i)
+            {
+                z[i] ^= x[i];
+            }
+#endif
+        }
+
+        public static void XorTo(int len, byte[] x, int xOff, byte[] z, int zOff)
+        {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            XorTo(len, x.AsSpan(xOff, len), z.AsSpan(zOff, len));
+#else
+            for (int i = 0; i < len; ++i)
+            {
+                z[zOff + i] ^= x[xOff + i];
+            }
+#endif
+        }
+
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+        public static void XorTo(int len, ReadOnlySpan<byte> x, Span<byte> z)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated)
+            {
+                int limit = len - Vector<byte>.Count;
+                while (i <= limit)
+                {
+                    var vx = new Vector<byte>(x[i..]);
+                    var vz = new Vector<byte>(z[i..]);
+                    (vx ^ vz).CopyTo(z[i..]);
+                    i += Vector<byte>.Count;
+                }
+            }
+            {
+                int limit = len - 8;
+                while (i <= limit)
+                {
+                    ulong x64 = MemoryMarshal.Read<ulong>(x[i..]);
+                    ulong z64 = MemoryMarshal.Read<ulong>(z[i..]);
+                    z64 ^= x64;
+#if NET8_0_OR_GREATER
+                    MemoryMarshal.Write(z[i..], in z64);
+#else
+                    MemoryMarshal.Write(z[i..], ref z64);
+#endif
+                    i += 8;
+                }
+            }
+            {
+                while (i < len)
+                {
+                    z[i] ^= x[i];
+                    ++i;
+                }
+            }
+        }
+#endif
+    }
+}

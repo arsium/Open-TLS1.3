@@ -1,0 +1,72 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+using System;
+using System.Collections.Generic;
+
+namespace Org.BouncyCastle.Asn1.Cms
+{
+    public class Attributes
+        : Asn1Encodable
+    {
+        public static Attributes GetInstance(object obj)
+        {
+            if (obj == null)
+                return null;
+            if (obj is Attributes attributes)
+                return attributes;
+            return new Attributes(Asn1Set.GetInstance(obj));
+        }
+
+        public static Attributes GetInstance(Asn1TaggedObject taggedObject, bool declaredExplicit) =>
+            new Attributes(Asn1Set.GetInstance(taggedObject, declaredExplicit));
+
+        public static Attributes GetTagged(Asn1TaggedObject taggedObject, bool declaredExplicit) =>
+            new Attributes(Asn1Set.GetTagged(taggedObject, declaredExplicit));
+
+        public static Attributes GetOptional(Asn1Encodable element)
+        {
+            if (element == null)
+                throw new ArgumentNullException(nameof(element));
+
+            if (element is Attributes attributes)
+                return attributes;
+
+            Asn1Set asn1Set = Asn1Set.GetOptional(element);
+            if (asn1Set != null)
+                return new Attributes(asn1Set);
+
+            return null;
+        }
+
+        private readonly Asn1Set m_attributes;
+
+        private Attributes(Asn1Set attributes)
+        {
+            m_attributes = attributes;
+        }
+
+        public Attributes(Asn1EncodableVector v)
+        {
+            m_attributes = BerSet.FromVector(v);
+        }
+
+        public Attributes(IReadOnlyCollection<Attribute> attributes)
+        {
+            m_attributes = BerSet.FromCollection(attributes);
+        }
+
+        public Asn1Set AttributeSet => m_attributes;
+
+        public virtual Attribute[] GetAttributes() => m_attributes.MapElements(Attribute.GetInstance);
+
+        /**
+         * <pre>
+         * Attributes ::=
+         *   SET SIZE(1..MAX) OF Attribute -- according to RFC 5652
+         * </pre>
+         * @return
+         */
+        public override Asn1Object ToAsn1Object() => m_attributes;
+    }
+}

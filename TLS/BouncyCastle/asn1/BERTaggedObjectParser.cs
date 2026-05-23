@@ -1,0 +1,63 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+using System.IO;
+
+namespace Org.BouncyCastle.Asn1
+{
+    internal class BerTaggedObjectParser
+        : Asn1TaggedObjectParser
+    {
+        internal readonly int m_tagClass;
+        internal readonly int m_tagNo;
+        internal readonly Asn1StreamParser m_parser;
+
+        internal BerTaggedObjectParser(int tagClass, int tagNo, Asn1StreamParser parser)
+        {
+            m_tagClass = tagClass;
+            m_tagNo = tagNo;
+            m_parser = parser;
+        }
+
+        public virtual bool IsConstructed => true;
+
+        public int TagClass => m_tagClass;
+
+        public int TagNo => m_tagNo;
+
+        public bool HasContextTag() => m_tagClass == Asn1Tags.ContextSpecific;
+
+        public bool HasContextTag(int tagNo) => m_tagClass == Asn1Tags.ContextSpecific && m_tagNo == tagNo;
+
+        public bool HasTag(int tagClass, int tagNo) => m_tagClass == tagClass && m_tagNo == tagNo;
+
+        public bool HasTagClass(int tagClass) => m_tagClass == tagClass;
+
+        public virtual IAsn1Convertible ParseBaseUniversal(bool declaredExplicit, int baseTagNo)
+        {
+            if (declaredExplicit)
+                return m_parser.ParseObject(baseTagNo);
+
+            return m_parser.ParseImplicitConstructedIL(baseTagNo);
+        }
+
+        public virtual IAsn1Convertible ParseExplicitBaseObject() => m_parser.ReadObject();
+
+        public virtual Asn1TaggedObjectParser ParseExplicitBaseTagged() => m_parser.ParseTaggedObject();
+
+        public virtual Asn1TaggedObjectParser ParseImplicitBaseTagged(int baseTagClass, int baseTagNo) =>
+            new BerTaggedObjectParser(baseTagClass, baseTagNo, m_parser);
+
+        public virtual Asn1Object ToAsn1Object()
+        {
+            try
+            {
+                return m_parser.LoadTaggedIL(TagClass, TagNo);
+            }
+            catch (IOException e)
+            {
+                throw new Asn1ParsingException(e.Message);
+            }
+        }
+    }
+}

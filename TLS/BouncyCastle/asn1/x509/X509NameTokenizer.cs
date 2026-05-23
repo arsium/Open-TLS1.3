@@ -1,0 +1,90 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+using System;
+
+namespace Org.BouncyCastle.Asn1.X509
+{
+    /// <summary>
+    /// Class for breaking up an X500 Name into it's component tokens.
+    /// </summary>
+    public class X509NameTokenizer
+    {
+        private readonly string m_value;
+        private readonly char m_separator;
+
+        private int m_index;
+
+        public X509NameTokenizer(string oid)
+            : this(oid, ',')
+        {
+        }
+
+        public X509NameTokenizer(string oid, char separator)
+        {
+            if (oid == null)
+                throw new ArgumentNullException(nameof(oid));
+
+            if (separator == '"' || separator == '\\')
+                throw new ArgumentException("reserved separator character", nameof(separator));
+
+            m_value = oid;
+            m_separator = separator;
+            m_index = oid.Length < 1 ? 0 : -1;
+        }
+
+        public bool HasMoreTokens() => m_index < m_value.Length;
+
+        public string NextToken()
+        {
+            int length = m_value.Length;
+            if (m_index >= length)
+                return null;
+
+            bool quoted = false;
+            bool escaped = false;
+
+            int beginIndex = m_index + 1;
+            while (++m_index < length)
+            {
+                char c = m_value[m_index];
+
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (c == '"')
+                {
+                    quoted = !quoted;
+                }
+                else if (quoted)
+                {
+                }
+                else if (c == '\\')
+                {
+                    escaped = true;
+                }
+                else if (c == m_separator)
+                {
+                    return m_value.Substring(beginIndex, m_index - beginIndex);
+                }
+            }
+
+            if (escaped || quoted)
+                throw new ArgumentException("badly formatted directory string");
+
+            return m_value.Substring(beginIndex, m_index - beginIndex);
+        }
+
+        public string Remaining()
+        {
+            int length = m_value.Length;
+            if (m_index >= length)
+                return null;
+
+            int beginIndex = m_index + 1;
+            m_index = length;
+            return m_value.Substring(beginIndex, length - beginIndex);
+        }
+    }
+}

@@ -1,0 +1,30 @@
+#nullable disable
+#pragma warning disable IL3050, IL2070, IL2026, IL2057, IL2059, IL2067, IL2072, IL2075, IL2080, IL2087, IL2090, IL2091, IL3051, CS3021, SYSLIB0051, CA1857, CS0105, CS1591, CA2014, CS8500
+
+using System;
+
+using Org.BouncyCastle.Math;
+
+namespace Org.BouncyCastle.Crypto.Agreement
+{
+    // TODO[api] sealed
+    public class ECDHWithKdfBasicAgreement
+        : ECDHBasicAgreement
+    {
+        private readonly string m_algorithm;
+        private readonly IDerivationFunction m_kdf;
+
+        public ECDHWithKdfBasicAgreement(string algorithm, IDerivationFunction kdf)
+        {
+            m_algorithm = algorithm ?? throw new ArgumentNullException(nameof(algorithm));
+            m_kdf = kdf ?? throw new ArgumentNullException(nameof(kdf));
+        }
+
+        public override BigInteger CalculateAgreement(ICipherParameters pubKey)
+        {
+            BigInteger result = base.CalculateAgreement(pubKey);
+
+            return BasicAgreementWithKdf.CalculateAgreementWithKdf(m_algorithm, m_kdf, GetFieldSize(), result);
+        }
+    }
+}
