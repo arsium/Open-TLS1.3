@@ -1,4 +1,4 @@
-# TLSServer
+# Open-TLS1.3
 
 A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptographic primitive runs through managed code — **no BCrypt / OpenSSL P/Invoke**. The published binary has a single bcrypt.dll import (`BCryptGenRandom`) which serves as the OS entropy source; everything else — hashes, HMACs, AEADs, EC point arithmetic, signatures — is pure C#. AES-NI is used via JIT-emitted CPU intrinsics (not a P/Invoke, gated by `Aes.IsSupported`), so the workhorse cipher stays hardware-fast while remaining portable to non-x86 CPUs.
 
