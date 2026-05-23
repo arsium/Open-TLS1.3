@@ -1,4 +1,5 @@
-﻿using System.Numerics;
+using System.Security.Cryptography;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace OpenGost.Security.Cryptography;
@@ -122,8 +123,14 @@ internal static class CryptoUtils
 
     public static ECCurve Clone(this in ECCurve curve)
     {
+        // Don't go through curve.Oid / ECCurve.CreateFromOid for Named curves — those
+        // touch the BCL Oid type which pulls CryptFindOIDInfo from crypt32.dll. Our code
+        // never feeds Named curves into Clone() anyway (we always materialise the explicit
+        // form via ECCurveOidMap.GetExplicitCurveByOid first).
         if (curve.IsNamed)
-            return ECCurve.CreateFromOid(curve.Oid);
+            throw new NotSupportedException(
+                "Clone() of a Named ECCurve is not supported; convert to explicit first via " +
+                "ECCurveOidMap.GetExplicitCurveByOid().");
 
         return new ECCurve
         {

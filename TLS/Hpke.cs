@@ -48,7 +48,7 @@ public static class Hpke
                 byte[] ciphertext = new byte[plaintext.Length];
                 byte[] tag = new byte[16];
 
-                using var aes = new AesGcm(_key, 16);
+                using var aes = new AesGcmManaged(_key, 16);
                 aes.Encrypt(nonce, plaintext, ciphertext, tag, aad);
 
                 // Return ciphertext || tag
@@ -76,7 +76,7 @@ public static class Hpke
 
                 try
                 {
-                    using var aes = new AesGcm(_key, 16);
+                    using var aes = new AesGcmManaged(_key, 16);
                     aes.Decrypt(nonce, ct, tag, plaintext, aad);
                     return plaintext;
                 }
@@ -104,8 +104,8 @@ public static class Hpke
 
         public void Dispose()
         {
-            Array.Clear(_key);
-            Array.Clear(_baseNonce);
+            CryptographicOperations.ZeroMemory(_key);
+            CryptographicOperations.ZeroMemory(_baseNonce);
         }
     }
 
@@ -128,7 +128,8 @@ public static class Hpke
             byte[] kemContext = CombineBytes(pkE, pkR);
             byte[] sharedSecret = ExtractAndExpand(dh, kemContext);
 
-            Array.Clear(skE); // Clear ephemeral private key
+            CryptographicOperations.ZeroMemory(skE); // Clear ephemeral private key
+            CryptographicOperations.ZeroMemory(dh);
             return (pkE, sharedSecret);
         }
 
@@ -145,7 +146,9 @@ public static class Hpke
             byte[] pkR = X25519.PublicFromPrivate(skR);
             byte[] kemContext = CombineBytes(enc, pkR);
 
-            return ExtractAndExpand(dh, kemContext);
+            byte[] result = ExtractAndExpand(dh, kemContext);
+            CryptographicOperations.ZeroMemory(dh);
+            return result;
         }
 
         private static byte[] ExtractAndExpand(byte[] dh, byte[] kemContext)
@@ -171,7 +174,7 @@ public static class Hpke
         {
             var (enc, sharedSecret) = DhKem.Encap(pkR);
             var context = KeyScheduleS(0x00, sharedSecret, info);
-            Array.Clear(sharedSecret);
+            CryptographicOperations.ZeroMemory(sharedSecret);
             return (enc, context);
         }
 
@@ -180,7 +183,7 @@ public static class Hpke
         {
             byte[] sharedSecret = DhKem.Decap(enc, skR);
             var context = KeyScheduleR(0x00, sharedSecret, info);
-            Array.Clear(sharedSecret);
+            CryptographicOperations.ZeroMemory(sharedSecret);
             return context;
         }
 
@@ -214,7 +217,7 @@ public static class Hpke
             byte[] key = LabeledExpand(secret, "key", keyScheduleContext, Nk, suiteIdBytes);
             byte[] baseNonce = LabeledExpand(secret, "base_nonce", keyScheduleContext, Nn, suiteIdBytes);
 
-            Array.Clear(secret);
+            CryptographicOperations.ZeroMemory(secret);
             return new HpkeContext(key, baseNonce);
         }
 

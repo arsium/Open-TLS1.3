@@ -16,11 +16,7 @@ internal static class GostKdf
 
     public static bool IsStreebog(HashAlgorithmName hash) => hash.Name == "STREEBOG256";
 
-    public static byte[] Hash(byte[] data)
-    {
-        using var h = Streebog256.Create();
-        return h.ComputeHash(data);
-    }
+    public static byte[] Hash(byte[] data) => Streebog256Managed.Hash(data);
 
     /// <summary>HMAC-Streebog256 (RFC 2104 construction over GOST R 34.11-2012-256).</summary>
     public static byte[] Hmac(byte[] key, byte[] data)

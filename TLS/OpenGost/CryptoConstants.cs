@@ -1,14 +1,14 @@
+using System.Security.Cryptography;
+using System.Numerics;
 ﻿namespace OpenGost.Security.Cryptography;
 
 internal static class CryptoConstants
 {
     public const string GostECDsaAlgorithmName = "GostECDsa";
 
-    public const string GrasshopperAlgorithmName = nameof(Grasshopper);
-    public const string CMACGrasshopperAlgorithmName = nameof(CMACGrasshopper);
-    public const string MagmaAlgorithmName = nameof(Magma);
-    public const string CMACMagmaAlgorithmName = nameof(CMACMagma);
+    public const string GrasshopperAlgorithmName = nameof(GrasshopperManaged);
+    public const string MagmaAlgorithmName = nameof(MagmaManaged);
 
-    public const string Streebog256AlgorithmName = nameof(Streebog256);
-    public const string Streebog512AlgorithmName = nameof(Streebog512);
+    public const string Streebog256AlgorithmName = nameof(Streebog256Managed);
+    public const string Streebog512AlgorithmName = nameof(Streebog512Managed);
 }

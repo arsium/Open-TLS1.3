@@ -27,7 +27,9 @@ public static class Pkcs12
     /// </summary>
     public static byte[] Export(TlsCertificate cert, string password, byte[][]? chainCerts = null)
     {
-        byte[] localKeyId = SHA1.HashData(cert.PublicKey);
+        // PKCS#12 LocalKeyID: SHA-1 of the public key. Use BC's Sha1Digest to keep
+        // System.Security.Cryptography.SHA1 (and its BCrypt hash registry) unlinked.
+        byte[] localKeyId = Pkcs12Sha1(cert.PublicKey);
 
         // ---- Build SafeBags ----
         var bags = new List<byte[]>();
@@ -69,8 +71,7 @@ public static class Pkcs12
         int iterations = 2048;
         byte[] macKey = Pkcs12Kdf(PasswordToBmp(password), macSalt, iterations, 3, 20);
 
-        using var hmac = new HMACSHA1(macKey);
-        byte[] macValue = hmac.ComputeHash(authSafe);
+        byte[] macValue = Sha2Managed.HmacSha1(macKey, authSafe);
 
         byte[] macData = Asn1.Sequence(
             Asn1.Sequence( // DigestInfo
@@ -112,8 +113,7 @@ public static class Pkcs12
                 iterations = (iterations << 8) | b;
 
             byte[] macKey = Pkcs12Kdf(PasswordToBmp(password), macSalt, iterations, 3, 20);
-            using var hmac = new System.Security.Cryptography.HMACSHA1(macKey);
-            byte[] actualMac = hmac.ComputeHash(authSafeBytes);
+            byte[] actualMac = Sha2Managed.HmacSha1(macKey, authSafeBytes);
 
             if (!CryptographicOperations.FixedTimeEquals(actualMac, expectedMac))
                 throw new TlsException(AlertDescription.DecryptError, "PFX MAC verification failed — wrong password or corrupted file");
@@ -204,16 +204,12 @@ public static class Pkcs12
 
         for (int i = 0; i < n; i++)
         {
-            byte[] A;
-            using (var sha = SHA1.Create())
-            {
-                sha.TransformBlock(D, 0, D.Length, null, 0);
-                sha.TransformFinalBlock(I, 0, I.Length);
-                A = sha.Hash!;
-            }
-
+            // SHA-1 via BC's Sha1Digest — avoids pulling System.Security.Cryptography.SHA1
+            // (and its BCrypt hash registry) into the assembly. SHA-1 is here only because
+            // RFC 7292's PKCS#12 KDF / MAC predates SHA-2; this is a legacy compat path.
+            byte[] A = Pkcs12Sha1(D, I);
             for (int j = 1; j < iterations; j++)
-                A = SHA1.HashData(A);
+                A = Pkcs12Sha1(A);
 
             Buffer.BlockCopy(A, 0, result, i * u, u);
 
@@ -250,6 +246,26 @@ public static class Pkcs12
             result[i * 2 + 1] = (byte)(password[i] & 0xFF);
         }
         return result;
+    }
+
+    // SHA-1 one-shot via BC. Used by Pkcs12Kdf only — replaces System.Security.Cryptography.SHA1
+    // calls so the BCL hash registry doesn't get linked.
+    private static byte[] Pkcs12Sha1(byte[] data)
+    {
+        var d = new Org.BouncyCastle.Crypto.Digests.Sha1Digest();
+        d.BlockUpdate(data, 0, data.Length);
+        var hash = new byte[d.GetDigestSize()];
+        d.DoFinal(hash, 0);
+        return hash;
+    }
+    private static byte[] Pkcs12Sha1(byte[] a, byte[] b)
+    {
+        var d = new Org.BouncyCastle.Crypto.Digests.Sha1Digest();
+        d.BlockUpdate(a, 0, a.Length);
+        d.BlockUpdate(b, 0, b.Length);
+        var hash = new byte[d.GetDigestSize()];
+        d.DoFinal(hash, 0);
+        return hash;
     }
 
     private static byte[] PadRepeat(byte[] data, int blockSize)
@@ -322,8 +338,15 @@ public static class Pkcs12
     internal static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ParsePkcs8Key(byte[] pkcs8)
     {
         var items = Asn1.ReadSequenceItems(pkcs8);
+        // RFC 5208 §5: PrivateKeyInfo ::= SEQUENCE { version, algorithm, privateKey [, attributes] }
+        if (items.Count < 3)
+            throw new TlsException(AlertDescription.BadCertificate,
+                $"Malformed PKCS#8: expected ≥3 items in PrivateKeyInfo, got {items.Count}");
+
         // items[1] = AlgorithmIdentifier SEQUENCE
         var algItems = Asn1.ReadSequenceItems(items[1].value);
+        if (algItems.Count < 1)
+            throw new TlsException(AlertDescription.BadCertificate, "Malformed PKCS#8 AlgorithmIdentifier");
         byte[] algOid = Asn1.Wrap(algItems[0].tag, algItems[0].value);
         byte[] ecOid = Asn1.Oid(OidEcPublicKey);
         byte[] rsaOid = Asn1.Oid(OidRsaEncryption);
@@ -334,6 +357,10 @@ public static class Pkcs12
             byte[] ecPrivKeyDer = items[2].value;
             var (_, ecPrivKeyContent, _) = Asn1.ReadTlv(ecPrivKeyDer);
             var ecItems = Asn1.ReadSequenceItems(ecPrivKeyContent);
+            // RFC 5915 §3: ECPrivateKey ::= SEQUENCE { version INTEGER, privateKey OCTET STRING, ... }
+            if (ecItems.Count < 2)
+                throw new TlsException(AlertDescription.BadCertificate,
+                    "Malformed ECPrivateKey: missing privateKey field");
 
             byte[] privKey = ecItems[1].value;
             byte[]? pubKey = null;
@@ -348,19 +375,8 @@ public static class Pkcs12
             }
             if (pubKey == null)
             {
-                // Derive public key from D scalar — rebuild ECPrivateKey with curve for .NET import
-                byte[] ecKeyWithCurve = Asn1.Sequence(
-                    Asn1.Integer(1),
-                    Asn1.OctetString(privKey),
-                    Asn1.Explicit(0, Asn1.Oid(OidSecp256r1))
-                );
-                using var ecdsa = System.Security.Cryptography.ECDsa.Create();
-                ecdsa.ImportECPrivateKey(ecKeyWithCurve, out _);
-                var p = ecdsa.ExportParameters(false);
-                pubKey = new byte[1 + p.Q.X!.Length + p.Q.Y!.Length];
-                pubKey[0] = 0x04;
-                Buffer.BlockCopy(p.Q.X!, 0, pubKey, 1, p.Q.X!.Length);
-                Buffer.BlockCopy(p.Q.Y!, 0, pubKey, 1 + p.Q.X!.Length, p.Q.Y!.Length);
+                // Derive uncompressed public point from the D scalar on P-256.
+                pubKey = EcdsaManaged.DerivePublicFromPrivate("P-256", privKey);
             }
 
             return (privKey, pubKey, SignatureScheme.EcdsaSecp256r1Sha256);
@@ -370,7 +386,7 @@ public static class Pkcs12
         {
             // RSA key — OCTET STRING value is full RSAPrivateKey DER
             byte[] rsaPrivKeyDer = items[2].value;
-            using var rsa = System.Security.Cryptography.RSA.Create();
+            using var rsa = RsaManaged.Create();
             rsa.ImportRSAPrivateKey(rsaPrivKeyDer, out _);
             byte[] pubKey = rsa.ExportRSAPublicKey();
             return (rsaPrivKeyDer, pubKey, SignatureScheme.RsaPssRsaeSha256);

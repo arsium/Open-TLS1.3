@@ -1,6 +1,6 @@
 # TLSServer
 
-A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every protocol layer — from the record framing and handshake state machine down to the elliptic-curve arithmetic and post-quantum key exchange — is written from scratch with zero external dependencies (except .NET's built-in AES-GCM and ChaCha20-Poly1305 AEAD primitives).
+A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptographic primitive runs through managed code — **no BCrypt / OpenSSL P/Invoke**. The published binary has a single bcrypt.dll import (`BCryptGenRandom`) which serves as the OS entropy source; everything else — hashes, HMACs, AEADs, EC point arithmetic, signatures — is pure C#. AES-NI is used via JIT-emitted CPU intrinsics (not a P/Invoke, gated by `Aes.IsSupported`), so the workhorse cipher stays hardware-fast while remaining portable to non-x86 CPUs.
 
 > **Note 1 :** AI driven prompt project.
 
@@ -42,7 +42,7 @@ A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every protocol 
 | Certificates | X.509 v3 generation (incl. GOST / SM2 certs), CA chaining, PKCS#12/PFX, PKCS#7 |
 | Compression | Certificate compression (RFC 8879) via Brotli and Zstandard |
 
-All elliptic-curve operations (point addition, doubling, scalar multiplication) and the ML-KEM NTT/InvNTT are implemented from scratch using `System.Numerics.BigInteger` — no platform-specific or third-party crypto libraries. The GOST primitives are vendored from the OpenGost project; SM2/SM3/SM4 are implemented from the GB/T standards.
+Symmetric primitives (AES-GCM, SHA-2 family, HMAC) and the asymmetric handshake primitives (RSA, NIST P-256/P-384/P-521 ECDSA/ECDH) go through BouncyCastle's vendored pure-managed implementations — no `System.Security.Cryptography.*` runtime calls into BCrypt or OpenSSL. ChaCha20-Poly1305 is a hand-written RFC 8439 implementation. The ML-KEM-768 NTT/InvNTT, X25519 / X448 / Ed25519, SM2/SM3/SM4, and Keccak are implemented from scratch. GOST primitives are vendored from OpenGost, with EC scalar-mult upgraded to Jacobian projective coordinates (one modular inverse per scalar mult instead of one per point operation).
 
 ### Cipher suites
 
@@ -53,11 +53,12 @@ All elliptic-curve operations (point addition, doubling, scalar multiplication) 
 | TLS_GOSTR341112_256_WITH_MAGMA_MGM_L / _S | RFC 9367 |
 | TLS_SM4_GCM_SM3, TLS_SM4_CCM_SM3 | RFC 8998 |
 
-### Sources & lib directly imported from files
+### Vendored sources (MIT / BSD / Apache 2.0)
 
-- [OpenGost](https://github.com/sergezhigunov/OpenGost)
-- [ZstdSharp](https://github.com/oleg-st/ZstdSharp)
-- [BouncyCastle](https://github.com/bcgit/bc-csharp)
+- [BouncyCastle (bc-csharp)](https://github.com/bcgit/bc-csharp) — AES + GCM mode, SHA-2 digests, HMAC, RSA, NIST EC curves, BigInteger, ASN.1 (`TLS/BouncyCastle/`, ~1330 files)
+- [BrotliSharpLib](https://github.com/master131/BrotliSharpLib) — Brotli for RFC 8879 cert compression, replaces `System.IO.Compression.BrotliStream` (`TLS/BrotliSharp/`, 58 files)
+- [ZstdSharp](https://github.com/oleg-st/ZstdSharp) — Zstandard for RFC 8879 cert compression (`TLS/Zstd/`)
+- [OpenGost](https://github.com/sergezhigunov/OpenGost) — GOST Kuznyechik / Magma block ciphers, Streebog hash, GOST R 34.10-2012 (`TLS/OpenGost/`, ~18 files; the upstream `HashAlgorithm` / `SymmetricAlgorithm` / `ECDsa` base-class inheritance has been stripped so the BCL crypto registry — and its BCrypt imports — don't get linked)
 
 ### Architecture
 
@@ -69,21 +70,27 @@ Open-TLS1.3.sln
 │   ├── KeySchedule.cs      # TLS 1.3 key schedule (RFC 8446 §7)
 │   ├── Hkdf.cs             # HKDF + HKDF-Expand-Label (multi-hash)
 │   ├── AeadCipher.cs       # AES-GCM / ChaCha20 / MGM / SM4-GCM/CCM dispatch
+│   ├── AesGcmManaged.cs    # AES-GCM via BC AesEngine + GcmBlockCipher (cached per instance)
+│   ├── ChaCha20.cs / Poly1305.cs / ChaCha20Poly1305Managed.cs  # RFC 8439 from scratch
+│   ├── Sha2Managed.cs      # SHA-2 / HMAC-SHA wrappers over BC digests (IncrementalSha2 for transcript)
+│   ├── RsaManaged.cs / EcdsaManaged.cs  # BC RSA / NIST EC wrappers
 │   ├── Ed25519.cs / X25519.cs / X448.cs / EcdhP256.cs / EcdhP384.cs
 │   ├── MlKem768.cs         # FIPS 203 ML-KEM-768
 │   ├── Keccak.cs           # Keccak-f[1600] sponge (SHA3/SHAKE)
 │   ├── Hpke.cs             # HPKE (RFC 9180)
 │   ├── EncryptedClientHello.cs  # ECH (RFC 9849)
-│   ├── Mgm.cs              # GOST MGM AEAD (RFC 9058/9367)
+│   ├── Mgm.cs              # GOST MGM AEAD (RFC 9058/9367), packed-ulong GF(2^128)
 │   ├── GostCrypto.cs / GostKdf.cs / GostEcdh.cs  # GOST facade, Streebog KDF, GOST ECDH
-│   ├── OpenGost/           # Vendored GOST: Kuznyechik, Magma, Streebog, GostECDsa, curves
-│   ├── ChineseCrypto.cs    # SM2 / SM3 / SM4
+│   ├── OpenGost/           # Vendored GOST + Jacobian EC scalar-mult
+│   ├── ChineseCrypto.cs    # SM2 / SM3 / SM4 (SM2 EC math = Jacobian projective)
 │   ├── Sm4Aead.cs / Sm3Kdf.cs   # SM4-GCM/CCM AEAD, SM3 KDF
 │   ├── Grease.cs           # GREASE (RFC 8701)
 │   ├── CertificateUtils.cs # X.509 generation (incl. GOST/SM2), CA chaining
 │   ├── Asn1.cs / Pkcs12.cs / Pkcs7.cs   # DER, PFX, PKCS#7
 │   ├── SessionTicket.cs / KeyLogger.cs / CertificateCompression.cs
-│   └── Zstd/               # Pure managed Zstandard implementation
+│   ├── BouncyCastle/       # Vendored BC core (crypto, math, security, util, asn1)
+│   ├── BrotliSharp/        # Vendored Brotli for RFC 8879
+│   └── Zstd/               # Vendored Zstandard for RFC 8879
 ├── TLSServer/  TLSClient/  TLSServerAsync/  TLSClientAsync/   # demo apps
 └── Tests/                  # Test-vector + loopback suite (dependency-free)
 ```
@@ -152,11 +159,24 @@ Then point Wireshark to the key log file under *Preferences > Protocols > TLS > 
 A dependency-free test suite lives in `Tests/` (known-answer vectors + end-to-end loopback matrix).
 
 ```bash
-dotnet run -c Release --project Tests          # run all tests (exit code 0 = pass)
+dotnet run -c Release --project Tests           # all tests (51 KAT + loopback)
 dotnet run -c Release --project Tests bench     # throughput + handshake benchmarks
+dotnet run -c Release --project Tests bulk      # 20 MB + 50 MB bulk loopback (AES-128/256-GCM + ChaCha20)
+dotnet run -c Release --project Tests fuzz      # parser fuzz harness (120k inputs across 12 parsers)
+dotnet run -c Release --project Tests fuzz 50000  # heavier fuzz (~600k inputs)
 ```
 
-Coverage includes KATs vs published vectors (MGM/RFC 9058, SM4/SM3 GB/T, SM4-GCM/CCM RFC 8998, Streebog, GOST R 34.10-2012 and SM2 signatures, HKDF RFC 5869, X25519 RFC 7748) and full handshake+data loopbacks for every cipher suite plus mTLS.
+Coverage includes KATs vs published vectors (MGM RFC 9058, SM4/SM3 GB/T, SM4-GCM/CCM RFC 8998, Streebog, GOST R 34.10-2012 and SM2 signatures, HKDF RFC 5869, X25519 RFC 7748, ChaCha20 / Poly1305 / AEAD-ChaCha20-Poly1305 RFC 8439) and full handshake+data loopbacks for every cipher suite plus mTLS plus RFC 8879 cert compression.
+
+### Measured throughput (loopback, single-thread, this dev box)
+
+| Cipher | 50 MB bulk |
+|---|---|
+| AES-128-GCM | ~99 MB/s |
+| AES-256-GCM | ~106 MB/s |
+| ChaCha20-Poly1305 (managed RFC 8439) | ~104 MB/s |
+| GOST handshake | ~2.06 s (Jacobian EC) |
+| SM handshake | ~2.06 s (Jacobian EC) |
 
 ## Native AOT
 
@@ -194,7 +214,8 @@ Core TLS 1.3 (RFC 8446) is compliant — handshake, HelloRetryRequest + cookie, 
 
 ## Limitations
 
-- **National crypto external interop is unverified.** GOST and Chinese SM suites are KAT-verified against published standard test vectors and pass self-interop (this stack's client ↔ server), but have not been cross-tested against GmSSL / OpenSSL-GOST. In particular, this stack emits Streebog digests in the reverse byte order of RFC 6986's textual presentation, and the GOST/SM CertificateVerify hashing is internally self-consistent — byte-order conventions should be validated before relying on external interop.
-- **National-suite performance is correctness-first.** AES-GCM uses hardware acceleration (~1.5 GB/s); the managed national AEADs run at tens of MB/s. GOST/SM2 EC point math uses affine coordinates (a modular inverse per point-add), adding a few hundred ms per national-suite handshake.
+- **External interop is unverified.** This stack passes its own loopback matrix end-to-end (and 120 k+ fuzz inputs across all message parsers without unhandled exceptions), but has not been cross-tested against OpenSSL, BoringSSL, nginx, curl, GmSSL, or OpenSSL-GOST. Production use should validate against the target peer first. In particular, this stack emits Streebog digests in the reverse byte order of RFC 6986's textual presentation, and the GOST/SM CertificateVerify hashing is internally self-consistent — byte-order conventions should be validated before relying on external national-suite interop.
+- **National AEAD throughput is bound by the managed implementation.** Hardware-accelerated AES-GCM does ~100 MB/s end-to-end through TLS framing; managed Kuznyechik / Magma / SM4 are an order of magnitude slower (tens of MB/s) and dominated by their per-block cost. GOST and SM2 scalar-mult is on Jacobian coordinates (one modular inverse per scalar mult, ~18% faster than the previous affine implementation).
 - The on-wire ClientHello `signature_algorithms` / `supported_groups` advertise the standard set only; national schemes/curves work in self-interop because the server selects directly.
 - `max_fragment_length` (RFC 6066) is intentionally not sent (superseded by `record_size_limit`).
+- TLS 1.2 fallback is out of scope by design — this is a TLS-1.3-only stack.

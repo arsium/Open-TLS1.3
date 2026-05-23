@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Numerics;
 ﻿namespace OpenGost.Security.Cryptography;
 
 internal static class ECCurveOidMap

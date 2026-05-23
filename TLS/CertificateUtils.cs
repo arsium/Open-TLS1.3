@@ -67,7 +67,7 @@ public static class CertificateUtils
         byte[] spki = BuildEcSpki(pubKey);
         byte[] sigAlgSeq = EcdsaSigAlg();
         byte[] cert = BuildAndSignCertificateCore(commonName, commonName, spki, extensions, sigAlgSeq,
-            tbs => ecdsa.SignData(tbs, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), validDays);
+            tbs => ecdsa.SignDataDer(tbs, HashAlgorithmName.SHA256), validDays);
 
         return new TlsCertificate
         {
@@ -95,7 +95,7 @@ public static class CertificateUtils
         byte[] spki = BuildEcSpki(pubKey);
         byte[] sigAlgSeq = EcdsaSigAlg();
         byte[] cert = BuildAndSignCertificateCore(commonName, commonName, spki, extensions, sigAlgSeq,
-            tbs => ecdsa.SignData(tbs, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), validDays);
+            tbs => ecdsa.SignDataDer(tbs, HashAlgorithmName.SHA256), validDays);
 
         return new TlsCertificate
         {
@@ -139,7 +139,7 @@ public static class CertificateUtils
     /// <summary>Generate a self-signed RSA certificate.</summary>
     public static TlsCertificate GenerateSelfSignedRsa(string commonName, int validDays = 365, int keySize = 2048)
     {
-        using var rsa = RSA.Create(keySize);
+        using var rsa = RsaManaged.Create(keySize);
         byte[] privKey = rsa.ExportRSAPrivateKey();
         byte[] pubKey = rsa.ExportRSAPublicKey();
 
@@ -168,7 +168,7 @@ public static class CertificateUtils
     /// <summary>Generate an RSA Certificate Authority (self-signed, CA:TRUE).</summary>
     public static TlsCertificate GenerateCARsa(string commonName, int validDays = 3650, int keySize = 2048)
     {
-        using var rsa = RSA.Create(keySize);
+        using var rsa = RsaManaged.Create(keySize);
         byte[] privKey = rsa.ExportRSAPrivateKey();
         byte[] pubKey = rsa.ExportRSAPublicKey();
 
@@ -201,7 +201,7 @@ public static class CertificateUtils
     public static TlsCertificate IssueCertificateRsa(string commonName, TlsCertificate ca,
         CertificateProfile profile, int validDays = 365, int keySize = 2048)
     {
-        using var rsa = RSA.Create(keySize);
+        using var rsa = RsaManaged.Create(keySize);
         byte[] privKey = rsa.ExportRSAPrivateKey();
         byte[] pubKey = rsa.ExportRSAPublicKey();
 
@@ -237,15 +237,14 @@ public static class CertificateUtils
 
         if (ca.IsRsa)
         {
-            using var rsa = RSA.Create();
+            using var rsa = RsaManaged.Create();
             rsa.ImportRSAPublicKey(ca.PublicKey, out _);
             return rsa.VerifyData(tbsCertDer, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         }
         else
         {
             using var caEcdsa = ImportEcdsaPubKey(ca.PublicKey);
-            return caEcdsa.VerifyData(tbsCertDer, signature, HashAlgorithmName.SHA256,
-                DSASignatureFormat.Rfc3279DerSequence);
+            return caEcdsa.VerifyDataDer(tbsCertDer, signature, HashAlgorithmName.SHA256);
         }
     }
 
@@ -440,7 +439,7 @@ public static class CertificateUtils
     /// <summary>Import a PKCS#1 RSA private key (RSAPrivateKey) from DER bytes.</summary>
     public static (byte[] privateKey, byte[] publicKey, SignatureScheme sigAlg) ImportRsaPrivateKey(byte[] der)
     {
-        using var rsa = RSA.Create();
+        using var rsa = RsaManaged.Create();
         rsa.ImportRSAPrivateKey(der, out _);
         byte[] pubKey = rsa.ExportRSAPublicKey();
         return (der, pubKey, SignatureScheme.RsaPssRsaeSha256);
@@ -466,17 +465,9 @@ public static class CertificateUtils
             }
         }
 
-        // If public key not embedded, derive from private key
+        // If public key not embedded, derive from private key on P-256.
         if (pubKey == null)
-        {
-            using var ecdsa = ECDsa.Create();
-            ecdsa.ImportECPrivateKey(der, out _);
-            var p = ecdsa.ExportParameters(false);
-            pubKey = new byte[1 + p.Q.X!.Length + p.Q.Y!.Length];
-            pubKey[0] = 0x04;
-            Buffer.BlockCopy(p.Q.X!, 0, pubKey, 1, p.Q.X!.Length);
-            Buffer.BlockCopy(p.Q.Y!, 0, pubKey, 1 + p.Q.X!.Length, p.Q.Y!.Length);
-        }
+            pubKey = EcdsaManaged.DerivePublicFromPrivate("P-256", privKey);
 
         return (privKey, pubKey, SignatureScheme.EcdsaSecp256r1Sha256);
     }
@@ -519,20 +510,20 @@ public static class CertificateUtils
         {
             case SignatureScheme.EcdsaSecp256r1Sha256:
                 using (var ecdsa = ImportEcdsaKey(privateKey, publicKey))
-                    return ecdsa.SignData(data, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+                    return ecdsa.SignDataDer(data, HashAlgorithmName.SHA256);
 
             case SignatureScheme.Ed25519:
                 return Ed25519.Sign(data, privateKey);
 
             case SignatureScheme.RsaPssRsaeSha256:
-                using (var rsa = RSA.Create())
+                using (var rsa = RsaManaged.Create())
                 {
                     rsa.ImportRSAPrivateKey(privateKey, out _);
                     return rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
                 }
 
             case SignatureScheme.RsaPssRsaeSha384:
-                using (var rsa = RSA.Create())
+                using (var rsa = RsaManaged.Create())
                 {
                     rsa.ImportRSAPrivateKey(privateKey, out _);
                     return rsa.SignData(data, HashAlgorithmName.SHA384, RSASignaturePadding.Pss);
@@ -540,21 +531,21 @@ public static class CertificateUtils
 
             // RFC 9963 §3: Legacy RSASSA-PKCS1-v1_5 (certificate verification only)
             case SignatureScheme.RsaPkcs1Sha256:
-                using (var rsa = RSA.Create())
+                using (var rsa = RsaManaged.Create())
                 {
                     rsa.ImportRSAPrivateKey(privateKey, out _);
                     return rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
                 }
 
             case SignatureScheme.RsaPkcs1Sha384:
-                using (var rsa = RSA.Create())
+                using (var rsa = RsaManaged.Create())
                 {
                     rsa.ImportRSAPrivateKey(privateKey, out _);
                     return rsa.SignData(data, HashAlgorithmName.SHA384, RSASignaturePadding.Pkcs1);
                 }
 
             case SignatureScheme.RsaPkcs1Sha512:
-                using (var rsa = RSA.Create())
+                using (var rsa = RsaManaged.Create())
                 {
                     rsa.ImportRSAPrivateKey(privateKey, out _);
                     return rsa.SignData(data, HashAlgorithmName.SHA512, RSASignaturePadding.Pkcs1);
@@ -587,21 +578,20 @@ public static class CertificateUtils
             {
                 case SignatureScheme.EcdsaSecp256r1Sha256:
                     using (var ecdsa = ImportEcdsaPubKey(publicKey))
-                        return ecdsa.VerifyData(data, signature, HashAlgorithmName.SHA256,
-                            DSASignatureFormat.Rfc3279DerSequence);
+                        return ecdsa.VerifyDataDer(data, signature, HashAlgorithmName.SHA256);
 
                 case SignatureScheme.Ed25519:
                     return Ed25519.Verify(data, signature, publicKey);
 
                 case SignatureScheme.RsaPssRsaeSha256:
-                    using (var rsa = RSA.Create())
+                    using (var rsa = RsaManaged.Create())
                     {
                         rsa.ImportRSAPublicKey(publicKey, out _);
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
                     }
 
                 case SignatureScheme.RsaPssRsaeSha384:
-                    using (var rsa = RSA.Create())
+                    using (var rsa = RsaManaged.Create())
                     {
                         rsa.ImportRSAPublicKey(publicKey, out _);
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA384, RSASignaturePadding.Pss);
@@ -609,21 +599,21 @@ public static class CertificateUtils
 
                 // RFC 9963 §3: Legacy RSASSA-PKCS1-v1_5 (certificate verification only)
                 case SignatureScheme.RsaPkcs1Sha256:
-                    using (var rsa = RSA.Create())
+                    using (var rsa = RsaManaged.Create())
                     {
                         rsa.ImportRSAPublicKey(publicKey, out _);
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
                     }
 
                 case SignatureScheme.RsaPkcs1Sha384:
-                    using (var rsa = RSA.Create())
+                    using (var rsa = RsaManaged.Create())
                     {
                         rsa.ImportRSAPublicKey(publicKey, out _);
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA384, RSASignaturePadding.Pkcs1);
                     }
 
                 case SignatureScheme.RsaPkcs1Sha512:
-                    using (var rsa = RSA.Create())
+                    using (var rsa = RsaManaged.Create())
                     {
                         rsa.ImportRSAPublicKey(publicKey, out _);
                         return rsa.VerifyData(data, signature, HashAlgorithmName.SHA512, RSASignaturePadding.Pkcs1);
@@ -704,13 +694,15 @@ public static class CertificateUtils
     };
 
     // PublicKey layout: Q.X(LE) ‖ Q.Y(LE); PrivateKey: D(LE) — both as exported by GostECDsaManaged.
+    // We pass the explicit curve from OpenGost's own dictionary instead of ECCurve.CreateFromValue
+    // so the BCL Oid type (and its CryptFindOIDInfo dependency) never gets linked.
     private static OpenGost.Security.Cryptography.GostECDsaManaged ImportGostKey(
         byte[]? privateKey, byte[] publicKey, SignatureScheme scheme)
     {
         var (curveOid, size, _) = GostParams(scheme);
         var p = new ECParameters
         {
-            Curve = ECCurve.CreateFromValue(curveOid),
+            Curve = OpenGost.Security.Cryptography.ECCurveOidMap.GetExplicitCurveByOid(curveOid),
             Q = new ECPoint { X = publicKey[..size], Y = publicKey[size..(2 * size)] },
             D = privateKey,
         };
@@ -723,7 +715,7 @@ public static class CertificateUtils
     {
         var (curveOid, size, _) = GostParams(scheme);
         using var g = new OpenGost.Security.Cryptography.GostECDsaManaged();
-        g.GenerateKey(ECCurve.CreateFromValue(curveOid));
+        g.GenerateKey(OpenGost.Security.Cryptography.ECCurveOidMap.GetExplicitCurveByOid(curveOid));
         var p = g.ExportParameters(true);
         byte[] pub = new byte[2 * size];
         Buffer.BlockCopy(p.Q.X!, 0, pub, 0, size);
@@ -972,7 +964,7 @@ public static class CertificateUtils
     {
         if (ca.IsRsa)
         {
-            using var rsa = RSA.Create();
+            using var rsa = RsaManaged.Create();
             rsa.ImportRSAPrivateKey(ca.PrivateKey, out _);
             byte[] sigAlgSeq = RsaSha256SigAlg();
             return BuildAndSignCertificateCore(issuerCn, subjectCn, spki, extensions, sigAlgSeq,
@@ -983,7 +975,7 @@ public static class CertificateUtils
             using var ecdsa = ImportEcdsaKey(ca.PrivateKey, ca.PublicKey);
             byte[] sigAlgSeq = EcdsaSigAlg();
             return BuildAndSignCertificateCore(issuerCn, subjectCn, spki, extensions, sigAlgSeq,
-                tbs => ecdsa.SignData(tbs, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), validDays);
+                tbs => ecdsa.SignDataDer(tbs, HashAlgorithmName.SHA256), validDays);
         }
     }
 
@@ -1065,15 +1057,28 @@ public static class CertificateUtils
 
     private static byte[] BuildSkiExtension(byte[] publicKey)
     {
-        byte[] keyHash = SHA1.HashData(publicKey);
+        byte[] keyHash = Sha1OneShot(publicKey);
         return BuildExtension(OidSubjectKeyId, false, Asn1.OctetString(keyHash));
     }
 
     private static byte[] BuildAkiExtension(byte[] issuerPublicKey)
     {
-        byte[] keyHash = SHA1.HashData(issuerPublicKey);
+        byte[] keyHash = Sha1OneShot(issuerPublicKey);
         byte[] value = Asn1.Sequence(Asn1.Wrap(0x80, keyHash));
         return BuildExtension(OidAuthorityKeyId, false, value);
+    }
+
+    // X.509 SubjectKeyIdentifier / AuthorityKeyIdentifier extensions need SHA-1 of the
+    // public key (RFC 5280 §4.2.1.2). Routed through BC's Sha1Digest so that
+    // System.Security.Cryptography.SHA1 (and the whole BCL hash registry it pulls in
+    // via BCryptCreateHash / BCryptHashData / etc.) doesn't get linked into the assembly.
+    private static byte[] Sha1OneShot(byte[] data)
+    {
+        var d = new Org.BouncyCastle.Crypto.Digests.Sha1Digest();
+        d.BlockUpdate(data, 0, data.Length);
+        var hash = new byte[d.GetDigestSize()];
+        d.DoFinal(hash, 0);
+        return hash;
     }
 
     private static List<byte[]> BuildIssuedExtensions(string commonName, byte[] caPublicKey, CertificateProfile profile)
@@ -1099,32 +1104,38 @@ public static class CertificateUtils
     private static byte[] BuildName(string cn) =>
         Asn1.Sequence(Asn1.Set(Asn1.Sequence(Asn1.Oid(OidCommonName), Asn1.Utf8String(cn))));
 
-    private static (byte[] privKey, byte[] pubKey, ECDsa ecdsa) GenerateEcKeyPair()
+    private static (byte[] privKey, byte[] pubKey, EcdsaManaged ecdsa) GenerateEcKeyPair()
     {
-        var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var p = ecdsa.ExportParameters(true);
-        byte[] privKey = p.D!;
-        byte[] pubKey = new byte[1 + p.Q.X!.Length + p.Q.Y!.Length];
-        pubKey[0] = 0x04;
-        Buffer.BlockCopy(p.Q.X!, 0, pubKey, 1, p.Q.X!.Length);
-        Buffer.BlockCopy(p.Q.Y!, 0, pubKey, 1 + p.Q.X!.Length, p.Q.Y!.Length);
+        var ecdsa = EcdsaManaged.Create("P-256");
+        byte[] privKey = ecdsa.ExportPrivateScalar();
+        byte[] pubKey = ecdsa.ExportPublicKeyUncompressed();
         return (privKey, pubKey, ecdsa);
     }
 
-    private static ECDsa ImportEcdsaKey(byte[] d, byte[] uncompressedPub) =>
-        ECDsa.Create(new ECParameters
-        {
-            Curve = ECCurve.NamedCurves.nistP256,
-            D = d,
-            Q = new ECPoint { X = uncompressedPub[1..33], Y = uncompressedPub[33..65] }
-        });
+    private static EcdsaManaged ImportEcdsaKey(byte[] d, byte[] uncompressedPub)
+    {
+        ValidateUncompressedP256Point(uncompressedPub);
+        var ecdsa = EcdsaManaged.Create();
+        ecdsa.ImportFromComponents("P-256", d, uncompressedPub);
+        return ecdsa;
+    }
 
-    private static ECDsa ImportEcdsaPubKey(byte[] uncompressedPub) =>
-        ECDsa.Create(new ECParameters
-        {
-            Curve = ECCurve.NamedCurves.nistP256,
-            Q = new ECPoint { X = uncompressedPub[1..33], Y = uncompressedPub[33..65] }
-        });
+    private static EcdsaManaged ImportEcdsaPubKey(byte[] uncompressedPub)
+    {
+        ValidateUncompressedP256Point(uncompressedPub);
+        var ecdsa = EcdsaManaged.Create();
+        ecdsa.ImportFromComponents("P-256", null, uncompressedPub);
+        return ecdsa;
+    }
+
+    private static void ValidateUncompressedP256Point(byte[] uncompressedPub)
+    {
+        // SEC1 §2.3.3: uncompressed P-256 point is 0x04 || X(32) || Y(32) = 65 bytes.
+        if (uncompressedPub.Length != 65 || uncompressedPub[0] != 0x04)
+            throw new TlsException(AlertDescription.BadCertificate,
+                $"Invalid uncompressed P-256 public key (length={uncompressedPub.Length}, " +
+                $"prefix=0x{(uncompressedPub.Length > 0 ? uncompressedPub[0] : 0):X2})");
+    }
 
     /// <summary>Extract the CN from a DER certificate.</summary>
     internal static string ExtractCommonName(byte[] certDer)
@@ -1208,12 +1219,11 @@ public static class CertificateUtils
             if (sigOidTlv.AsSpan().SequenceEqual(ecdsaSha256Oid))
             {
                 using var ecdsa = ImportEcdsaPubKey(caCert.PublicKey);
-                sigValid = ecdsa.VerifyData(tbsResponseDataDer, signatureBytes,
-                    HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+                sigValid = ecdsa.VerifyDataDer(tbsResponseDataDer, signatureBytes, HashAlgorithmName.SHA256);
             }
             else if (sigOidTlv.AsSpan().SequenceEqual(rsaSha256Oid))
             {
-                using var rsa = RSA.Create();
+                using var rsa = RsaManaged.Create();
                 rsa.ImportRSAPublicKey(caCert.PublicKey, out _);
                 sigValid = rsa.VerifyData(tbsResponseDataDer, signatureBytes,
                     HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);

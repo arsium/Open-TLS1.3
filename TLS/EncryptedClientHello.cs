@@ -55,14 +55,19 @@ public static class EncryptedClientHello
 
         while (pos < configListBytes.Length)
         {
-            if (pos + 4 > configListBytes.Length) break;
+            // 3-byte ECHConfig header: 1-byte version + 2-byte length. Bail loudly on truncation
+            // — silent breaks here used to mask malformed lists as "no ECH" and would have been a
+            // confusing source of "why doesn't ECH work" bugs.
+            if (pos + 3 > configListBytes.Length)
+                throw new ArgumentException("Truncated ECHConfigList: incomplete config header");
 
             byte version = configListBytes[pos++];
             ushort configLen = BinaryHelper.ReadUInt16(configListBytes.AsSpan(pos)); pos += 2;
 
-            if (pos + configLen > configListBytes.Length) throw new ArgumentException("Invalid ECHConfig length");
+            if (pos + configLen > configListBytes.Length)
+                throw new ArgumentException("Truncated ECHConfigList: config length exceeds buffer");
 
-            // Parse ECHConfig contents
+            // Parse ECHConfig contents (unknown version/algorithm → silent skip for forward compat)
             var config = ParseEchConfig(version, configListBytes.AsSpan(pos, configLen));
             if (config != null) configs.Add(config);
 

@@ -13,7 +13,7 @@ using System.Security.Cryptography;
 /// PSK/session resumption, 0-RTT early data, post-handshake client auth,
 /// exporter interface, SSLKEYLOGFILE, and proper close_notify / alert handling.
 /// </summary>
-public sealed class TlsConnection
+public sealed class TlsConnection : IDisposable
 {
     private readonly RecordLayer _record;
     private readonly bool _isServer;
@@ -235,7 +235,8 @@ public sealed class TlsConnection
     {
         if (serverRandom.Length < 8) return;
         var tail = serverRandom.AsSpan(serverRandom.Length - 8);
-        if (tail.SequenceEqual(DowngradeSentinel12) || tail.SequenceEqual(DowngradeSentinel11))
+        if (CryptographicOperations.FixedTimeEquals(tail, DowngradeSentinel12) ||
+            CryptographicOperations.FixedTimeEquals(tail, DowngradeSentinel11))
             AlertAndThrow(AlertDescription.IllegalParameter,
                 "TLS version-downgrade sentinel detected (RFC 8446 §4.1.3)");
     }
@@ -349,8 +350,7 @@ public sealed class TlsConnection
             throw new InvalidOperationException("No peer certificate available");
 
         // Use SHA-256 for certificate hashing (RFC 9266 recommendation)
-        using var hasher = SHA256.Create();
-        return hasher.ComputeHash(PeerCertificateData);
+        return Sha2Managed.Sha256(PeerCertificateData);
     }
 
     private byte[] GetTlsExporterBinding()
@@ -412,8 +412,9 @@ public sealed class TlsConnection
         BinaryHelper.WriteUInt24(ms, 0); // certificate_request_context length = 0
 
         // Certificate entries
+        byte[][] chainCerts = certificate.ChainCertificates ?? Array.Empty<byte[]>();
         int totalCertLen = certificate.DerData.Length + 3 + 2; // cert + len + ext_len
-        foreach (var chainCert in certificate.ChainCertificates)
+        foreach (var chainCert in chainCerts)
             totalCertLen += chainCert.Length + 3 + 2;
 
         BinaryHelper.WriteUInt24(ms, (uint)totalCertLen);
@@ -424,7 +425,7 @@ public sealed class TlsConnection
         BinaryHelper.WriteUInt16(ms, 0); // extensions length = 0
 
         // Write chain certificates
-        foreach (var chainCert in certificate.ChainCertificates)
+        foreach (var chainCert in chainCerts)
         {
             BinaryHelper.WriteUInt24(ms, (uint)chainCert.Length);
             ms.Write(chainCert);
@@ -2231,9 +2232,29 @@ public sealed class TlsConnection
         if (desc == AlertDescription.CloseNotify)
         {
             _closed = true;
+            // The session is over — zero key material now rather than waiting for GC.
+            _keySchedule?.Dispose();
             return;
         }
+        // Fatal alerts terminate the connection; clear key material before unwinding.
+        _keySchedule?.Dispose();
         throw new TlsException(desc, $"Received alert: {(AlertLevel)data[0]} {desc}");
+    }
+
+    private bool _disposed;
+
+    /// <summary>
+    /// Zero key material and release record-layer resources. Safe to call multiple times.
+    /// Does NOT send close_notify — callers wanting graceful shutdown should call
+    /// <see cref="SendAlert"/>(Warning, CloseNotify) first.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _keySchedule?.Dispose();
+        _record.Dispose();
+        _writeLock.Dispose();
     }
 
     [DoesNotReturn]

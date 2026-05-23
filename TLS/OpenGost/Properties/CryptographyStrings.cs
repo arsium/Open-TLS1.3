@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Numerics;
 namespace OpenGost.Security.Cryptography.Properties;
 
 // Vendored from OpenGost: resx-backed strongly-typed resources replaced with

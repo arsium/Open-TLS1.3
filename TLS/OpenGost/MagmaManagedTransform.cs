@@ -1,29 +1,31 @@
-﻿using System.Numerics;
+using System.Security.Cryptography;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace OpenGost.Security.Cryptography;
 
-internal sealed class MagmaManagedTransform : SymmetricTransform
+/// <summary>
+/// Magma (GOST R 34.12-2015, 64-bit block, 256-bit key) ECB block cipher. Standalone — no
+/// inheritance from SymmetricAlgorithm/SymmetricTransform/ICryptoTransform, so the BCL
+/// symmetric-algorithm registry doesn't get linked.
+/// </summary>
+public sealed class MagmaManagedTransform
 {
-    #region Lookup tables
+    public const int BlockSizeBytes = 8;
+    public const int KeySizeBytes = 32;
 
     private static readonly uint[] _lookup = InitializeLookupTable();
 
-    #endregion
-
     private uint[]? _keyExpansion;
 
-    internal MagmaManagedTransform(
-        byte[] rgbKey,
-        byte[]? rgbIV,
-        int blockSize,
-        CipherMode cipherMode,
-        PaddingMode paddingMode,
-        bool encrypting)
-        : base(rgbKey, rgbIV, blockSize, cipherMode, paddingMode, encrypting)
-    { }
+    public MagmaManagedTransform(byte[] rgbKey)
+    {
+        if (rgbKey == null) throw new ArgumentNullException(nameof(rgbKey));
+        if (rgbKey.Length != KeySizeBytes) throw new ArgumentException("Magma key must be 32 bytes", nameof(rgbKey));
+        GenerateKeyExpansion(rgbKey);
+    }
 
-    protected override unsafe void GenerateKeyExpansion(byte[] key)
+    private unsafe void GenerateKeyExpansion(byte[] key)
     {
         _keyExpansion = new uint[8];
 
@@ -32,7 +34,7 @@ internal sealed class MagmaManagedTransform : SymmetricTransform
             CryptoUtils.UInt32FromBigEndian(keyExpansion, 8, keyPtr);
     }
 
-    protected override unsafe void EncryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
+    public unsafe void EncryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
     {
         LoadRegisters(inputBuffer, inputOffset, out var a0, out var a1);
 
@@ -50,7 +52,7 @@ internal sealed class MagmaManagedTransform : SymmetricTransform
         FlushRegisters(outputBuffer, outputOffset, a0, a1);
     }
 
-    protected override unsafe void DecryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
+    public unsafe void DecryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
     {
         LoadRegisters(inputBuffer, inputOffset, out var a0, out var a1);
 
@@ -92,13 +94,9 @@ internal sealed class MagmaManagedTransform : SymmetricTransform
         }
     }
 
-    protected override void Dispose(bool disposing)
+    public void Dispose()
     {
-        if (disposing)
-        {
-            CryptoUtils.EraseData(ref _keyExpansion);
-        }
-        base.Dispose(disposing);
+        CryptoUtils.EraseData(ref _keyExpansion);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

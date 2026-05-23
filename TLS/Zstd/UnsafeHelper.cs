@@ -5,7 +5,10 @@ using System.Runtime.InteropServices;
 // ReSharper disable InconsistentNaming
 // ReSharper disable IdentifierTypo
 
-[module: SkipLocalsInit]
+// Removed: [module: SkipLocalsInit] — this was assembly-wide and caused memory corruption
+// in BouncyCastle's heavy stackalloc usage (BC assumes zero-init buffers per CLR spec).
+// Zstd's perf-critical methods can opt in individually if needed; the assembly-wide flag
+// was poisoning every other vendored library.
 
 namespace ZstdSharp
 {

@@ -22,6 +22,15 @@
     <Compile Include="$(MSBuildThisFileDirectory)Grease.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)ChineseCrypto.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Sm4Aead.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)ChaCha20.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)ChaCha20Drbg.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Poly1305.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)ChaCha20Poly1305Managed.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)AesGcmManaged.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Sha2Managed.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)RsaManaged.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)EcdsaManaged.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)EcdhManaged.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)AeadCipher.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)X25519.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Ed25519.cs" />
@@ -55,5 +64,16 @@
   <!-- OpenGost: vendored managed GOST crypto (Grasshopper/Magma/Streebog/CMAC) -->
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)OpenGost\**\*.cs" />
+  </ItemGroup>
+  <!-- BrotliSharpLib: vendored managed Brotli (1:1 C# port of google/brotli, MIT). Replaces
+       System.IO.Compression.BrotliStream so RFC 8879 cert compression has no native dep. -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)BrotliSharp\**\*.cs" />
+  </ItemGroup>
+  <!-- BouncyCastle: vendored crypto, math, security, util, asn1 subtrees from bc-csharp.
+       Used to replace System.Security.Cryptography for AES-GCM, SHA-2, HMAC, RSA, and
+       NIST-curve ECDH/ECDSA, removing the BCrypt/OpenSSL native dependency on those paths. -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)BouncyCastle\**\*.cs" />
   </ItemGroup>
 </Project>

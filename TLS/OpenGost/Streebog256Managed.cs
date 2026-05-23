@@ -1,14 +1,18 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 
 namespace OpenGost.Security.Cryptography;
 
 /// <summary>
-/// Computes the <see cref="Streebog256"/> hash for the input data using the managed implementation.
+/// Streebog-256 (GOST R 34.11-2012, half-length variant). Standalone class — no longer
+/// inherits from System.Security.Cryptography.HashAlgorithm so the BCL hash registry
+/// (and its BCrypt imports) doesn't get linked. Internally wraps a Streebog512Managed
+/// seeded with the 256-bit IV; the 32-byte output is the upper half of the 64-byte digest.
 /// </summary>
 [ComVisible(true)]
-public class Streebog256Managed : Streebog256
+public sealed class Streebog256Managed : IDisposable
 {
-    #region Constants
+    public const int HashSize = 32;
+    public byte[]? HashValue { get; private set; }
 
     private static readonly byte[] _defaultIV =
     [
@@ -18,67 +22,50 @@ public class Streebog256Managed : Streebog256
         0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01
     ];
 
-    #endregion
+    private readonly Streebog512Managed _innerAlgorithm = new(_defaultIV);
+    private bool _disposed;
 
-    private readonly Streebog512Managed _innerAlgorithm;
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="Streebog256Managed"/> class.
-    /// </summary>
-    public Streebog256Managed()
+    public static byte[] Hash(byte[] data)
     {
-        _innerAlgorithm = new Streebog512Managed(_defaultIV);
+        var h = new Streebog256Managed();
+        h.BlockUpdate(data, 0, data.Length);
+        var result = new byte[HashSize];
+        h.DoFinal(result, 0);
+        return result;
     }
 
-    /// <summary>
-    /// Initializes an instance of <see cref="Streebog256Managed"/>.
-    /// </summary>
-    public override void Initialize()
-    {
-        _innerAlgorithm.Initialize();
-    }
+    public void Initialize() => _innerAlgorithm.Initialize();
 
-    /// <summary>
-    /// Routes data written to the object into the <see cref="Streebog256"/> hash algorithm for computing the hash.
-    /// </summary>
-    /// <param name="array">
-    /// The input data.
-    /// </param>
-    /// <param name="ibStart">
-    /// The offset into the byte array from which to begin using data.
-    /// </param>
-    /// <param name="cbSize">
-    /// The number of bytes in the array to use as data.
-    /// </param>
-    protected override void HashCore(byte[] array, int ibStart, int cbSize)
-        => _innerAlgorithm.TransformBlock(array, ibStart, cbSize, null, 0);
+    public void BlockUpdate(byte[] data, int offset, int count)
+        => _innerAlgorithm.TransformBlock(data, offset, count, null, 0);
 
-    /// <summary>
-    /// Returns the computed <see cref="Streebog256"/> hash value after all data has been written to the object.
-    /// </summary>
-    /// <returns>
-    /// The computed hash code.
-    /// </returns>
-    protected override byte[] HashFinal()
+    public int DoFinal(byte[] output, int offset)
     {
         _ = _innerAlgorithm.TransformFinalBlock([], 0, 0);
-        var hash = new byte[32];
-        Buffer.BlockCopy(_innerAlgorithm.Hash!, 32, hash, 0, 32);
+        // Streebog-256 takes the upper half (bytes 32..64) of the Streebog-512 state.
+        Buffer.BlockCopy(_innerAlgorithm.HashValue!, 32, output, offset, HashSize);
+        var hash = new byte[HashSize];
+        Buffer.BlockCopy(_innerAlgorithm.HashValue!, 32, hash, 0, HashSize);
         HashValue = hash;
-        return hash;
+        return HashSize;
     }
 
-    /// <summary>
-    /// Releases the unmanaged resources used by the <see cref="Streebog256"/> and optionally releases the managed resources.
-    /// </summary>
-    /// <param name="disposing">
-    /// <see langword="true"/> to release both managed and unmanaged resources;
-    /// <see langword="false"/> to release only unmanaged resources.
-    /// </param>
-    protected override void Dispose(bool disposing)
+    // Compat shims for the few callers that used the old HashAlgorithm-style names.
+    public byte[] TransformFinalBlock(byte[] inputBuffer, int inputOffset, int inputCount)
     {
-        base.Dispose(disposing);
+        if (inputCount > 0) BlockUpdate(inputBuffer, inputOffset, inputCount);
+        var hash = new byte[HashSize];
+        DoFinal(hash, 0);
+        var copy = new byte[inputCount];
+        if (inputCount > 0) Buffer.BlockCopy(inputBuffer, inputOffset, copy, 0, inputCount);
+        return copy;
+    }
 
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (HashValue != null) Array.Clear(HashValue, 0, HashValue.Length);
         _innerAlgorithm.Dispose();
     }
 }

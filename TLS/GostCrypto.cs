@@ -13,8 +13,8 @@ public static class GostCrypto
     /// <summary>Kuznyechik (GOST R 34.12-2015 "Grasshopper") 128-bit block cipher.</summary>
     public static class Kuznyechik
     {
-        public const int BlockSize = 16; // 128 bits
-        public const int KeySize = 32;   // 256 bits
+        public const int BlockSize = GrasshopperManaged.BlockSize;
+        public const int KeySize = GrasshopperManaged.KeySize;
 
         public static byte[] EncryptBlock(byte[] key, byte[] plaintext) => Transform(key, plaintext, encrypt: true);
         public static byte[] DecryptBlock(byte[] key, byte[] ciphertext) => Transform(key, ciphertext, encrypt: false);
@@ -24,17 +24,19 @@ public static class GostCrypto
             if (key.Length != KeySize) throw new ArgumentException("Invalid key size", nameof(key));
             if (block.Length != BlockSize) throw new ArgumentException("Invalid block size", nameof(block));
 
-            using var alg = new GrasshopperManaged { Mode = CipherMode.ECB, Padding = PaddingMode.None };
-            using var t = encrypt ? alg.CreateEncryptor(key, null) : alg.CreateDecryptor(key, null);
-            return t.TransformFinalBlock(block, 0, block.Length);
+            using var cipher = new GrasshopperManaged(key);
+            byte[] output = new byte[BlockSize];
+            if (encrypt) cipher.EncryptBlock(block, 0, output, 0);
+            else         cipher.DecryptBlock(block, 0, output, 0);
+            return output;
         }
     }
 
     /// <summary>Magma (GOST R 34.12-2015 / 28147-89) 64-bit block cipher.</summary>
     public static class Magma
     {
-        public const int BlockSize = 8;  // 64 bits
-        public const int KeySize = 32;   // 256 bits
+        public const int BlockSize = MagmaManaged.BlockSize;
+        public const int KeySize = MagmaManaged.KeySize;
 
         public static byte[] EncryptBlock(byte[] key, byte[] plaintext) => Transform(key, plaintext, encrypt: true);
         public static byte[] DecryptBlock(byte[] key, byte[] ciphertext) => Transform(key, ciphertext, encrypt: false);
@@ -44,43 +46,19 @@ public static class GostCrypto
             if (key.Length != KeySize) throw new ArgumentException("Invalid key size", nameof(key));
             if (block.Length != BlockSize) throw new ArgumentException("Invalid block size", nameof(block));
 
-            using var alg = new MagmaManaged { Mode = CipherMode.ECB, Padding = PaddingMode.None };
-            using var t = encrypt ? alg.CreateEncryptor(key, null) : alg.CreateDecryptor(key, null);
-            return t.TransformFinalBlock(block, 0, block.Length);
+            using var cipher = new MagmaManaged(key);
+            byte[] output = new byte[BlockSize];
+            if (encrypt) cipher.EncryptBlock(block, 0, output, 0);
+            else         cipher.DecryptBlock(block, 0, output, 0);
+            return output;
         }
     }
 
     /// <summary>GOST R 34.11-2012 (Streebog) hash function.</summary>
     public static class Streebog
     {
-        public static byte[] Hash256(byte[] data)
-        {
-            using var h = Streebog256.Create();
-            return h.ComputeHash(data);
-        }
-
-        public static byte[] Hash512(byte[] data)
-        {
-            using var h = Streebog512.Create();
-            return h.ComputeHash(data);
-        }
-    }
-
-    /// <summary>OMAC (CMAC over a GOST block cipher) per GOST R 34.13-2015. Not used by the
-    /// RFC 9367 MGM suites, but exposed as a verified GOST primitive.</summary>
-    public static class Omac
-    {
-        public static byte[] Kuznyechik(byte[] key, byte[] data)
-        {
-            using var mac = new CMACGrasshopper(key);
-            return mac.ComputeHash(data);
-        }
-
-        public static byte[] Magma(byte[] key, byte[] data)
-        {
-            using var mac = new CMACMagma(key);
-            return mac.ComputeHash(data);
-        }
+        public static byte[] Hash256(byte[] data) => Streebog256Managed.Hash(data);
+        public static byte[] Hash512(byte[] data) => Streebog512Managed.Hash(data);
     }
 
     /// <summary>Check if a cipher suite is a GOST suite.</summary>

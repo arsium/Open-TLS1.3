@@ -115,18 +115,25 @@ public static class HandshakeMessages
     public static ParsedClientHello ParseClientHello(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 2 + 32 + 1, "ClientHello fixed header");
         p += 2; // legacy_version
         byte[] clientRandom = body[p..(p + 32)]; p += 32;
 
         int sidLen = body[p++];
+        EnsureRemaining(body, p, sidLen + 2, "ClientHello session_id");
         byte[] sessionId = body[p..(p + sidLen)]; p += sidLen;
 
         ushort suitesLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        if ((suitesLen & 1) != 0)
+            throw new TlsException(AlertDescription.DecodeError, "ClientHello cipher_suites length must be even");
+        EnsureRemaining(body, p, suitesLen + 1, "ClientHello cipher_suites");
         var suites = new List<CipherSuite>();
         for (int i = 0; i < suitesLen / 2; i++)
         { suites.Add((CipherSuite)BinaryHelper.ReadUInt16(body.AsSpan(p))); p += 2; }
 
-        int compLen = body[p++]; p += compLen; // skip compression
+        int compLen = body[p++];
+        EnsureRemaining(body, p, compLen, "ClientHello compression_methods");
+        p += compLen; // skip compression
 
         var keyShares = new List<(NamedGroup, byte[])>();
         var supportedGroups = new List<NamedGroup>();
@@ -144,27 +151,37 @@ public static class HandshakeMessages
 
         if (p < body.Length)
         {
+            EnsureRemaining(body, p, 2, "ClientHello extensions length");
             ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+            EnsureRemaining(body, p, extLen, "ClientHello extensions block");
             int extEnd = p + extLen;
             while (p < extEnd)
             {
                 var (et, ed, np) = ReadExtension(body, p); p = np;
                 if (et == ExtensionType.KeyShare)
                 {
+                    EnsureRemaining(ed, 0, 2, "key_share list length");
                     ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    EnsureRemaining(ed, 2, listLen, "key_share list");
                     int kp = 2;
                     int kEnd = 2 + listLen;
                     while (kp < kEnd)
                     {
+                        EnsureRemaining(ed, kp, 4, "key_share entry header");
                         var group = (NamedGroup)BinaryHelper.ReadUInt16(ed.AsSpan(kp)); kp += 2;
                         ushort kl = BinaryHelper.ReadUInt16(ed.AsSpan(kp)); kp += 2;
+                        EnsureRemaining(ed, kp, kl, "key_share key bytes");
                         keyShares.Add((group, ed[kp..(kp + kl)]));
                         kp += kl;
                     }
                 }
                 else if (et == ExtensionType.SupportedGroups)
                 {
+                    EnsureRemaining(ed, 0, 2, "supported_groups length");
                     ushort groupsLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    if ((groupsLen & 1) != 0)
+                        throw new TlsException(AlertDescription.DecodeError, "supported_groups length must be even");
+                    EnsureRemaining(ed, 2, groupsLen, "supported_groups list");
                     int gp = 2;
                     int gEnd = 2 + groupsLen;
                     while (gp < gEnd)
@@ -175,9 +192,11 @@ public static class HandshakeMessages
                 }
                 else if (et == ExtensionType.ServerName)
                 {
+                    EnsureRemaining(ed, 0, 5, "server_name header");
                     int sp = 2; // skip list length
                     sp++;       // skip name type
                     ushort nl = BinaryHelper.ReadUInt16(ed.AsSpan(sp)); sp += 2;
+                    EnsureRemaining(ed, sp, nl, "server_name host_name");
                     sni = System.Text.Encoding.ASCII.GetString(ed, sp, nl);
                 }
                 else if (et == ExtensionType.PreSharedKey)
@@ -195,12 +214,16 @@ public static class HandshakeMessages
                 else if (et == ExtensionType.Alpn)
                 {
                     var protos = new List<string>();
+                    EnsureRemaining(ed, 0, 2, "ALPN list length");
                     ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    EnsureRemaining(ed, 2, listLen, "ALPN protocol list");
                     int ap = 2;
                     int apEnd = 2 + listLen;
                     while (ap < apEnd)
                     {
+                        EnsureRemaining(ed, ap, 1, "ALPN proto length byte");
                         int pLen = ed[ap++];
+                        EnsureRemaining(ed, ap, pLen, "ALPN proto name");
                         protos.Add(System.Text.Encoding.ASCII.GetString(ed, ap, pLen));
                         ap += pLen;
                     }
@@ -208,7 +231,12 @@ public static class HandshakeMessages
                 }
                 else if (et == ExtensionType.CertificateCompression)
                 {
-                    int numAlgs = ed[0] / 2; // byte length to algorithm count
+                    EnsureRemaining(ed, 0, 1, "compress_certificate length byte");
+                    int algBytes = ed[0];
+                    if ((algBytes & 1) != 0)
+                        throw new TlsException(AlertDescription.DecodeError, "compress_certificate list length must be even");
+                    EnsureRemaining(ed, 1, algBytes, "compress_certificate algorithm list");
+                    int numAlgs = algBytes / 2;
                     certCompAlgorithms = new ushort[numAlgs];
                     for (int a = 0; a < numAlgs; a++)
                         certCompAlgorithms[a] = BinaryHelper.ReadUInt16(ed.AsSpan(1 + a * 2));
@@ -333,12 +361,14 @@ public static class HandshakeMessages
     public static ParsedServerHello ParseServerHello(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 2 + 32 + 1, "ServerHello fixed header");
         p += 2; // legacy_version
         byte[] serverRandom = body[p..(p + 32)]; p += 32;
 
         bool isHrr = serverRandom.AsSpan().SequenceEqual(HrrSentinel);
 
         int sidLen = body[p++];
+        EnsureRemaining(body, p, sidLen + 2 + 1 + 2, "ServerHello session_id + suite + compression + ext_len");
         byte[] sessionId = body[p..(p + sidLen)]; p += sidLen;
 
         var suite = (CipherSuite)BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
@@ -350,29 +380,36 @@ public static class HandshakeMessages
         int selectedPsk = -1;
 
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        EnsureRemaining(body, p, extLen, "ServerHello extensions block");
         int extEnd = p + extLen;
         while (p < extEnd)
         {
             var (et, ed, np) = ReadExtension(body, p); p = np;
             if (et == ExtensionType.KeyShare)
             {
+                EnsureRemaining(ed, 0, 2, "ServerHello key_share group");
                 keyShareGroup = (NamedGroup)BinaryHelper.ReadUInt16(ed.AsSpan(0));
                 if (!isHrr)
                 {
                     // Normal SH: group(2) + key_len(2) + key(...)
+                    EnsureRemaining(ed, 2, 2, "ServerHello key_share length");
                     int kp = 2;
                     ushort kl = BinaryHelper.ReadUInt16(ed.AsSpan(kp)); kp += 2;
+                    EnsureRemaining(ed, kp, kl, "ServerHello key_share key bytes");
                     keyShare = ed[kp..(kp + kl)];
                 }
                 // HRR: just the group (2 bytes), keyShare stays null
             }
             else if (et == ExtensionType.Cookie)
             {
+                EnsureRemaining(ed, 0, 2, "cookie length");
                 ushort cookieLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                EnsureRemaining(ed, 2, cookieLen, "cookie data");
                 cookie = ed[2..(2 + cookieLen)];
             }
             else if (et == ExtensionType.PreSharedKey)
             {
+                EnsureRemaining(ed, 0, 2, "PSK selected_identity");
                 selectedPsk = BinaryHelper.ReadUInt16(ed.AsSpan(0));
             }
         }
@@ -560,10 +597,13 @@ public static class HandshakeMessages
     public static (byte[] context, SignatureScheme[] sigAlgorithms, SignatureScheme[]? certSigAlgorithms) ParseCertificateRequest(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 1, "CertificateRequest context length");
         int ctxLen = body[p++];
+        EnsureRemaining(body, p, ctxLen + 2, "CertificateRequest context + ext_len");
         byte[] context = body[p..(p + ctxLen)]; p += ctxLen;
 
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        EnsureRemaining(body, p, extLen, "CertificateRequest extensions block");
         int extEnd = p + extLen;
 
         var sigAlgs = new List<SignatureScheme>();
@@ -573,13 +613,21 @@ public static class HandshakeMessages
             var (et, ed, np) = ReadExtension(body, p); p = np;
             if (et == ExtensionType.SignatureAlgorithms)
             {
+                EnsureRemaining(ed, 0, 2, "signature_algorithms length");
                 ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                if ((algLen & 1) != 0)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms length must be even");
+                EnsureRemaining(ed, 2, algLen, "signature_algorithms list");
                 for (int i = 0; i < algLen / 2; i++)
                     sigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
             }
             else if (et == ExtensionType.SignatureAlgorithmsCert)
             {
+                EnsureRemaining(ed, 0, 2, "signature_algorithms_cert length");
                 ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                if ((algLen & 1) != 0)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert length must be even");
+                EnsureRemaining(ed, 2, algLen, "signature_algorithms_cert list");
                 for (int i = 0; i < algLen / 2; i++)
                     certSigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
             }
@@ -662,9 +710,14 @@ public static class HandshakeMessages
     public static byte[] ParseCertificateMessage(byte[] body)
     {
         int p = 0;
-        int ctxLen = body[p++]; p += ctxLen;
+        EnsureRemaining(body, p, 1, "Certificate context length");
+        int ctxLen = body[p++];
+        EnsureRemaining(body, p, ctxLen + 3, "Certificate context + list_len");
+        p += ctxLen;
         p += 3; // certificate_list length
+        EnsureRemaining(body, p, 3, "Certificate entry length");
         uint certLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
+        EnsureRemaining(body, p, (int)certLen, "Certificate entry data");
         return body[p..(p + (int)certLen)];
     }
 
@@ -672,25 +725,33 @@ public static class HandshakeMessages
     public static (byte[] context, List<CertEntry> entries) ParseCertificateEx(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 1, "Certificate context length");
         int ctxLen = body[p++];
+        EnsureRemaining(body, p, ctxLen + 3, "Certificate context + list_len");
         byte[] context = body[p..(p + ctxLen)]; p += ctxLen;
 
         uint listLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
+        EnsureRemaining(body, p, (int)listLen, "Certificate list");
         int listEnd = p + (int)listLen;
 
         var entries = new List<CertEntry>();
         while (p < listEnd)
         {
+            EnsureRemaining(body, p, 3, "Certificate entry length");
             uint certLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
+            EnsureRemaining(body, p, (int)certLen + 2, "Certificate entry data + ext_len");
             byte[] certDer = body[p..(p + (int)certLen)]; p += (int)certLen;
 
             byte[]? ocspResponse = null;
             ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+            EnsureRemaining(body, p, extLen, "Certificate entry extensions");
             int extEnd = p + extLen;
             while (p < extEnd)
             {
+                EnsureRemaining(body, p, 4, "Certificate per-cert ext header");
                 var extType = (ExtensionType)BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
                 ushort extDataLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+                EnsureRemaining(body, p, extDataLen, "Certificate per-cert ext data");
                 if (extType == ExtensionType.StatusRequest)
                     ocspResponse = UnwrapCertificateStatus(body[p..(p + extDataLen)]);
                 p += extDataLen;
@@ -717,8 +778,10 @@ public static class HandshakeMessages
 
     public static (SignatureScheme scheme, byte[] signature) ParseCertificateVerify(byte[] body)
     {
+        EnsureRemaining(body, 0, 4, "CertificateVerify header");
         var scheme = (SignatureScheme)BinaryHelper.ReadUInt16(body.AsSpan(0));
         ushort sigLen = BinaryHelper.ReadUInt16(body.AsSpan(2));
+        EnsureRemaining(body, 4, sigLen, "CertificateVerify signature");
         return (scheme, body[4..(4 + sigLen)]);
     }
 
@@ -775,17 +838,21 @@ public static class HandshakeMessages
     public static ParsedNewSessionTicket ParseNewSessionTicket(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 4 + 4 + 1, "NewSessionTicket fixed header");
         uint lifetime = BinaryHelper.ReadUInt32(body.AsSpan(p)); p += 4;
         uint ageAdd = BinaryHelper.ReadUInt32(body.AsSpan(p)); p += 4;
         int nonceLen = body[p++];
+        EnsureRemaining(body, p, nonceLen + 2, "NewSessionTicket nonce + ticket_len");
         byte[] nonce = body[p..(p + nonceLen)]; p += nonceLen;
         ushort ticketLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        EnsureRemaining(body, p, ticketLen, "NewSessionTicket ticket");
         byte[] ticket = body[p..(p + ticketLen)]; p += ticketLen;
 
         uint maxEarlyData = 0;
         if (p + 2 <= body.Length)
         {
             ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+            EnsureRemaining(body, p, extLen, "NewSessionTicket extensions");
             int extEnd = p + extLen;
             while (p < extEnd)
             {
@@ -833,33 +900,50 @@ public static class HandshakeMessages
     {
         int hashLen = Hkdf.HashLen(hash);
         byte[] finishedKey = Hkdf.ExpandLabel(hash, binderKey, "finished", Array.Empty<byte>(), hashLen);
-        using var hmac = System.Security.Cryptography.IncrementalHash.CreateHMAC(hash, finishedKey);
-        hmac.AppendData(transcriptHashTruncated);
-        return hmac.GetHashAndReset();
+        if (hash == System.Security.Cryptography.HashAlgorithmName.SHA256)
+            return Sha2Managed.HmacSha256(finishedKey, transcriptHashTruncated);
+        if (hash == System.Security.Cryptography.HashAlgorithmName.SHA384)
+            return Sha2Managed.HmacSha384(finishedKey, transcriptHashTruncated);
+        if (hash == System.Security.Cryptography.HashAlgorithmName.SHA512)
+            return Sha2Managed.HmacSha512(finishedKey, transcriptHashTruncated);
+        // RFC 9367 (GOST PSK) and RFC 8998 (SM3 PSK) use custom HMAC primitives.
+        if (GostKdf.IsStreebog(hash))
+            return GostKdf.Hmac(finishedKey, transcriptHashTruncated);
+        if (Sm3Kdf.IsSm3(hash))
+            return Sm3Kdf.Hmac(finishedKey, transcriptHashTruncated);
+        throw new ArgumentException($"Unsupported PSK binder hash: {hash}");
     }
 
     /// <summary>Parse pre_shared_key extension from ClientHello.</summary>
     public static (byte[][] identities, uint[] ages, byte[][] binders) ParsePreSharedKeyExtension(byte[] data)
     {
         int p = 0;
+        EnsureRemaining(data, p, 2, "PSK identities length");
         ushort idsLen = BinaryHelper.ReadUInt16(data.AsSpan(p)); p += 2;
+        EnsureRemaining(data, p, idsLen, "PSK identities block");
         int idsEnd = p + idsLen;
 
         var identities = new List<byte[]>();
         var ages = new List<uint>();
         while (p < idsEnd)
         {
+            EnsureRemaining(data, p, 2, "PSK identity length");
             ushort idLen = BinaryHelper.ReadUInt16(data.AsSpan(p)); p += 2;
+            EnsureRemaining(data, p, idLen + 4, "PSK identity + obfuscated_age");
             identities.Add(data[p..(p + idLen)]); p += idLen;
             ages.Add(BinaryHelper.ReadUInt32(data.AsSpan(p))); p += 4;
         }
 
+        EnsureRemaining(data, p, 2, "PSK binders length");
         ushort bindersLen = BinaryHelper.ReadUInt16(data.AsSpan(p)); p += 2;
+        EnsureRemaining(data, p, bindersLen, "PSK binders block");
         var binders = new List<byte[]>();
         int bindersEnd = p + bindersLen;
         while (p < bindersEnd)
         {
+            EnsureRemaining(data, p, 1, "PSK binder length");
             int bLen = data[p++];
+            EnsureRemaining(data, p, bLen, "PSK binder data");
             binders.Add(data[p..(p + bLen)]); p += bLen;
         }
 
@@ -1170,9 +1254,20 @@ public static class HandshakeMessages
 
     private static (ExtensionType type, byte[] data, int newPos) ReadExtension(byte[] buf, int pos)
     {
+        EnsureRemaining(buf, pos, 4, "extension header");
         var type = (ExtensionType)BinaryHelper.ReadUInt16(buf.AsSpan(pos)); pos += 2;
         ushort len = BinaryHelper.ReadUInt16(buf.AsSpan(pos)); pos += 2;
+        EnsureRemaining(buf, pos, len, "extension data");
         return (type, buf[pos..(pos + len)], pos + len);
+    }
+
+    // Raise DecodeError instead of letting the runtime throw IndexOutOfRange/ArgumentOutOfRange
+    // when a peer sends a length-prefix that runs past the message body.
+    private static void EnsureRemaining(byte[] buf, int pos, int needed, string what)
+    {
+        if (pos < 0 || needed < 0 || (long)pos + needed > buf.Length)
+            throw new TlsException(AlertDescription.DecodeError,
+                $"Malformed handshake message: truncated {what} (pos={pos}, need={needed}, have={buf.Length})");
     }
 
     // ================================================================
@@ -1198,9 +1293,11 @@ public static class HandshakeMessages
     public static byte[] ParseCompressedCertificate(byte[] body)
     {
         int p = 0;
+        EnsureRemaining(body, p, 2 + 3 + 3, "CompressedCertificate header");
         ushort algorithm = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
         uint uncompressedLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
         uint compressedLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
+        EnsureRemaining(body, p, (int)compressedLen, "CompressedCertificate payload");
         byte[] compressed = body[p..(p + (int)compressedLen)];
         return CertificateCompression.Decompress(compressed, algorithm, (int)uncompressedLen);
     }

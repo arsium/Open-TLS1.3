@@ -26,7 +26,7 @@ using System.Security.Cryptography;
 ///              +---> Derive-Secret(., "c ap traffic", CH..SF) = client_app_traffic_secret_0
 ///              +---> Derive-Secret(., "s ap traffic", CH..SF) = server_app_traffic_secret_0
 /// </summary>
-public sealed class KeySchedule
+public sealed class KeySchedule : IDisposable
 {
     private readonly HashAlgorithmName _hash;
     private readonly int _hashLen;
@@ -36,6 +36,7 @@ public sealed class KeySchedule
     private byte[] _earlySecret;
     private byte[] _handshakeSecret = null!;
     private byte[] _masterSecret = null!;
+    private bool _disposed;
 
     public byte[]? ServerHandshakeTrafficSecret { get; private set; }
     public byte[]? ClientHandshakeTrafficSecret { get; private set; }
@@ -172,9 +173,10 @@ public sealed class KeySchedule
             return GostKdf.Hmac(finishedKey, transcriptHash);
         if (Sm3Kdf.IsSm3(_hash))
             return Sm3Kdf.Hmac(finishedKey, transcriptHash);
-        using var hmac = IncrementalHash.CreateHMAC(_hash, finishedKey);
-        hmac.AppendData(transcriptHash);
-        return hmac.GetHashAndReset();
+        if (_hash == HashAlgorithmName.SHA256) return Sha2Managed.HmacSha256(finishedKey, transcriptHash);
+        if (_hash == HashAlgorithmName.SHA384) return Sha2Managed.HmacSha384(finishedKey, transcriptHash);
+        if (_hash == HashAlgorithmName.SHA512) return Sha2Managed.HmacSha512(finishedKey, transcriptHash);
+        throw new ArgumentException($"Unsupported HMAC hash: {_hash}");
     }
 
     /// <summary>Derive the next application traffic secret for KeyUpdate (RFC 8446 §7.2).</summary>
@@ -199,12 +201,38 @@ public sealed class KeySchedule
 
     internal byte[] HashData(byte[] data)
     {
-        if (_hash == HashAlgorithmName.SHA256) return SHA256.HashData(data);
-        if (_hash == HashAlgorithmName.SHA384) return SHA384.HashData(data);
+        if (_hash == HashAlgorithmName.SHA256) return Sha2Managed.Sha256(data);
+        if (_hash == HashAlgorithmName.SHA384) return Sha2Managed.Sha384(data);
         if (GostKdf.IsStreebog(_hash)) return GostKdf.Hash(data);
         if (Sm3Kdf.IsSm3(_hash)) return Sm3Kdf.Hash(data);
         throw new ArgumentException($"Unsupported hash: {_hash}");
     }
 
     private byte[] HashEmpty() => HashData(Array.Empty<byte>());
+
+    /// <summary>
+    /// Cryptographically zero every derived secret and master/handshake key still held by
+    /// this schedule. Safe to call multiple times. Callers should invoke this when the TLS
+    /// session is finished to reduce the window during which key material lingers in memory.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Zero(_earlySecret);
+        Zero(_handshakeSecret);
+        Zero(_masterSecret);
+        Zero(ClientHandshakeTrafficSecret);
+        Zero(ServerHandshakeTrafficSecret);
+        Zero(ClientAppTrafficSecret);
+        Zero(ServerAppTrafficSecret);
+        Zero(ExporterMasterSecret);
+        Zero(ResumptionMasterSecret);
+    }
+
+    private static void Zero(byte[]? buf)
+    {
+        if (buf != null && buf.Length > 0)
+            CryptographicOperations.ZeroMemory(buf);
+    }
 }

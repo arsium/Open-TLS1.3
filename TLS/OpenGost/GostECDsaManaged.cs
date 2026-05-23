@@ -1,22 +1,41 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Security.Cryptography;
 using System.Numerics;
+﻿using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using OpenGost.Security.Cryptography.Properties;
 
 namespace OpenGost.Security.Cryptography;
 
 /// <summary>
-/// Provides a managed implementation of the <see cref="GostECDsa"/> algorithm.
+/// Managed implementation of GOST R 34.10-2012 ECDSA. Standalone — no longer inherits
+/// from System.Security.Cryptography.ECDsa / AsymmetricAlgorithm so the BCL asymmetric
+/// machinery (and its BCrypt imports) doesn't get linked. ECCurve / ECPoint / ECParameters
+/// from System.Security.Cryptography are still used as plain data containers — those types
+/// are structs without runtime crypto dependencies.
 /// </summary>
 [ComVisible(true)]
-public sealed class GostECDsaManaged : GostECDsa
+public sealed class GostECDsaManaged : IDisposable
 {
+    public string SignatureAlgorithm => CryptoConstants.GostECDsaAlgorithmName;
+
     private ECCurve _curve;
     private ECPoint _publicKey;
     private byte[]? _privateKey;
+    private int _keySize = 512;
     private bool
         _parametersSet,
         _disposed;
+
+    public int KeySize
+    {
+        get => _keySize;
+        private set
+        {
+            if (value != 256 && value != 512)
+                throw new CryptographicException($"GOST key size must be 256 or 512, got {value}");
+            _keySize = value;
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GostECDsaManaged" /> class
@@ -50,9 +69,11 @@ public sealed class GostECDsaManaged : GostECDsa
     /// <paramref name="curve"/> is invalid.
     /// </exception>
     [ComVisible(false)]
-    public override void GenerateKey(ECCurve curve)
+    public void GenerateKey(ECCurve curve)
     {
-        curve.Validate();
+        // Skip curve.Validate() — see ImportParameters() for why.
+        if (curve.CurveType != ECCurve.ECCurveType.PrimeShortWeierstrass)
+            throw new CryptographicException("Only PrimeShortWeierstrass ECCurves are accepted");
 
         GenerateKey(curve, out var publicKey, out var privateKey);
 
@@ -97,7 +118,7 @@ public sealed class GostECDsaManaged : GostECDsa
     /// The key cannot be exported.
     /// </exception>
     [ComVisible(false)]
-    public override ECParameters ExportParameters(bool includePrivateParameters)
+    public ECParameters ExportParameters(bool includePrivateParameters)
     {
         ThrowIfDisposed();
 
@@ -122,11 +143,18 @@ public sealed class GostECDsaManaged : GostECDsa
     /// <paramref name="parameters"/> are invalid.
     /// </exception>
     [ComVisible(false)]
-    public override void ImportParameters(ECParameters parameters)
+    public void ImportParameters(ECParameters parameters)
     {
         ThrowIfDisposed();
 
-        parameters.Validate();
+        // parameters.Validate() goes through System.Security.Cryptography.ECCurve.Validate()
+        // which calls ECCurveExtensions.Validate(), which references the BCL Oid type for
+        // Named curves — a path that pulls CryptFindOIDInfo. Since we only accept explicit
+        // (PrimeShortWeierstrass) curves here, the lighter own-validation below is sufficient.
+        if (parameters.Curve.CurveType != ECCurve.ECCurveType.PrimeShortWeierstrass)
+            throw new CryptographicException("Only PrimeShortWeierstrass ECCurves are accepted");
+        if (parameters.Q.X == null || parameters.Q.Y == null)
+            throw new CryptographicException("Public key Q.X / Q.Y missing");
         KeySize = parameters.Q.X!.Length * 8;
 
         _curve = parameters.Curve.Clone();
@@ -151,7 +179,7 @@ public sealed class GostECDsaManaged : GostECDsa
     /// Invalid hash size.
     /// </exception>
     [SuppressMessage("Performance", "CA1863")]
-    public override byte[] SignHash(byte[] hash)
+    public byte[] SignHash(byte[] hash)
     {
 #if NET6_0_OR_GREATER
         ArgumentNullException.ThrowIfNull(hash);
@@ -235,7 +263,7 @@ public sealed class GostECDsaManaged : GostECDsa
     /// Invalid signature size.
     /// </exception>
     [SuppressMessage("Performance", "CA1863")]
-    public override bool VerifyHash(byte[] hash, byte[] signature)
+    public bool VerifyHash(byte[] hash, byte[] signature)
     {
 #if NET6_0_OR_GREATER
         ArgumentNullException.ThrowIfNull(hash);
@@ -310,42 +338,35 @@ public sealed class GostECDsaManaged : GostECDsa
     /// <see langword="true"/>true to release both managed and unmanaged resources;
     /// <see langword="false"/> to release only unmanaged resources.
     /// </param>
-    protected override void Dispose(bool disposing)
+    public void Dispose()
     {
-        if (!_disposed)
-        {
-            CryptoUtils.EraseData(ref _privateKey);
-
-            if (disposing)
-            {
-                CryptoUtils.EraseData(ref _curve.Prime);
-                CryptoUtils.EraseData(ref _curve.A);
-                CryptoUtils.EraseData(ref _curve.B);
-                CryptoUtils.EraseData(ref _curve.Order);
-                CryptoUtils.EraseData(ref _curve.Cofactor);
-                CryptoUtils.EraseData(ref _publicKey.X);
-                CryptoUtils.EraseData(ref _publicKey.Y);
-                var g = _curve.G;
-                CryptoUtils.EraseData(ref g.X);
-                CryptoUtils.EraseData(ref g.Y);
-            }
-        }
-
-        base.Dispose(disposing);
+        if (_disposed) return;
+        CryptoUtils.EraseData(ref _privateKey);
+        CryptoUtils.EraseData(ref _curve.Prime);
+        CryptoUtils.EraseData(ref _curve.A);
+        CryptoUtils.EraseData(ref _curve.B);
+        CryptoUtils.EraseData(ref _curve.Order);
+        CryptoUtils.EraseData(ref _curve.Cofactor);
+        CryptoUtils.EraseData(ref _publicKey.X);
+        CryptoUtils.EraseData(ref _publicKey.Y);
+        var g = _curve.G;
+        CryptoUtils.EraseData(ref g.X);
+        CryptoUtils.EraseData(ref g.Y);
         _disposed = true;
     }
 
     private static ECCurve GetExplicitCurve(in ECCurve curve)
     {
+        // Only PrimeShortWeierstrass is supported. We deliberately don't handle the Named
+        // case here — that would require touching curve.Oid (the BCL Oid type), which
+        // pulls CryptFindOIDInfo from crypt32.dll. Callers route through
+        // ECCurveOidMap.GetExplicitCurveByOid(oidString) directly and pass an explicit curve.
         return curve.CurveType switch
         {
             ECCurve.ECCurveType.PrimeShortWeierstrass => curve,
-            ECCurve.ECCurveType.Named => ECCurveOidMap.GetExplicitCurveByOid(curve.Oid.Value!),
-            ECCurve.ECCurveType.Implicit or
-            ECCurve.ECCurveType.PrimeTwistedEdwards or
-            ECCurve.ECCurveType.PrimeMontgomery or
-            ECCurve.ECCurveType.Characteristic2 or
-            _ => throw new NotImplementedException(),
+            _ => throw new NotSupportedException(
+                "GostECDsaManaged requires an explicit (PrimeShortWeierstrass) ECCurve. " +
+                "Use ECCurveOidMap.GetExplicitCurveByOid(...) instead of ECCurve.CreateFromValue(...)."),
         };
     }
 
@@ -361,7 +382,7 @@ public sealed class GostECDsaManaged : GostECDsa
     private static ECCurve GetDefaultCurve(int keySize)
         => keySize switch
         {
-            512 => ECCurve.CreateFromValue(Oids.ECCurve512ParamSetA),
-            _ => ECCurve.CreateFromValue(Oids.ECCurve256ParamSetA),
+            512 => ECCurveOidMap.GetExplicitCurveByOid(Oids.ECCurve512ParamSetA),
+            _ => ECCurveOidMap.GetExplicitCurveByOid(Oids.ECCurve256ParamSetA),
         };
 }

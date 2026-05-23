@@ -1,0 +1,103 @@
+# ============================================================================
+#  Open-TLS 1.3 — .gitignore (.NET)
+# ============================================================================
+
+# Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+build/
+bld/
+[Oo]ut/
+[Pp]ublish/
+publish/
+artifacts/
+
+# Native AOT / publish intermediates
+*.ilk
+*.pdb
+*.map
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.VisualState.xml
+*.ncrunch*
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# VS Code (keep shared settings, ignore local)
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+*.nuget.props
+*.nuget.targets
+
+# Test / coverage results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.trx
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+
+# MSBuild / temp
+*.tlog
+*.log
+*.tmp
+*.cache
+*_i.c
+*_p.c
+*.meta
+
+# ============================================================================
+#  Project-specific runtime artifacts
+# ============================================================================
+
+# Demo server generates a client certificate at startup
+client.pfx
+*.pfx
+
+# SSLKEYLOGFILE output (Wireshark key logs) — secret material
+keys.log
+*keylog*
+sslkeylog*
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# NOTE: Doc/ holds large external reference repos (OpenGost, bc-csharp, ZstdSharp,
+# ...). Their build artifacts are already covered by the bin/obj rules above.
+# Uncomment the next line if you do NOT want the reference sources committed:
+# Doc/

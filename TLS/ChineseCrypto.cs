@@ -196,40 +196,90 @@ public static class ChineseCrypto
         /// <summary>Default user identity per GB/T (used for certificate verification).</summary>
         public const string DefaultId = "1234567812345678";
 
-        // ---- affine EC arithmetic over GF(p) ----
+        // ---- EC arithmetic over GF(p), Jacobian projective coordinates ----
+        //
+        // Jacobian point (X, Y, Z) represents the affine point (X / Z², Y / Z³).
+        // Z = 0 represents the point at infinity. Working in Jacobian avoids one modular
+        // inversion per Add / Double — only one inverse is needed at the very end to convert
+        // back to affine. For a 256-bit scalar that's ~190 inversions saved per scalar mult
+        // (~3-5× speedup, since ModPow dominates affine cost).
+        private readonly record struct JPoint(BigInteger X, BigInteger Y, BigInteger Z);
+        private static readonly JPoint JInfinity = new(BigInteger.Zero, BigInteger.One, BigInteger.Zero);
+
+        private static JPoint ToJ((BigInteger x, BigInteger y) affine) =>
+            new(affine.x, affine.y, BigInteger.One);
+
+        private static (BigInteger x, BigInteger y)? ToAffine(JPoint p, BigInteger prime)
+        {
+            if (p.Z.IsZero) return null;
+            var zInv  = ModInv(p.Z, prime);
+            var zInv2 = zInv * zInv % prime;
+            var zInv3 = zInv2 * zInv % prime;
+            return (p.X * zInv2 % prime, p.Y * zInv3 % prime);
+        }
+
+        // Double-add formulas from Bernstein/Lange's EFD (efd.cr.yp.to), "Short Weierstrass,
+        // Jacobian coordinates, doubling-2007-bl" and "addition-2007-bl".
+        private static JPoint Double(JPoint p, BigInteger a, BigInteger prime)
+        {
+            if (p.Z.IsZero || p.Y.IsZero) return JInfinity;
+            var ysq    = p.Y * p.Y    % prime;
+            var s      = 4 * p.X * ysq % prime;
+            var zsq    = p.Z * p.Z    % prime;
+            var zfourth= zsq * zsq    % prime;
+            var m      = Mod(3 * p.X * p.X + a * zfourth, prime);
+            var xR     = Mod(m * m - 2 * s, prime);
+            var yR     = Mod(m * (s - xR) - 8 * ysq * ysq, prime);
+            var zR     = Mod(2 * p.Y * p.Z, prime);
+            return new(xR, yR, zR);
+        }
+
+        private static JPoint AddJ(JPoint p, JPoint q, BigInteger a, BigInteger prime)
+        {
+            if (p.Z.IsZero) return q;
+            if (q.Z.IsZero) return p;
+            var z1sq = p.Z * p.Z % prime;
+            var z2sq = q.Z * q.Z % prime;
+            var u1   = p.X * z2sq % prime;
+            var u2   = q.X * z1sq % prime;
+            var s1   = p.Y * q.Z % prime * z2sq % prime;
+            var s2   = q.Y * p.Z % prime * z1sq % prime;
+            if (u1 == u2)
+            {
+                if (s1 != s2) return JInfinity;       // P + (-P) = O
+                return Double(p, a, prime);            // P == Q
+            }
+            var h    = Mod(u2 - u1, prime);
+            var r    = Mod(s2 - s1, prime);
+            var hsq  = h * h % prime;
+            var hcb  = hsq * h % prime;
+            var u1h2 = u1 * hsq % prime;
+            var xR   = Mod(r * r - hcb - 2 * u1h2, prime);
+            var yR   = Mod(r * (u1h2 - xR) - s1 * hcb, prime);
+            var zR   = h * p.Z % prime * q.Z % prime;
+            return new(xR, yR, Mod(zR, prime));
+        }
+
         private static (BigInteger x, BigInteger y)? Add(Curve c, (BigInteger x, BigInteger y)? p1, (BigInteger x, BigInteger y)? p2)
         {
+            // Public affine-tuple API kept for Verify (s·G + t·Q) — internally uses Jacobian.
             if (p1 is null) return p2;
             if (p2 is null) return p1;
-            var (x1, y1) = p1.Value;
-            var (x2, y2) = p2.Value;
-            BigInteger lambda;
-            if (x1 == x2)
-            {
-                if ((y1 + y2) % c.P == 0) return null; // P + (-P) = O
-                lambda = (3 * x1 * x1 + c.A) * ModInv(2 * y1, c.P) % c.P;
-            }
-            else
-            {
-                lambda = Mod(y2 - y1, c.P) * ModInv(Mod(x2 - x1, c.P), c.P) % c.P;
-            }
-            lambda = Mod(lambda, c.P);
-            var x3 = Mod(lambda * lambda - x1 - x2, c.P);
-            var y3 = Mod(lambda * (x1 - x3) - y1, c.P);
-            return (x3, y3);
+            return ToAffine(AddJ(ToJ(p1.Value), ToJ(p2.Value), c.A, c.P), c.P);
         }
 
         private static (BigInteger x, BigInteger y)? Multiply(Curve c, BigInteger k, (BigInteger x, BigInteger y)? point)
         {
-            (BigInteger x, BigInteger y)? result = null;
-            var addend = point;
+            if (point is null || k.IsZero) return null;
+            var basePoint = ToJ(point.Value);
+            var result = JInfinity;
             while (k > 0)
             {
-                if (!k.IsEven) result = Add(c, result, addend);
-                addend = Add(c, addend, addend);
+                if (!k.IsEven) result = AddJ(result, basePoint, c.A, c.P);
+                basePoint = Double(basePoint, c.A, c.P);
                 k >>= 1;
             }
-            return result;
+            return ToAffine(result, c.P);
         }
 
         private static BigInteger Mod(BigInteger a, BigInteger m) { var r = a % m; return r.Sign < 0 ? r + m : r; }

@@ -1,11 +1,13 @@
 namespace TLS;
 
+using System.Buffers;
+
 /// <summary>
 /// TLS 1.3 record layer — reads/writes TLS records and handles AEAD encryption.
 /// Encrypted records are wrapped as ContentType.ApplicationData with the real
 /// content type appended to the plaintext before encryption.
 /// </summary>
-public sealed class RecordLayer
+public sealed class RecordLayer : IDisposable
 {
     private readonly Stream _stream;
     private AeadCipher? _readCipher;
@@ -41,6 +43,14 @@ public sealed class RecordLayer
     /// <summary>Remove the write cipher, reverting to plaintext writes (used when HRR invalidates early keys).</summary>
     public void ClearWriteCipher()
     {
+        _writeCipher?.Dispose();
+        _writeCipher = null;
+    }
+
+    public void Dispose()
+    {
+        _readCipher?.Dispose();
+        _readCipher = null;
         _writeCipher?.Dispose();
         _writeCipher = null;
     }
@@ -91,21 +101,36 @@ public sealed class RecordLayer
             {
                 int chunkLen = Math.Min(data.Length - offset, MaxSendPlaintext);
 
-                // Build inner plaintext: chunk ‖ content_type ‖ padding_zeros
+                // Build inner plaintext: chunk ‖ content_type ‖ padding_zeros. Pool the
+                // intermediate buffer — at MaxPlaintextLength+1 (16385) bytes it's the
+                // single biggest per-record allocation on the encrypt path.
                 int innerLen = chunkLen + 1; // +1 for content type
                 if (PaddingBlockSize > 0)
                     innerLen = ((innerLen + PaddingBlockSize - 1) / PaddingBlockSize) * PaddingBlockSize;
-                byte[] inner = new byte[innerLen];
-                Buffer.BlockCopy(data, offset, inner, 0, chunkLen);
-                inner[chunkLen] = (byte)type;
+                byte[] innerRented = ArrayPool<byte>.Shared.Rent(innerLen);
+                try
+                {
+                    Buffer.BlockCopy(data, offset, innerRented, 0, chunkLen);
+                    innerRented[chunkLen] = (byte)type;
+                    // Zero the padding slot — the rented buffer may carry stale bytes.
+                    if (innerLen > chunkLen + 1)
+                        Array.Clear(innerRented, chunkLen + 1, innerLen - chunkLen - 1);
 
-                int encLen = inner.Length + _writeCipher.TagLength;
-                byte[] header = BuildHeader(ContentType.ApplicationData, (ushort)encLen);
+                    int encLen = innerLen + _writeCipher.TagLength;
+                    byte[] header = BuildHeader(ContentType.ApplicationData, (ushort)encLen);
 
-                byte[] encrypted = _writeCipher.Encrypt(inner, header);
+                    byte[] encrypted = _writeCipher.Encrypt(
+                        new ReadOnlySpan<byte>(innerRented, 0, innerLen), header);
 
-                _stream.Write(header);
-                _stream.Write(encrypted);
+                    _stream.Write(header);
+                    _stream.Write(encrypted);
+                }
+                finally
+                {
+                    // Wipe the plaintext we just encrypted before handing the buffer back.
+                    Array.Clear(innerRented, 0, innerLen);
+                    ArrayPool<byte>.Shared.Return(innerRented);
+                }
                 offset += chunkLen;
             }
             _stream.Flush();

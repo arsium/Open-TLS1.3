@@ -9,8 +9,11 @@ using System.Security.Cryptography;
 public static class RandomnessWrapper
 {
     private static readonly object _lock = new();
-    private static readonly RandomNumberGenerator _primaryRng = RandomNumberGenerator.Create();
-    private static readonly HashAlgorithm _mixer = SHA256.Create();
+    // ChaCha20-DRBG seeded from the OS RNG at startup, reseeded every 1 MB or on fork.
+    // The OS entropy source is still the root of trust (BCryptGenRandom on Windows,
+    // getrandom on Linux); this layer just rate-limits the syscalls and lets us add fast
+    // key erasure on top — closer to BoringSSL's RAND_bytes / Linux's get_random_bytes.
+    private static readonly ChaCha20Drbg _primaryRng = new();
 
     // RFC 8937 failure detection state
     private static byte[]? _lastOutput;
@@ -47,8 +50,7 @@ public static class RandomnessWrapper
             CheckAndReseedIfNeeded();
 
             // Generate primary entropy
-            byte[] primary = new byte[count];
-            _primaryRng.GetBytes(primary);
+            byte[] primary = _primaryRng.GetBytes(count);
 
             // Generate additional entropy sources and mix (RFC 8937 §3.2)
             byte[] enhanced = EnhanceWithAdditionalEntropy(primary);
@@ -74,7 +76,6 @@ public static class RandomnessWrapper
         byte[] baseRandom = GetBytes(count);
 
         // Additional mixing for handshake-critical randomness (RFC 8937 §4.1)
-        using var mixer = SHA384.Create();
         var mixData = new List<byte[]>
         {
             baseRandom,
@@ -84,7 +85,7 @@ public static class RandomnessWrapper
         };
 
         byte[] combined = CombineByteArrays(mixData);
-        byte[] hash = mixer.ComputeHash(combined);
+        byte[] hash = Sha2Managed.Sha384(combined);
         return hash[..count];
     }
 
@@ -99,7 +100,6 @@ public static class RandomnessWrapper
         byte[] baseRandom = GetBytes(count);
 
         // Maximum entropy mixing for key material (RFC 8937 §4.2)
-        using var hasher = SHA384.Create();
         var keyData = new List<byte[]>
         {
             baseRandom,
@@ -109,7 +109,7 @@ public static class RandomnessWrapper
         };
 
         byte[] combined = CombineByteArrays(keyData);
-        byte[] hash = hasher.ComputeHash(combined);
+        byte[] hash = Sha2Managed.Sha384(combined);
 
         // For larger outputs, use iterative hashing
         if (count <= hash.Length)
@@ -140,9 +140,11 @@ public static class RandomnessWrapper
 
     private static void PerformInitialSeeding()
     {
-        // Gather entropy from multiple sources (RFC 8937 §3.2.1)
-        byte[] systemRng = new byte[64];
-        _primaryRng.GetBytes(systemRng);
+        // Gather entropy from multiple sources (RFC 8937 §3.2.1). The primary RNG itself
+        // performs an OS-RNG reseed if its budget is exhausted; calling ForceReseed here
+        // also draws fresh entropy from the OS into its state.
+        _primaryRng.ForceReseed();
+        byte[] systemRng = _primaryRng.GetBytes(64);
 
         var entropyPool = new List<byte[]>
         {
@@ -166,8 +168,7 @@ public static class RandomnessWrapper
 
         // Mix all entropy sources using SHA-384
         byte[] combined = CombineByteArrays(entropyPool);
-        using var hasher = SHA384.Create();
-        byte[] mixedEntropy = hasher.ComputeHash(combined);
+        byte[] mixedEntropy = Sha2Managed.Sha384(combined);
 
         // Note: .NET's RandomNumberGenerator.Create() cannot be externally seeded,
         // but this process ensures our additional entropy sources are available
@@ -193,8 +194,7 @@ public static class RandomnessWrapper
             mixData.Add(_lastOutput);
 
         byte[] combined = CombineByteArrays(mixData);
-        using var mixer = SHA256.Create();
-        byte[] hash = mixer.ComputeHash(combined);
+        byte[] hash = Sha2Managed.Sha256(combined);
 
         // For outputs larger than hash size, use iterative hashing
         if (primary.Length <= hash.Length)
@@ -297,13 +297,12 @@ public static class RandomnessWrapper
     /// <summary>Helper method for iterative hashing to generate larger outputs.</summary>
     private static byte[] IterativeHash(byte[] seed, int outputLength)
     {
-        using var hasher = SHA256.Create();
         var result = new List<byte>();
         byte[] current = seed;
 
         while (result.Count < outputLength)
         {
-            current = hasher.ComputeHash(current);
+            current = Sha2Managed.Sha256(current);
             result.AddRange(current);
 
             // Mix in the counter to ensure different outputs

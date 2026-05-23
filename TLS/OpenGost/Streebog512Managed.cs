@@ -1,14 +1,72 @@
+using System.Security.Cryptography;
+using System.Numerics;
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace OpenGost.Security.Cryptography;
 
 /// <summary>
-/// Computes the <see cref="Streebog512"/> hash for the input data using the managed implementation.
+/// Computes the Streebog-512 (GOST R 34.11-2012) hash. Standalone class — no longer inherits
+/// from System.Security.Cryptography.HashAlgorithm so the BCL hash registry (and its BCrypt
+/// imports) doesn't get linked into the assembly. Expose the same Initialize / BlockUpdate /
+/// DoFinal surface that consumers (GostKdf, GostCrypto.Streebog) need, plus a static one-shot.
 /// </summary>
 [ComVisible(true)]
-public class Streebog512Managed : Streebog512
+public class Streebog512Managed : IDisposable
 {
+    public const int HashSize = 64;
+    public byte[]? HashValue { get; private set; }
+    private bool _disposed;
+
+    /// <summary>One-shot: hash <paramref name="data"/> with default IV.</summary>
+    public static byte[] Hash(byte[] data)
+    {
+        var h = new Streebog512Managed();
+        h.BlockUpdate(data, 0, data.Length);
+        var result = new byte[HashSize];
+        h.DoFinal(result, 0);
+        return result;
+    }
+
+    /// <summary>Append data to the running digest.</summary>
+    public void BlockUpdate(byte[] data, int offset, int count) => HashCore(data, offset, count);
+
+    /// <summary>Finalise the digest into <paramref name="output"/> starting at <paramref name="offset"/>.</summary>
+    public int DoFinal(byte[] output, int offset)
+    {
+        var hash = HashFinal();
+        Buffer.BlockCopy(hash, 0, output, offset, HashSize);
+        return HashSize;
+    }
+
+    // Compatibility shims for callers that used the old HashAlgorithm-style names.
+    public byte[] TransformFinalBlock(byte[] inputBuffer, int inputOffset, int inputCount)
+    {
+        if (inputCount > 0) HashCore(inputBuffer, inputOffset, inputCount);
+        HashValue = HashFinal();
+        // BCL returned the input slice; mirror that for any caller relying on it.
+        var copy = new byte[inputCount];
+        if (inputCount > 0) Buffer.BlockCopy(inputBuffer, inputOffset, copy, 0, inputCount);
+        return copy;
+    }
+
+    public void TransformBlock(byte[] inputBuffer, int inputOffset, int inputCount, byte[]? outputBuffer, int outputOffset)
+    {
+        if (inputCount > 0) HashCore(inputBuffer, inputOffset, inputCount);
+        if (outputBuffer != null && inputCount > 0)
+            Buffer.BlockCopy(inputBuffer, inputOffset, outputBuffer, outputOffset, inputCount);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (HashValue != null) Array.Clear(HashValue, 0, HashValue.Length);
+        if (_state != null) Array.Clear(_state, 0, _state.Length);
+        if (_sigma != null) Array.Clear(_sigma, 0, _sigma.Length);
+        if (_buffer != null) Array.Clear(_buffer, 0, _buffer.Length);
+    }
+
     private static readonly byte[] _keyExpansionTable =
     [
         0x07, 0x45, 0xa6, 0xf2, 0x59, 0x65, 0x80, 0xdd, 0x23, 0x4d, 0x74, 0xcc, 0x36, 0x74, 0x76, 0x05,
@@ -105,7 +163,7 @@ public class Streebog512Managed : Streebog512
     /// <summary>
     /// Initializes an instance of <see cref="Streebog512Managed"/>.
     /// </summary>
-    public override void Initialize()
+    public void Initialize()
     {
         _count = 0L;
         _n = 0uL;
@@ -127,7 +185,7 @@ public class Streebog512Managed : Streebog512
     /// <param name="cbSize">
     /// The number of bytes in the array to use as data.
     /// </param>
-    protected override void HashCore(byte[] array, int ibStart, int cbSize)
+    private void HashCore(byte[] array, int ibStart, int cbSize)
     {
         // Compute length of buffer
         var bufferLen = (int)(_count & 0x3f);
@@ -164,7 +222,7 @@ public class Streebog512Managed : Streebog512
     /// <returns>
     /// The computed hash code.
     /// </returns>
-    protected override byte[] HashFinal()
+    private byte[] HashFinal()
     {
         // Compute length of buffer
         var bufferLen = (int)(_count & 0x3f);
@@ -178,7 +236,7 @@ public class Streebog512Managed : Streebog512
         DoFinalTransform(_n, _sigma);
 
         HashValue = (byte[])_state.Clone();
-        return HashValue;
+        return HashValue!;
     }
 
     private void DoTransform(byte[] block, uint blockSize)

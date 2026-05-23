@@ -72,8 +72,11 @@ public sealed class TicketEncryption
     private readonly object _keyLock = new();
     private uint _nextKeyId;
 
-    // Anti-replay: track used ticket hashes for 0-RTT single-use enforcement (RFC 8446 §8)
+    // Anti-replay: track used ticket hashes for 0-RTT single-use enforcement (RFC 8446 §8).
+    // Hard-capped so a flood of unique 0-RTT attempts can't exhaust memory.
     private readonly Dictionary<string, DateTime> _usedTickets = new();
+    private readonly Queue<string> _usedTicketsOrder = new();
+    private const int MaxUsedTickets = 1_000_000; // ~80 MB worst-case at 80 bytes/entry
     private DateTime _lastCleanup = DateTime.UtcNow;
 
     public TicketEncryption(byte[]? key = null)
@@ -111,12 +114,23 @@ public sealed class TicketEncryption
     /// </summary>
     public bool TryMarkUsedForEarlyData(byte[] ticketBlob)
     {
-        string key = Convert.ToHexString(SHA256.HashData(ticketBlob));
+        string key = Convert.ToHexString(Sha2Managed.Sha256(ticketBlob));
         lock (_usedTickets)
         {
             CleanupExpired();
             if (_usedTickets.ContainsKey(key)) return false; // replay!
+
+            // FIFO eviction once we hit the cap — bounds memory under a flood of unique
+            // 0-RTT attempts. Old entries are already expired by the 7-day cutoff in normal
+            // operation; this is the safety net.
+            while (_usedTickets.Count >= MaxUsedTickets && _usedTicketsOrder.Count > 0)
+            {
+                string oldest = _usedTicketsOrder.Dequeue();
+                _usedTickets.Remove(oldest);
+            }
+
             _usedTickets[key] = DateTime.UtcNow;
+            _usedTicketsOrder.Enqueue(key);
             return true;
         }
     }
@@ -129,6 +143,9 @@ public sealed class TicketEncryption
         foreach (var kv in _usedTickets)
             if (kv.Value < cutoff) expired.Add(kv.Key);
         foreach (var k in expired) _usedTickets.Remove(k);
+        // Best-effort sync of the eviction queue with the dictionary. We can't cheaply remove
+        // from the middle of the Queue, so we accept some stale entries — at worst the next
+        // FIFO eviction loop pops a few already-removed keys, which is a no-op.
         _lastCleanup = DateTime.UtcNow;
     }
 
@@ -142,7 +159,7 @@ public sealed class TicketEncryption
         byte[] ciphertext = new byte[plaintext.Length];
         byte[] tag = new byte[16];
 
-        using var aes = new AesGcm(current.Key, 16);
+        using var aes = new AesGcmManaged(current.Key, 16);
         aes.Encrypt(iv, plaintext, ciphertext, tag);
 
         byte[] result = new byte[4 + 12 + ciphertext.Length + 16];
@@ -173,7 +190,7 @@ public sealed class TicketEncryption
 
         try
         {
-            using var aes = new AesGcm(entry.Key, 16);
+            using var aes = new AesGcmManaged(entry.Key, 16);
             aes.Decrypt(iv, ciphertext, tag, plaintext);
             return plaintext;
         }

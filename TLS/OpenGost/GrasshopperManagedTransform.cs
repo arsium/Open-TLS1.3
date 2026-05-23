@@ -1,9 +1,18 @@
+using System.Security.Cryptography;
+using System.Numerics;
 ﻿using System.Runtime.CompilerServices;
 
 namespace OpenGost.Security.Cryptography;
 
-internal sealed class GrasshopperManagedTransform : SymmetricTransform
+/// <summary>
+/// Grasshopper / Kuznyechik (GOST R 34.12-2015, 128-bit block, 256-bit key) ECB block cipher.
+/// Standalone — no inheritance from SymmetricAlgorithm / SymmetricTransform / ICryptoTransform.
+/// </summary>
+public sealed class GrasshopperManagedTransform
 {
+    public const int BlockSizeBytes = 16;
+    public const int KeySizeBytes = 32;
+
     #region Constants
 
     private static readonly byte[]
@@ -58,17 +67,14 @@ internal sealed class GrasshopperManagedTransform : SymmetricTransform
 
     private byte[]? _key;
 
-    internal GrasshopperManagedTransform(
-        byte[] rgbKey,
-        byte[]? rgbIV,
-        int blockSize,
-        CipherMode cipherMode,
-        PaddingMode paddingMode,
-        bool encrypting)
-        : base(rgbKey, rgbIV, blockSize, cipherMode, paddingMode, encrypting)
-    { }
+    public GrasshopperManagedTransform(byte[] rgbKey)
+    {
+        if (rgbKey == null) throw new ArgumentNullException(nameof(rgbKey));
+        if (rgbKey.Length != KeySizeBytes) throw new ArgumentException("Grasshopper key must be 32 bytes", nameof(rgbKey));
+        GenerateKeyExpansion(rgbKey);
+    }
 
-    protected override void GenerateKeyExpansion(byte[] key)
+    private void GenerateKeyExpansion(byte[] key)
     {
         _key = new byte[160];
         Buffer.BlockCopy(key, 0, _key, 0, 32);
@@ -108,14 +114,12 @@ internal sealed class GrasshopperManagedTransform : SymmetricTransform
         }
     }
 
-    protected override void Dispose(bool disposing)
+    public void Dispose()
     {
-        if (disposing)
-            CryptoUtils.EraseData(ref _key);
-        base.Dispose(disposing);
+        CryptoUtils.EraseData(ref _key);
     }
 
-    protected override void EncryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
+    public void EncryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
     {
         unsafe
         {
@@ -124,7 +128,7 @@ internal sealed class GrasshopperManagedTransform : SymmetricTransform
         }
     }
 
-    protected override void DecryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
+    public void DecryptBlock(byte[] inputBuffer, int inputOffset, byte[] outputBuffer, int outputOffset)
     {
         unsafe
         {

@@ -345,7 +345,7 @@ public static class Ed25519
 
     private static byte[] SHA512(byte[] data)
     {
-        return System.Security.Cryptography.SHA512.HashData(data);
+        return Sha2Managed.Sha512(data);
     }
 
     /// <summary>Concatenates a slice of a with a slice of b.</summary>

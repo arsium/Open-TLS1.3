@@ -127,6 +127,8 @@ public sealed class Sm4Aead
 
     private void GHashBlocks(ref ulong yHi, ref ulong yLo, ReadOnlySpan<byte> data)
     {
+        // Hoisted out of the loop to satisfy CA2014. Only the trailing partial block uses tmp.
+        Span<byte> tmp = stackalloc byte[Block];
         for (int off = 0; off < data.Length; off += Block)
         {
             int blk = Math.Min(Block, data.Length - off);
@@ -138,7 +140,6 @@ public sealed class Sm4Aead
             }
             else
             {
-                Span<byte> tmp = stackalloc byte[Block];
                 tmp.Clear();
                 data.Slice(off, blk).CopyTo(tmp);
                 bHi = BinaryPrimitives.ReadUInt64BigEndian(tmp);

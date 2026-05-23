@@ -12,19 +12,16 @@ using OpenGost.Security.Cryptography;
 /// </summary>
 public sealed class Mgm : IDisposable
 {
-    private readonly SymmetricAlgorithm _alg;
-    private readonly ICryptoTransform _enc;
+    private readonly GrasshopperManaged? _kuz;
+    private readonly MagmaManaged? _mag;
     private readonly int _n;        // block size in bytes (16 or 8)
     private readonly int _tagLen;   // tag length in bytes
     private readonly byte _reduce;  // GF reduction low byte
 
     public Mgm(byte[] key, bool kuznyechik, int tagLen)
     {
-        _alg = kuznyechik ? new GrasshopperManaged() : new MagmaManaged();
-        _alg.Mode = CipherMode.ECB;
-        _alg.Padding = PaddingMode.None;
-        _alg.Key = key;
-        _enc = _alg.CreateEncryptor();
+        if (kuznyechik) _kuz = new GrasshopperManaged(key);
+        else            _mag = new MagmaManaged(key);
         _n = kuznyechik ? 16 : 8;
         _reduce = (byte)(kuznyechik ? 0x87 : 0x1B);
         _tagLen = tagLen;
@@ -139,7 +136,11 @@ public sealed class Mgm : IDisposable
         return tag;
     }
 
-    private void E(byte[] inBlock, byte[] outBlock) => _enc.TransformBlock(inBlock, 0, _n, outBlock, 0);
+    private void E(byte[] inBlock, byte[] outBlock)
+    {
+        if (_kuz != null) _kuz.EncryptBlock(inBlock, 0, outBlock, 0);
+        else              _mag!.EncryptBlock(inBlock, 0, outBlock, 0);
+    }
 
     // incr_r: increment the right (lower) n/2 bytes as a big-endian integer.
     private void IncrR(byte[] a)
@@ -214,7 +215,7 @@ public sealed class Mgm : IDisposable
 
     public void Dispose()
     {
-        _enc.Dispose();
-        _alg.Dispose();
+        _kuz?.Dispose();
+        _mag?.Dispose();
     }
 }
