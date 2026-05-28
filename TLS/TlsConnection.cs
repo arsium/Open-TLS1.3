@@ -1,5 +1,6 @@
 namespace TLS;
 
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 
@@ -13,6 +14,19 @@ using System.Security.Cryptography;
 /// PSK/session resumption, 0-RTT early data, post-handshake client auth,
 /// exporter interface, SSLKEYLOGFILE, and proper close_notify / alert handling.
 /// </summary>
+/// <summary>
+/// Diagnostic phase hook fired at well-known points during the handshake. Set <see cref="Hook"/>
+/// to a non-null delegate to capture phase markers (e.g. for allocation profiling).
+/// Cost when null: a single null-check + indirect invoke skip; safe to leave wired in release.
+/// Cost when non-null: one delegate invocation per mark. Both client and server fire to the same
+/// hook — they may interleave when the handshake runs in-process.
+/// </summary>
+public static class HandshakePhaseHook
+{
+    public static Action<string>? Hook;
+    internal static void Mark(string phase) => Hook?.Invoke(phase);
+}
+
 public sealed class TlsConnection : IDisposable
 {
     private readonly RecordLayer _record;
@@ -508,19 +522,78 @@ public sealed class TlsConnection : IDisposable
 
     public void HandshakeAsClient(string? serverName = null)
     {
-        // 1. Generate ephemeral key pairs for all supported groups
-        byte[] x25519Priv = X25519.GeneratePrivateKey();
-        byte[] x25519Pub = X25519.PublicFromPrivate(x25519Priv);
-        var (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
-        var (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
-        byte[] x448Priv = X448.GeneratePrivateKey();
-        byte[] x448Pub = X448.PublicFromPrivate(x448Priv);
+        HandshakePhaseHook.Mark("client/start");
 
-        // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
-        var (mlkemEk, mlkemDk) = MlKem768.KeyGen();
-        byte[] hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
-        Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
-        Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        // 1. Lazy ephemeral key pair generation — only generate for groups we'll actually
+        // offer in the ClientHello key_share extension. Previously we generated all five
+        // (X25519 + P-256 + P-384 + X448 + ML-KEM-768) unconditionally; profiling showed
+        // X25519=656 KB, X448=1687 KB, P-384=292 KB, P-256=63 KB, ML-KEM=60 KB per call
+        // (~2.7 MB combined) — pure waste when the caller restricted the offered set.
+        //
+        // For each unoffered group the key fields stay Array.Empty<byte>(); they're never
+        // read downstream because ComputeClientSharedSecret only dispatches based on the
+        // group the server chose (which must be one we offered). HRR fallback (below)
+        // does its own keygen for the requested group, so that path is unaffected.
+        var offered = _offeredGroups ?? new[]
+        {
+            NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
+            NamedGroup.Secp256r1, NamedGroup.Secp384r1
+        };
+
+        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false;
+        foreach (var g in offered)
+        {
+            switch (g)
+            {
+                case NamedGroup.X25519: wantX25519 = true; break;
+                case NamedGroup.Secp256r1: wantP256 = true; break;
+                case NamedGroup.Secp384r1: wantP384 = true; break;
+                case NamedGroup.X448: wantX448 = true; break;
+                case NamedGroup.X25519MLKEM768: wantHybrid = true; break;
+                // GOST + SM2 groups are handled inside BuildClientKeyShares (their key
+                // generators live there and stash the private into _gostKexPriv / _sm2KexPriv).
+            }
+        }
+        // The hybrid group reuses the X25519 keypair as its ECDH component, so generating
+        // it implies an X25519 keygen even if X25519 alone wasn't offered.
+        if (wantHybrid) wantX25519 = true;
+
+        byte[] x25519Priv = Array.Empty<byte>(), x25519Pub = Array.Empty<byte>();
+        byte[] p256Priv = Array.Empty<byte>(), p256Pub = Array.Empty<byte>();
+        byte[] p384Priv = Array.Empty<byte>(), p384Pub = Array.Empty<byte>();
+        byte[] x448Priv = Array.Empty<byte>(), x448Pub = Array.Empty<byte>();
+        byte[] mlkemDk = Array.Empty<byte>();
+        byte[] hybridPub = Array.Empty<byte>();
+
+        if (wantX25519)
+        {
+            x25519Priv = X25519.GeneratePrivateKey();
+            x25519Pub = X25519.PublicFromPrivate(x25519Priv);
+        }
+        HandshakePhaseHook.Mark("client/after-X25519-keygen");
+        if (wantP256)
+            (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
+        HandshakePhaseHook.Mark("client/after-P256-keygen");
+        if (wantP384)
+            (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
+        HandshakePhaseHook.Mark("client/after-P384-keygen");
+        if (wantX448)
+        {
+            x448Priv = X448.GeneratePrivateKey();
+            x448Pub = X448.PublicFromPrivate(x448Priv);
+        }
+        HandshakePhaseHook.Mark("client/after-X448-keygen");
+
+        if (wantHybrid)
+        {
+            // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
+            var (mlkemEk, dk) = MlKem768.KeyGen();
+            mlkemDk = dk;
+            hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
+            Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
+            Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        }
+        HandshakePhaseHook.Mark("client/after-MLKEM-keygen");
 
         byte[] clientRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = clientRandom;
@@ -639,6 +712,7 @@ public sealed class TlsConnection : IDisposable
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
         _transcript.Update(chMsg);
+        HandshakePhaseHook.Mark("client/after-CH-sent");
 
         // 2b. Send 0-RTT early data if applicable
         if (offer0Rtt && _keySchedule != null)
@@ -658,7 +732,10 @@ public sealed class TlsConnection : IDisposable
                 while (pos < toSend)
                 {
                     int chunk = Math.Min(toSend - pos, TlsConst.MaxPlaintextLength);
-                    _record.WriteRecord(ContentType.ApplicationData, _earlyData[pos..(pos + chunk)]);
+                    // AsSpan instead of Range slice — RecordLayer.WriteRecord now takes
+                    // ReadOnlySpan<byte>, so this passes a zero-copy view instead of
+                    // allocating a fresh byte[chunk] per record.
+                    _record.WriteRecord(ContentType.ApplicationData, _earlyData.AsSpan(pos, chunk));
                     pos += chunk;
                 }
             }
@@ -670,6 +747,7 @@ public sealed class TlsConnection : IDisposable
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
+        HandshakePhaseHook.Mark("client/after-SH-received");
 
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
@@ -709,7 +787,10 @@ public sealed class TlsConnection : IDisposable
             {
                 x25519Priv = X25519.GeneratePrivateKey();
                 x25519Pub = X25519.PublicFromPrivate(x25519Priv);
-                (mlkemEk, mlkemDk) = MlKem768.KeyGen();
+                // mlkemEk is local to the HRR branch — only used here to build hybridPub.
+                // mlkemDk is the outer-scope variable since ComputeClientSharedSecret needs it.
+                var (mlkemEk, dk) = MlKem768.KeyGen();
+                mlkemDk = dk;
                 hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
                 Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
                 Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
@@ -792,7 +873,9 @@ public sealed class TlsConnection : IDisposable
         byte[] shared = ComputeClientSharedSecret(
             sh.KeyShareGroup, sh.KeyShare, x25519Priv, x25519Pub,
             p256Priv, p256Pub, p384Priv, p384Pub, x448Priv, mlkemDk);
+        HandshakePhaseHook.Mark("client/after-ECDH");
         _keySchedule.DeriveHandshakeSecrets(shared, _transcript.GetHash());
+        HandshakePhaseHook.Mark("client/after-DeriveHandshakeSecrets");
 
         // Key logging
         if (KeyLogger.IsEnabled)
@@ -808,6 +891,7 @@ public sealed class TlsConnection : IDisposable
         _transcript.Update(eeMsg);
         var (_, eeBody) = HandshakeMessages.Unframe(eeMsg);
         var ee = HandshakeMessages.ParseEncryptedExtensionsEx(eeBody);
+        HandshakePhaseHook.Mark("client/after-EE");
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
@@ -906,21 +990,27 @@ public sealed class TlsConnection : IDisposable
         if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
             PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
+        HandshakePhaseHook.Mark("client/after-Certificate-parsed");
 
         // 12. CertificateVerify
         byte[] preCvHash = _transcript.GetHash();
         byte[] cvMsg = NextHandshake(HandshakeType.CertificateVerify);
+        HandshakePhaseHook.Mark("client/CV/after-read");
         var (_, cvBody) = HandshakeMessages.Unframe(cvMsg);
         var (sigScheme, sig) = HandshakeMessages.ParseCertificateVerify(cvBody);
         ValidateSignatureScheme(sigScheme);
+        HandshakePhaseHook.Mark("client/CV/after-parse");
 
         var (serverPubKey, _) = CertificateUtils.ParseCertificatePublicKey(serverCertDer);
+        HandshakePhaseHook.Mark("client/CV/after-ParsePubKey");
         byte[] cvContent = HandshakeMessages.BuildCertVerifyContent(
             "TLS 1.3, server CertificateVerify", preCvHash);
         if (!CertificateUtils.Verify(cvContent, sig, serverPubKey, sigScheme))
             AlertAndThrow(AlertDescription.DecryptError, "Server CertificateVerify failed");
+        HandshakePhaseHook.Mark("client/CV/after-Verify");
 
         _transcript.Update(cvMsg);
+        HandshakePhaseHook.Mark("client/after-CertVerify");
 
         // 13. Server Finished
         byte[] preFinHash2 = _transcript.GetHash();
@@ -1543,6 +1633,9 @@ public sealed class TlsConnection : IDisposable
     {
         if (_closed) return 0;
 
+        // Drain any leftover plaintext stashed by a previous Read that returned less
+        // than a full record. _readBuf here is a fresh byte[] holding the *remainder*
+        // (the lease itself was already released when the remainder was copied out).
         if (_readOff < _readBuf.Length)
         {
             int avail = _readBuf.Length - _readOff;
@@ -1553,12 +1646,76 @@ public sealed class TlsConnection : IDisposable
             return n;
         }
 
-        byte[] data = ReadAppData();
-        if (data.Length == 0) return 0;
-        int copy = Math.Min(data.Length, count);
-        Buffer.BlockCopy(data, 0, buffer, offset, copy);
-        if (copy < data.Length) { _readBuf = data; _readOff = copy; }
-        return copy;
+        // Loop until we get an ApplicationData record (Alert/CCS/post-handshake messages
+        // are processed inline and we keep reading). The new ReadRecordInto path decrypts
+        // straight into the caller's buffer when the record fits — that's the bulk-path
+        // win that drops per-record allocations to near zero.
+        while (true)
+        {
+            if (_closed) return 0;
+
+            var result = _record.ReadRecordInto(buffer.AsSpan(offset, count));
+            try
+            {
+                if (result.Type == ContentType.ApplicationData)
+                {
+                    if (result.LeasedBuffer == null)
+                    {
+                        // Direct path: data is already in the caller's buffer.
+                        return result.Length;
+                    }
+                    // Overflow path: caller's buffer was smaller than the record.
+                    // Copy what fits, stash the remainder in _readBuf as a fresh byte[]
+                    // (the lease itself goes back to the pool in finally below).
+                    int copy = Math.Min(result.Length, count);
+                    Buffer.BlockCopy(result.LeasedBuffer, 0, buffer, offset, copy);
+                    if (copy < result.Length)
+                    {
+                        int rem = result.Length - copy;
+                        var stash = new byte[rem];
+                        Buffer.BlockCopy(result.LeasedBuffer, copy, stash, 0, rem);
+                        _readBuf = stash;
+                        _readOff = 0;
+                    }
+                    return copy;
+                }
+
+                // Non-ApplicationData (rare): payload is in destination if LeasedBuffer
+                // is null, otherwise in the lease. View as a span either way.
+                ReadOnlySpan<byte> payload = result.LeasedBuffer == null
+                    ? buffer.AsSpan(offset, result.Length)
+                    : new ReadOnlySpan<byte>(result.LeasedBuffer, 0, result.Length);
+
+                if (result.Type == ContentType.Alert)
+                {
+                    HandleAlert(payload);
+                    if (_closed) return 0;
+                    continue;
+                }
+                if (result.Type == ContentType.Handshake)
+                {
+                    // Post-handshake message handlers (KeyUpdate / NewSessionTicket / etc.)
+                    // still expect byte[] because SplitMessages returns List<byte[]>.
+                    // Materialise — this path is rare and the cost is bounded.
+                    HandlePostHandshakeMessages(payload.ToArray());
+                    continue;
+                }
+                if (result.Type == ContentType.ChangeCipherSpec)
+                {
+                    // Middlebox-compat record; ignore and loop.
+                    continue;
+                }
+                // Unknown type — keep behaviour of legacy ReadAppData (silently loops).
+            }
+            finally
+            {
+                if (result.LeasedBuffer != null)
+                {
+                    Array.Clear(result.LeasedBuffer, 0, result.Length);
+                    ArrayPool<byte>.Shared.Return(result.LeasedBuffer);
+                }
+            }
+        }
     }
 
     /// <summary>Read a complete application-data record.</summary>
@@ -1587,7 +1744,9 @@ public sealed class TlsConnection : IDisposable
             while (pos < end)
             {
                 int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
-                _record.WriteRecord(ContentType.ApplicationData, data[pos..(pos + chunk)]);
+                // AsSpan instead of Range slice — saves ~chunk bytes/record on the bulk
+                // path (was the biggest unfixed allocation in TlsConnection.Write).
+                _record.WriteRecord(ContentType.ApplicationData, data.AsSpan(pos, chunk));
                 pos += chunk;
 
                 // RFC 8446 §5.5: automatically initiate KeyUpdate as we approach the
@@ -2223,7 +2382,10 @@ public sealed class TlsConnection : IDisposable
         return hostname == pattern;
     }
 
-    private void HandleAlert(byte[] data)
+    // Span input so callers from the new direct-decrypt path don't need to materialise
+    // a byte[]. Existing byte[] callers (ReadAppData / ReadAppDataAsync) keep working
+    // because byte[] implicitly converts to ReadOnlySpan<byte>.
+    private void HandleAlert(ReadOnlySpan<byte> data)
     {
         if (data.Length < 2)
             throw new TlsException(AlertDescription.DecodeError, "Malformed alert record (too short)");
@@ -2385,6 +2547,8 @@ public sealed class TlsConnection : IDisposable
     {
         if (_closed) return 0;
 
+        // Drain any leftover plaintext stashed by a previous Read (same _readBuf
+        // semantics as the sync path — a fresh byte[] holding only the remainder).
         if (_readOff < _readBuf.Length)
         {
             int avail = _readBuf.Length - _readOff;
@@ -2395,12 +2559,63 @@ public sealed class TlsConnection : IDisposable
             return n;
         }
 
-        byte[] data = await ReadAppDataAsync(ct).ConfigureAwait(false);
-        if (data.Length == 0) return 0;
-        int copy = Math.Min(data.Length, count);
-        Buffer.BlockCopy(data, 0, buffer, offset, copy);
-        if (copy < data.Length) { _readBuf = data; _readOff = copy; }
-        return copy;
+        // Loop until we get an ApplicationData record. The new ReadRecordIntoAsync path
+        // decrypts straight into the caller's buffer when the record fits.
+        while (true)
+        {
+            if (_closed) return 0;
+
+            var result = await _record.ReadRecordIntoAsync(buffer.AsMemory(offset, count), ct).ConfigureAwait(false);
+            try
+            {
+                if (result.Type == ContentType.ApplicationData)
+                {
+                    if (result.LeasedBuffer == null)
+                    {
+                        return result.Length;
+                    }
+                    int copy = Math.Min(result.Length, count);
+                    Buffer.BlockCopy(result.LeasedBuffer, 0, buffer, offset, copy);
+                    if (copy < result.Length)
+                    {
+                        int rem = result.Length - copy;
+                        var stash = new byte[rem];
+                        Buffer.BlockCopy(result.LeasedBuffer, copy, stash, 0, rem);
+                        _readBuf = stash;
+                        _readOff = 0;
+                    }
+                    return copy;
+                }
+
+                ReadOnlySpan<byte> payload = result.LeasedBuffer == null
+                    ? buffer.AsSpan(offset, result.Length)
+                    : new ReadOnlySpan<byte>(result.LeasedBuffer, 0, result.Length);
+
+                if (result.Type == ContentType.Alert)
+                {
+                    HandleAlert(payload);
+                    if (_closed) return 0;
+                    continue;
+                }
+                if (result.Type == ContentType.Handshake)
+                {
+                    HandlePostHandshakeMessages(payload.ToArray());
+                    continue;
+                }
+                if (result.Type == ContentType.ChangeCipherSpec)
+                {
+                    continue;
+                }
+            }
+            finally
+            {
+                if (result.LeasedBuffer != null)
+                {
+                    Array.Clear(result.LeasedBuffer, 0, result.Length);
+                    ArrayPool<byte>.Shared.Return(result.LeasedBuffer);
+                }
+            }
+        }
     }
 
     /// <summary>Read a complete application-data record asynchronously.</summary>
@@ -2429,7 +2644,9 @@ public sealed class TlsConnection : IDisposable
             while (pos < end)
             {
                 int chunk = Math.Min(end - pos, TlsConst.MaxPlaintextLength);
-                await _record.WriteRecordAsync(ContentType.ApplicationData, data[pos..(pos + chunk)], ct).ConfigureAwait(false);
+                // AsMemory instead of Range slice — same fix as the sync path. ReadOnlyMemory
+                // because the slice must cross await boundaries (Span can't).
+                await _record.WriteRecordAsync(ContentType.ApplicationData, data.AsMemory(pos, chunk), ct).ConfigureAwait(false);
                 pos += chunk;
             }
         }
@@ -2487,19 +2704,56 @@ public sealed class TlsConnection : IDisposable
 
     public async Task HandshakeAsClientAsync(string? serverName = null, CancellationToken ct = default)
     {
-        // 1. Generate ephemeral key pairs for all supported groups
-        byte[] x25519Priv = X25519.GeneratePrivateKey();
-        byte[] x25519Pub = X25519.PublicFromPrivate(x25519Priv);
-        var (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
-        var (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
-        byte[] x448Priv = X448.GeneratePrivateKey();
-        byte[] x448Pub = X448.PublicFromPrivate(x448Priv);
+        // 1. Lazy ephemeral key pair generation — same rationale as the sync HandshakeAsClient:
+        // only generate for groups in _offeredGroups, saves ~2.7 MB/handshake when constrained.
+        var offered = _offeredGroups ?? new[]
+        {
+            NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
+            NamedGroup.Secp256r1, NamedGroup.Secp384r1
+        };
 
-        // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
-        var (mlkemEk, mlkemDk) = MlKem768.KeyGen();
-        byte[] hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
-        Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
-        Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false;
+        foreach (var g in offered)
+        {
+            switch (g)
+            {
+                case NamedGroup.X25519: wantX25519 = true; break;
+                case NamedGroup.Secp256r1: wantP256 = true; break;
+                case NamedGroup.Secp384r1: wantP384 = true; break;
+                case NamedGroup.X448: wantX448 = true; break;
+                case NamedGroup.X25519MLKEM768: wantHybrid = true; break;
+            }
+        }
+        if (wantHybrid) wantX25519 = true; // hybrid reuses the X25519 keypair
+
+        byte[] x25519Priv = Array.Empty<byte>(), x25519Pub = Array.Empty<byte>();
+        byte[] p256Priv = Array.Empty<byte>(), p256Pub = Array.Empty<byte>();
+        byte[] p384Priv = Array.Empty<byte>(), p384Pub = Array.Empty<byte>();
+        byte[] x448Priv = Array.Empty<byte>(), x448Pub = Array.Empty<byte>();
+        byte[] mlkemDk = Array.Empty<byte>();
+        byte[] hybridPub = Array.Empty<byte>();
+
+        if (wantX25519)
+        {
+            x25519Priv = X25519.GeneratePrivateKey();
+            x25519Pub = X25519.PublicFromPrivate(x25519Priv);
+        }
+        if (wantP256) (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
+        if (wantP384) (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
+        if (wantX448)
+        {
+            x448Priv = X448.GeneratePrivateKey();
+            x448Pub = X448.PublicFromPrivate(x448Priv);
+        }
+        if (wantHybrid)
+        {
+            // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
+            var (mlkemEk, dk) = MlKem768.KeyGen();
+            mlkemDk = dk;
+            hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
+            Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
+            Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        }
 
         byte[] clientRandom = RandomnessWrapper.GetHandshakeBytes(32);
         _clientRandom = clientRandom;
@@ -2577,7 +2831,9 @@ public sealed class TlsConnection : IDisposable
                 while (pos < toSend)
                 {
                     int chunk = Math.Min(toSend - pos, TlsConst.MaxPlaintextLength);
-                    await _record.WriteRecordAsync(ContentType.ApplicationData, _earlyData[pos..(pos + chunk)], ct).ConfigureAwait(false);
+                    // AsMemory instead of Range slice — eliminates the per-record
+                    // _earlyData fragmentation allocation on the 0-RTT path.
+                    await _record.WriteRecordAsync(ContentType.ApplicationData, _earlyData.AsMemory(pos, chunk), ct).ConfigureAwait(false);
                     pos += chunk;
                 }
             }
@@ -2627,7 +2883,10 @@ public sealed class TlsConnection : IDisposable
             {
                 x25519Priv = X25519.GeneratePrivateKey();
                 x25519Pub = X25519.PublicFromPrivate(x25519Priv);
-                (mlkemEk, mlkemDk) = MlKem768.KeyGen();
+                // mlkemEk is local to the HRR branch — only used here to build hybridPub.
+                // mlkemDk is the outer-scope variable since ComputeClientSharedSecret needs it.
+                var (mlkemEk, dk) = MlKem768.KeyGen();
+                mlkemDk = dk;
                 hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
                 Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
                 Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);

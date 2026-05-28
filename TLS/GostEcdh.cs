@@ -17,6 +17,12 @@ internal static class GostEcdh
 
     public static (byte[] priv, byte[] pub) GenerateKeyPair(string curveOid)
     {
+        // NB: an experimental BC `ECGost3410NamedCurves`-backed fast path was tried here
+        // (see git history) — it made GOST handshakes *worse* (6.4 MB → 21.8 MB per
+        // handshake). Root cause: BC only provides optimized Custom*Curve impls for
+        // a few NIST curves; the GOST curves fall back to generic `FpCurve` which uses
+        // BC's BigInteger — same allocation profile as our OpenGost BigIntegerPoint plus
+        // overhead from BC's W-NAF table precomputation per-call on the random peer point.
         var c = ECCurveOidMap.GetExplicitCurveByOid(curveOid);
         int size = c.Prime!.Length;
         var prime = CryptoUtils.UnsignedBigIntegerFromLittleEndian(c.Prime);

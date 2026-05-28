@@ -7,6 +7,11 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Server + concurrent (background) GC: parallel ephemeral collections across cores,
+         concurrent Gen2 marking. Default is Workstation GC which serialises GC on a
+         single thread — wrong fit for a server-shaped workload (or its benchmark). -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <Import Project="..\TLS\TLS.projitems" Label="Shared" />

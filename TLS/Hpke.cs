@@ -45,16 +45,11 @@ public static class Hpke
             {
                 byte[] nonce = ComputeNonce(_sequenceNumber++);
 
-                byte[] ciphertext = new byte[plaintext.Length];
-                byte[] tag = new byte[16];
-
+                // AesGcmManaged.Encrypt now writes ciphertext||tag straight into a single
+                // output span — no separate scratch buffers and no concatenation copy.
+                byte[] result = new byte[plaintext.Length + 16];
                 using var aes = new AesGcmManaged(_key, 16);
-                aes.Encrypt(nonce, plaintext, ciphertext, tag, aad);
-
-                // Return ciphertext || tag
-                byte[] result = new byte[ciphertext.Length + tag.Length];
-                Buffer.BlockCopy(ciphertext, 0, result, 0, ciphertext.Length);
-                Buffer.BlockCopy(tag, 0, result, ciphertext.Length, tag.Length);
+                aes.Encrypt(nonce, plaintext, result, aad);
                 return result;
             }
         }
@@ -68,16 +63,14 @@ public static class Hpke
             {
                 byte[] nonce = ComputeNonce(_sequenceNumber++);
 
-                // Split ciphertext and tag
                 int plaintextLen = ciphertext.Length - 16;
-                byte[] ct = ciphertext[..plaintextLen];
-                byte[] tag = ciphertext[plaintextLen..];
                 byte[] plaintext = new byte[plaintextLen];
 
                 try
                 {
                     using var aes = new AesGcmManaged(_key, 16);
-                    aes.Decrypt(nonce, ct, tag, plaintext, aad);
+                    // Pass the full ct||tag span; Decrypt slices internally.
+                    aes.Decrypt(nonce, ciphertext, plaintext, aad);
                     return plaintext;
                 }
                 catch (CryptographicException)

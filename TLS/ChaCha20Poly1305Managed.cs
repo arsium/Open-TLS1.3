@@ -28,13 +28,22 @@ internal sealed class ChaCha20Poly1305Managed : IDisposable
         _key = key.ToArray();
     }
 
+    /// <summary>
+    /// Encrypt <paramref name="plaintext"/> into <paramref name="output"/> as ciphertext||tag
+    /// (matches the layout AesGcmManaged.Encrypt produces, so AeadCipher can dispatch to
+    /// either with one signature). <c>output.Length</c> MUST equal
+    /// <c>plaintext.Length + TagSize</c>.
+    /// </summary>
     public void Encrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> plaintext,
-        Span<byte> ciphertext, Span<byte> tag, ReadOnlySpan<byte> aad)
+        Span<byte> output, ReadOnlySpan<byte> aad)
     {
         EnsureNotDisposed();
         if (nonce.Length != NonceSize) throw new ArgumentException("Nonce must be 12 bytes", nameof(nonce));
-        if (tag.Length != TagSize) throw new ArgumentException("Tag must be 16 bytes", nameof(tag));
-        if (ciphertext.Length != plaintext.Length) throw new ArgumentException("Ciphertext length must equal plaintext length");
+        if (output.Length != plaintext.Length + TagSize)
+            throw new ArgumentException($"output must be plaintext.Length + {TagSize} bytes");
+
+        var ciphertext = output.Slice(0, plaintext.Length);
+        var tag = output.Slice(plaintext.Length, TagSize);
 
         // RFC 8439 §2.6: Poly1305 one-time key = first 32 bytes of ChaCha20 keystream at counter 0.
         Span<byte> polyKey = stackalloc byte[32];
@@ -47,13 +56,20 @@ internal sealed class ChaCha20Poly1305Managed : IDisposable
         CryptographicOperations.ZeroMemory(polyKey);
     }
 
-    public void Decrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> ciphertext,
-        ReadOnlySpan<byte> tag, Span<byte> plaintext, ReadOnlySpan<byte> aad)
+    /// <summary>
+    /// Decrypt <paramref name="ctAndTag"/> (ciphertext||tag concatenated) into
+    /// <paramref name="plaintext"/>. Throws on tag mismatch (matches BCL behaviour).
+    /// </summary>
+    public void Decrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> ctAndTag,
+        Span<byte> plaintext, ReadOnlySpan<byte> aad)
     {
         EnsureNotDisposed();
         if (nonce.Length != NonceSize) throw new ArgumentException("Nonce must be 12 bytes", nameof(nonce));
-        if (tag.Length != TagSize) throw new ArgumentException("Tag must be 16 bytes", nameof(tag));
-        if (plaintext.Length != ciphertext.Length) throw new ArgumentException("Plaintext length must equal ciphertext length");
+        if (ctAndTag.Length < TagSize || plaintext.Length != ctAndTag.Length - TagSize)
+            throw new ArgumentException($"plaintext.Length must equal ctAndTag.Length - {TagSize}");
+
+        var ciphertext = ctAndTag.Slice(0, plaintext.Length);
+        var tag = ctAndTag.Slice(plaintext.Length, TagSize);
 
         // Recompute the expected tag from AAD || ciphertext and verify in constant time.
         Span<byte> polyKey = stackalloc byte[32];

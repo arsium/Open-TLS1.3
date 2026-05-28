@@ -33,11 +33,50 @@ public sealed class Sm4Aead
     public int TagLength => _tagLen;
 
     public byte[] Encrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> aad)
-        => _ccm ? CcmEncrypt(nonce, plaintext, aad) : GcmEncrypt(nonce, plaintext, aad);
+    {
+        byte[] result = new byte[plaintext.Length + _tagLen];
+        EncryptInto(nonce, plaintext, result, aad);
+        return result;
+    }
+
+    /// <summary>
+    /// Encrypt straight into <paramref name="output"/> = ciphertext||tag. <c>output.Length</c>
+    /// MUST equal <c>plaintext.Length + TagLength</c>. Matches AesGcmManaged / ChaCha20Poly1305Managed
+    /// / Mgm for uniform dispatch from AeadCipher.
+    /// </summary>
+    public void EncryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> plaintext,
+        Span<byte> output, ReadOnlySpan<byte> aad)
+    {
+        if (output.Length != plaintext.Length + _tagLen)
+            throw new ArgumentException($"output must be plaintext.Length + {_tagLen} bytes");
+        if (_ccm) CcmEncryptInto(nonce, plaintext, output, aad);
+        else      GcmEncryptInto(nonce, plaintext, output, aad);
+    }
 
     public bool TryDecrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, out byte[]? plaintext)
-        => _ccm ? CcmTryDecrypt(nonce, encrypted, aad, out plaintext)
-                : GcmTryDecrypt(nonce, encrypted, aad, out plaintext);
+    {
+        int ctLen = encrypted.Length - _tagLen;
+        if (ctLen < 0) { plaintext = null; return false; }
+        byte[] pt = new byte[ctLen];
+        if (TryDecryptInto(nonce, encrypted, pt, aad))
+        {
+            plaintext = pt;
+            return true;
+        }
+        plaintext = null;
+        return false;
+    }
+
+    /// <summary>Verify+decrypt <paramref name="ctAndTag"/> directly into <paramref name="plaintext"/>.
+    /// Returns false on tag mismatch.</summary>
+    public bool TryDecryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> ctAndTag,
+        Span<byte> plaintext, ReadOnlySpan<byte> aad)
+    {
+        int ctLen = ctAndTag.Length - _tagLen;
+        if (ctLen < 0 || plaintext.Length != ctLen) return false;
+        return _ccm ? CcmTryDecryptInto(nonce, ctAndTag, plaintext, aad)
+                    : GcmTryDecryptInto(nonce, ctAndTag, plaintext, aad);
+    }
 
     public byte[] Decrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad)
     {
@@ -50,40 +89,42 @@ public sealed class Sm4Aead
 
     // ---------------- GCM ----------------
 
-    private byte[] GcmEncrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt, ReadOnlySpan<byte> aad)
+    private void GcmEncryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt,
+        Span<byte> output, ReadOnlySpan<byte> aad)
     {
+        // output = ct||tag. Write ciphertext directly into the output buffer's first slice;
+        // no intermediate ct allocation. Tag goes in the trailing slice.
+        var ctSpan = output.Slice(0, pt.Length);
+        var tagSpan = output.Slice(pt.Length, _tagLen);
+
         byte[] j0 = GcmJ0(nonce);
-        byte[] ct = new byte[pt.Length];
-        Gctr(j0, increment: true, pt, ct);
+        Gctr(j0, increment: true, pt, ctSpan);
 
-        byte[] s = GHash(aad, ct);
-        byte[] ej0 = new byte[Block];
+        // GHash + E(J0) → tag, all working buffers stackalloc'd.
+        Span<byte> s = stackalloc byte[Block];
+        GHashInto(aad, ctSpan, s);
+        Span<byte> ej0 = stackalloc byte[Block];
         E(j0, ej0);
-        byte[] tag = new byte[_tagLen];
-        for (int i = 0; i < _tagLen; i++) tag[i] = (byte)(s[i] ^ ej0[i]);
-
-        return Concat(ct, tag);
+        for (int i = 0; i < _tagLen; i++) tagSpan[i] = (byte)(s[i] ^ ej0[i]);
     }
 
-    private bool GcmTryDecrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> enc, ReadOnlySpan<byte> aad, out byte[]? plaintext)
+    private bool GcmTryDecryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> enc,
+        Span<byte> plaintext, ReadOnlySpan<byte> aad)
     {
-        plaintext = null;
         int ctLen = enc.Length - _tagLen;
-        if (ctLen < 0) return false;
         var ct = enc[..ctLen];
         var tag = enc[ctLen..];
 
         byte[] j0 = GcmJ0(nonce);
-        byte[] s = GHash(aad, ct);
-        byte[] ej0 = new byte[Block];
+        Span<byte> s = stackalloc byte[Block];
+        GHashInto(aad, ct, s);
+        Span<byte> ej0 = stackalloc byte[Block];
         E(j0, ej0);
-        byte[] expected = new byte[_tagLen];
+        Span<byte> expected = stackalloc byte[_tagLen];
         for (int i = 0; i < _tagLen; i++) expected[i] = (byte)(s[i] ^ ej0[i]);
         if (!CryptographicOperations.FixedTimeEquals(tag, expected)) return false;
 
-        byte[] pt = new byte[ctLen];
-        Gctr(j0, increment: true, ct, pt);
-        plaintext = pt;
+        Gctr(j0, increment: true, ct, plaintext);
         return true;
     }
 
@@ -110,7 +151,9 @@ public sealed class Sm4Aead
         }
     }
 
-    private byte[] GHash(ReadOnlySpan<byte> aad, ReadOnlySpan<byte> ct)
+    // Allocation-free GHash that writes the 16-byte digest into a caller-provided span.
+    // The previous byte[] return was a small but per-record allocation on the GCM hot path.
+    private void GHashInto(ReadOnlySpan<byte> aad, ReadOnlySpan<byte> ct, Span<byte> y)
     {
         ulong yHi = 0, yLo = 0;
         GHashBlocks(ref yHi, ref yLo, aad);
@@ -119,10 +162,8 @@ public sealed class Sm4Aead
         yHi ^= (ulong)aad.Length * 8;
         yLo ^= (ulong)ct.Length * 8;
         GfMul(ref yHi, ref yLo);
-        byte[] y = new byte[Block];
         BinaryPrimitives.WriteUInt64BigEndian(y, yHi);
-        BinaryPrimitives.WriteUInt64BigEndian(y.AsSpan(8), yLo);
-        return y;
+        BinaryPrimitives.WriteUInt64BigEndian(y.Slice(8), yLo);
     }
 
     private void GHashBlocks(ref ulong yHi, ref ulong yLo, ReadOnlySpan<byte> data)
@@ -180,99 +221,139 @@ public sealed class Sm4Aead
 
     // ---------------- CCM ----------------
 
-    private byte[] CcmEncrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt, ReadOnlySpan<byte> aad)
+    private void CcmEncryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt,
+        Span<byte> output, ReadOnlySpan<byte> aad)
     {
-        byte[] tag = CcmMac(nonce, pt, aad);          // T (16) before S0 XOR
-        byte[] s0 = CcmKeystream0(nonce);
-        byte[] u = new byte[_tagLen];
-        for (int i = 0; i < _tagLen; i++) u[i] = (byte)(tag[i] ^ s0[i]);
+        var ctSpan = output.Slice(0, pt.Length);
+        var tagSpan = output.Slice(pt.Length, _tagLen);
 
-        byte[] ct = new byte[pt.Length];
-        CcmCtr(nonce, pt, ct);
-        return Concat(ct, u);
+        Span<byte> tag = stackalloc byte[Block];
+        CcmMacInto(nonce, pt, aad, tag);
+        Span<byte> s0 = stackalloc byte[Block];
+        CcmKeystream0Into(nonce, s0);
+        for (int i = 0; i < _tagLen; i++) tagSpan[i] = (byte)(tag[i] ^ s0[i]);
+
+        CcmCtr(nonce, pt, ctSpan);
     }
 
-    private bool CcmTryDecrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> enc, ReadOnlySpan<byte> aad, out byte[]? plaintext)
+    private bool CcmTryDecryptInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> enc,
+        Span<byte> plaintext, ReadOnlySpan<byte> aad)
     {
-        plaintext = null;
         int ctLen = enc.Length - _tagLen;
-        if (ctLen < 0) return false;
         var ct = enc[..ctLen];
         var tag = enc[ctLen..];
 
-        byte[] pt = new byte[ctLen];
-        CcmCtr(nonce, ct, pt);
+        CcmCtr(nonce, ct, plaintext);
 
-        byte[] t = CcmMac(nonce, pt, aad);
-        byte[] s0 = CcmKeystream0(nonce);
-        byte[] expected = new byte[_tagLen];
+        Span<byte> t = stackalloc byte[Block];
+        CcmMacInto(nonce, plaintext, aad, t);
+        Span<byte> s0 = stackalloc byte[Block];
+        CcmKeystream0Into(nonce, s0);
+        Span<byte> expected = stackalloc byte[_tagLen];
         for (int i = 0; i < _tagLen; i++) expected[i] = (byte)(t[i] ^ s0[i]);
-        if (!CryptographicOperations.FixedTimeEquals(tag, expected)) return false;
-
-        plaintext = pt;
+        if (!CryptographicOperations.FixedTimeEquals(tag, expected))
+        {
+            // Wipe partial plaintext if tag check fails.
+            plaintext.Clear();
+            return false;
+        }
         return true;
     }
 
     private int L => 15 - 12; // nonce is 12 bytes ⇒ L = 3
 
-    private byte[] CcmMac(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt, ReadOnlySpan<byte> aad)
+    // Writes T (the CBC-MAC, before S0 XOR) into the caller's span. All per-call working
+    // buffers are now stackalloc'd or reused across loop iterations — previously each
+    // CCM call did ~1024 per-block byte[Block] allocations in CbcMacBlocks alone.
+    private void CcmMacInto(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> pt,
+        ReadOnlySpan<byte> aad, Span<byte> t)
     {
         // B0 = flags || nonce || Q
-        byte[] b0 = new byte[Block];
+        Span<byte> b0 = stackalloc byte[Block];
         int mPrime = (_tagLen - 2) / 2;
         b0[0] = (byte)((aad.Length > 0 ? 0x40 : 0) | (mPrime << 3) | (L - 1));
-        nonce[..12].CopyTo(b0.AsSpan(1));
-        WriteBE(b0.AsSpan(1 + 12), (uint)pt.Length, L);
+        nonce[..12].CopyTo(b0.Slice(1));
+        WriteBE(b0.Slice(1 + 12), (uint)pt.Length, L);
 
-        byte[] t = new byte[Block];
         E(b0, t); // T = E(B0)
 
         if (aad.Length > 0)
         {
             // associated data: 2-byte BE length prefix (for len < 2^16-2^8), then aad, zero-padded
-            byte[] enc = new byte[2 + aad.Length];
-            BinaryPrimitives.WriteUInt16BigEndian(enc, (ushort)aad.Length);
-            aad.CopyTo(enc.AsSpan(2));
-            CbcMacBlocks(t, enc);
+            // Pool the framed AAD buffer — it's len(2) + aad.Length bytes (TLS AAD is 5 B,
+            // so this is tiny in practice but per-record on the bulk path).
+            int encLen = 2 + aad.Length;
+            byte[] encArr = System.Buffers.ArrayPool<byte>.Shared.Rent(encLen);
+            try
+            {
+                var enc = encArr.AsSpan(0, encLen);
+                BinaryPrimitives.WriteUInt16BigEndian(enc, (ushort)aad.Length);
+                aad.CopyTo(enc.Slice(2));
+                CbcMacBlocks(t, enc);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(encArr.AsSpan(0, encLen));
+                System.Buffers.ArrayPool<byte>.Shared.Return(encArr);
+            }
         }
         CbcMacBlocks(t, pt);
-        return t;
     }
 
-    private void CbcMacBlocks(byte[] t, ReadOnlySpan<byte> data)
+    private void CbcMacBlocks(Span<byte> t, ReadOnlySpan<byte> data)
     {
-        byte[] block = new byte[Block];
+        // Pre-allocate the block + cipher-output buffers ONCE per call instead of
+        // per-iteration (was ~1024 allocations on a 16 KB record).
+        Span<byte> block = stackalloc byte[Block];
+        Span<byte> o = stackalloc byte[Block];
         for (int off = 0; off < data.Length; off += Block)
         {
             int blk = Math.Min(Block, data.Length - off);
-            block.AsSpan().Clear();
+            block.Clear();
             data.Slice(off, blk).CopyTo(block);
-            XorBlock(t, block);
-            byte[] o = new byte[Block];
+            XorBlockSpan(t, block);
             E(t, o);
-            Buffer.BlockCopy(o, 0, t, 0, Block);
+            o.CopyTo(t);
         }
     }
 
-    private byte[] CcmKeystream0(ReadOnlySpan<byte> nonce)
+    private void CcmKeystream0Into(ReadOnlySpan<byte> nonce, Span<byte> s0)
     {
-        byte[] a0 = CcmCtrBlock(nonce, 0);
-        byte[] s0 = new byte[Block];
+        Span<byte> a0 = stackalloc byte[Block];
+        CcmCtrBlockInto(nonce, 0, a0);
         E(a0, s0);
-        return s0;
     }
 
     private void CcmCtr(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> input, Span<byte> output)
     {
-        byte[] ks = new byte[Block];
+        // ks + a are reused across all iterations; was ~1024 byte[Block] allocations
+        // (the per-iter CcmCtrBlock) on a 16 KB record. Big drop in GC pressure.
+        Span<byte> ks = stackalloc byte[Block];
+        Span<byte> a = stackalloc byte[Block];
+        // The flags+nonce prefix doesn't change between counter values — write once.
+        a[0] = (byte)(L - 1);
+        nonce[..12].CopyTo(a.Slice(1));
         int counter = 1;
         for (int off = 0; off < input.Length; off += Block, counter++)
         {
-            byte[] a = CcmCtrBlock(nonce, (uint)counter);
+            WriteBE(a.Slice(1 + 12), (uint)counter, L);
             E(a, ks);
             int blk = Math.Min(Block, input.Length - off);
             for (int i = 0; i < blk; i++) output[off + i] = (byte)(input[off + i] ^ ks[i]);
         }
+    }
+
+    private void CcmCtrBlockInto(ReadOnlySpan<byte> nonce, uint counter, Span<byte> a)
+    {
+        a[0] = (byte)(L - 1);
+        nonce[..12].CopyTo(a.Slice(1));
+        WriteBE(a.Slice(1 + 12), counter, L);
+    }
+
+    // Span-typed sibling of XorBlock for callers that work in stackalloc spans.
+    private static void XorBlockSpan(Span<byte> dst, ReadOnlySpan<byte> src)
+    {
+        for (int i = 0; i < dst.Length; i++) dst[i] ^= src[i];
     }
 
     private byte[] CcmCtrBlock(ReadOnlySpan<byte> nonce, uint counter)

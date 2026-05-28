@@ -12,6 +12,8 @@ using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Security;
 using BcBigInteger = Org.BouncyCastle.Math.BigInteger;
 
+// Per-thread SecureRandom for RSA signing — see the same pattern in EcdsaManaged.
+
 /// <summary>
 /// RSA wrapper backed by BouncyCastle. Mirrors the parts of
 /// <see cref="System.Security.Cryptography.RSA"/> we actually use:
@@ -20,6 +22,9 @@ using BcBigInteger = Org.BouncyCastle.Math.BigInteger;
 /// </summary>
 internal sealed class RsaManaged : IDisposable
 {
+    [ThreadStatic] private static SecureRandom? _tlsRandom;
+    private static SecureRandom Random => _tlsRandom ??= new SecureRandom();
+
     private RsaPrivateCrtKeyParameters? _priv;
     private RsaKeyParameters? _pub;
     private bool _disposed;
@@ -99,7 +104,7 @@ internal sealed class RsaManaged : IDisposable
     {
         if (_priv == null) throw new CryptographicException("No private key available");
         ISigner signer = BuildSigner(hashAlg, padding);
-        signer.Init(true, new ParametersWithRandom(_priv, new SecureRandom()));
+        signer.Init(true, new ParametersWithRandom(_priv, Random));
         signer.BlockUpdate(data, 0, data.Length);
         return signer.GenerateSignature();
     }

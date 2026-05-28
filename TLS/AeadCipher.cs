@@ -86,134 +86,173 @@ public sealed class AeadCipher : IDisposable
         _ => AesGcmRekeyWatermark
     };
 
-    /// <summary>Encrypt plaintext with AEAD. Returns ciphertext ‖ tag.</summary>
+    /// <summary>Encrypt plaintext with AEAD. Returns a freshly-allocated ciphertext||tag byte[].
+    /// On the hot record-layer path prefer <see cref="EncryptInto"/> with a pooled output buffer
+    /// — that's where the per-record allocation actually matters.</summary>
     public byte[] Encrypt(ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> aad)
     {
-        EnforceHardLimit();
+        byte[] result = new byte[plaintext.Length + _tagLen];
+        EncryptInto(plaintext, aad, result);
+        return result;
+    }
 
-        // Mgm and Sm4 take byte[] — keep the alloc for those paths only. AES/ChaCha can
-        // take a Span, so we stackalloc for the hot path.
+    /// <summary>Encrypt directly into a caller-provided buffer (typically rented from
+    /// <see cref="System.Buffers.ArrayPool{T}"/>). <c>output.Length</c> MUST equal
+    /// <c>plaintext.Length + TagLength</c>. Layout is ciphertext||tag, matching what
+    /// every underlying AEAD impl produces.</summary>
+    // Per-record stackalloc nonce (12-16 B) is always fully written by BuildNonceInto
+    // before any read, so skipping the JIT-emitted localloc zeroing is safe.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public void EncryptInto(ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> aad, Span<byte> output)
+    {
+        EnforceHardLimit();
+        if (output.Length != plaintext.Length + _tagLen)
+            throw new ArgumentException($"output must be plaintext.Length + {_tagLen} bytes");
+
         if (_mgm != null)
         {
             byte[] nonce = BuildNonce();
             _seqNum++;
-            return _mgm.Encrypt(nonce, plaintext, aad);
+            _mgm.EncryptInto(nonce, plaintext, output, aad);
+            return;
         }
         if (_sm4 != null)
         {
             byte[] nonce = BuildNonce();
             _seqNum++;
-            return _sm4.Encrypt(nonce, plaintext, aad);
+            _sm4.EncryptInto(nonce, plaintext, output, aad);
+            return;
         }
 
         Span<byte> nonceSpan = stackalloc byte[_iv.Length];
         BuildNonceInto(nonceSpan);
         _seqNum++;
 
-        // Allocate one final-size buffer and encrypt directly into its two regions
-        // (ciphertext slice + tag slice). Cuts the three allocations + two BlockCopy
-        // calls that the old (ciphertext, tag, combined-result) pattern did.
-        byte[] result = new byte[plaintext.Length + _tagLen];
-        var ctSpan = result.AsSpan(0, plaintext.Length);
-        var tagSpan = result.AsSpan(plaintext.Length, _tagLen);
-
         if (_alg == AeadAlgorithm.ChaCha20Poly1305)
-            _chachaManaged!.Encrypt(nonceSpan, plaintext, ctSpan, tagSpan, aad);
+            _chachaManaged!.Encrypt(nonceSpan, plaintext, output, aad);
         else
-            _aesManaged!.Encrypt(nonceSpan, plaintext, ctSpan, tagSpan, aad);
-
-        return result;
+            _aesManaged!.Encrypt(nonceSpan, plaintext, output, aad);
     }
 
-    /// <summary>Decrypt ciphertext ‖ tag. Returns plaintext.</summary>
+    /// <summary>Decrypt ciphertext ‖ tag. Returns a freshly-allocated plaintext byte[].
+    /// Prefer <see cref="DecryptInto"/> on the hot record-layer path.</summary>
     public byte[] Decrypt(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad)
     {
-        // RFC 8446 §5.5 applies to the key, not the direction — if our peer has been
-        // misbehaving and emitted records past the AEAD limit without KeyUpdate, fail
-        // closed instead of silently propagating an exhausted key on the read side.
+        int ctLen = encrypted.Length - _tagLen;
+        if (ctLen < 0)
+            throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+        byte[] plaintext = new byte[ctLen];
+        DecryptInto(encrypted, aad, plaintext);
+        return plaintext;
+    }
+
+    /// <summary>Decrypt directly into a caller-provided buffer. <c>plaintext.Length</c> MUST
+    /// equal <c>encrypted.Length - TagLength</c>. Throws on tag mismatch (same exception types
+    /// as <see cref="Decrypt"/>).</summary>
+    // Same SkipLocalsInit reasoning as EncryptInto.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public void DecryptInto(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, Span<byte> plaintext)
+    {
+        // RFC 8446 §5.5: applies to the key not the direction — fail closed if the peer
+        // pushed us past the AEAD safety budget without KeyUpdate.
         EnforceHardLimit();
 
         int ctLen = encrypted.Length - _tagLen;
         if (ctLen < 0)
             throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+        if (plaintext.Length != ctLen)
+            throw new ArgumentException($"plaintext must be encrypted.Length - {_tagLen} bytes");
 
         if (_mgm != null)
         {
             byte[] nonce = BuildNonce();
             _seqNum++;
-            try { return _mgm.Decrypt(nonce, encrypted, aad); }
+            try
+            {
+                if (!_mgm.TryDecryptInto(nonce, encrypted, plaintext, aad))
+                    throw new TlsException(AlertDescription.BadRecordMac, "MGM authentication tag mismatch");
+            }
             catch (CryptographicException e)
             { throw new TlsException(AlertDescription.BadRecordMac, e.Message); }
+            return;
         }
         if (_sm4 != null)
         {
             byte[] nonce = BuildNonce();
             _seqNum++;
-            try { return _sm4.Decrypt(nonce, encrypted, aad); }
+            try
+            {
+                if (!_sm4.TryDecryptInto(nonce, encrypted, plaintext, aad))
+                    throw new TlsException(AlertDescription.BadRecordMac, "SM4 AEAD authentication tag mismatch");
+            }
             catch (CryptographicException e)
             { throw new TlsException(AlertDescription.BadRecordMac, e.Message); }
+            return;
         }
 
         Span<byte> nonceSpan = stackalloc byte[_iv.Length];
         BuildNonceInto(nonceSpan);
         _seqNum++;
 
-        var ciphertext = encrypted[..ctLen];
-        var tag = encrypted[ctLen..];
-        byte[] plaintext = new byte[ctLen];
-
         if (_alg == AeadAlgorithm.ChaCha20Poly1305)
-            _chachaManaged!.Decrypt(nonceSpan, ciphertext, tag, plaintext, aad);
+            _chachaManaged!.Decrypt(nonceSpan, encrypted, plaintext, aad);
         else
-            _aesManaged!.Decrypt(nonceSpan, ciphertext, tag, plaintext, aad);
-
-        return plaintext;
+            _aesManaged!.Decrypt(nonceSpan, encrypted, plaintext, aad);
     }
 
     /// <summary>Try to decrypt; returns false (without advancing seqNum) on authentication failure.</summary>
     public bool TryDecrypt(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, out byte[]? plaintext)
     {
-        // Same RFC 8446 §5.5 reasoning as Decrypt(): hard-fail if the peer pushes us past
-        // the AEAD's per-key safety budget without KeyUpdate.
-        EnforceHardLimit();
-
         int ctLen = encrypted.Length - _tagLen;
         if (ctLen < 0) { plaintext = null; return false; }
+        byte[] buf = new byte[ctLen];
+        if (TryDecryptInto(encrypted, aad, buf))
+        {
+            plaintext = buf;
+            return true;
+        }
+        plaintext = null;
+        return false;
+    }
+
+    /// <summary>Try to decrypt into a caller-provided buffer. Returns false (without advancing
+    /// seqNum) on authentication failure — RFC 8446 §5.5 trial-decryption semantics.</summary>
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public bool TryDecryptInto(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, Span<byte> plaintext)
+    {
+        EnforceHardLimit();
+        int ctLen = encrypted.Length - _tagLen;
+        if (ctLen < 0 || plaintext.Length != ctLen) return false;
 
         if (_mgm != null)
         {
             byte[] nonce = BuildNonce();
-            if (_mgm.TryDecrypt(nonce, encrypted, aad, out plaintext)) { _seqNum++; return true; }
+            if (_mgm.TryDecryptInto(nonce, encrypted, plaintext, aad)) { _seqNum++; return true; }
             return false;
         }
         if (_sm4 != null)
         {
             byte[] nonce = BuildNonce();
-            if (_sm4.TryDecrypt(nonce, encrypted, aad, out plaintext)) { _seqNum++; return true; }
+            if (_sm4.TryDecryptInto(nonce, encrypted, plaintext, aad)) { _seqNum++; return true; }
             return false;
         }
 
         Span<byte> nonceSpan = stackalloc byte[_iv.Length];
         BuildNonceInto(nonceSpan);
-        var ciphertext = encrypted[..ctLen];
-        var tag = encrypted[ctLen..];
-        byte[] buf = new byte[ctLen];
 
         try
         {
             if (_alg == AeadAlgorithm.ChaCha20Poly1305)
-                _chachaManaged!.Decrypt(nonceSpan, ciphertext, tag, buf, aad);
+                _chachaManaged!.Decrypt(nonceSpan, encrypted, plaintext, aad);
             else
-                _aesManaged!.Decrypt(nonceSpan, ciphertext, tag, buf, aad);
+                _aesManaged!.Decrypt(nonceSpan, encrypted, plaintext, aad);
             _seqNum++;
-            plaintext = buf;
             return true;
         }
         catch (CryptographicException)
         {
             // AuthenticationTagMismatchException derives from CryptographicException, so
             // this single catch covers both the BCL and managed-fallback failure paths.
-            plaintext = null;
             return false;
         }
     }

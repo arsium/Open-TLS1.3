@@ -1,5 +1,6 @@
 namespace TLS;
 
+using System.Security.Cryptography;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Digests;
 using Org.BouncyCastle.Crypto.Macs;
@@ -11,11 +12,21 @@ using Org.BouncyCastle.Crypto.Parameters;
 /// One-shot APIs (HashData, ComputeHash) mirror System.Security.Cryptography; BC digests
 /// expose <c>BlockUpdate(ReadOnlySpan&lt;byte&gt;)</c> so we never copy the input to a heap
 /// array — important for HKDF and per-record HMAC paths.
+///
+/// HMac instances are pooled per-thread via [ThreadStatic]. Each HMac carries a Digest
+/// plus two block-sized XOR pads (~420 B for SHA-256 / SHA-384 combined). Allocating one
+/// per call cost ~25 KB/handshake across HmacShaXXX + Hkdf.ExpandSha2. Pooling drops that
+/// to one per (thread × algorithm) for the lifetime of the thread.
 /// </summary>
 internal static class Sha2Managed
 {
+    [ThreadStatic] private static HMac? _hmacSha1;
+    [ThreadStatic] private static HMac? _hmacSha256;
+    [ThreadStatic] private static HMac? _hmacSha384;
+    [ThreadStatic] private static HMac? _hmacSha512;
+
     public static byte[] HmacSha1(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
-        => ComputeHmac(new Sha1Digest(), key, data);
+        => ComputeHmacPooled(_hmacSha1 ??= new HMac(new Sha1Digest()), key, data);
 
     public static byte[] Sha256(ReadOnlySpan<byte> data)
     {
@@ -45,23 +56,37 @@ internal static class Sha2Managed
     }
 
     public static byte[] HmacSha256(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
-        => ComputeHmac(new Sha256Digest(), key, data);
+        => ComputeHmacPooled(_hmacSha256 ??= new HMac(new Sha256Digest()), key, data);
 
     public static byte[] HmacSha384(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
-        => ComputeHmac(new Sha384Digest(), key, data);
+        => ComputeHmacPooled(_hmacSha384 ??= new HMac(new Sha384Digest()), key, data);
 
     public static byte[] HmacSha512(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
-        => ComputeHmac(new Sha512Digest(), key, data);
+        => ComputeHmacPooled(_hmacSha512 ??= new HMac(new Sha512Digest()), key, data);
 
-    private static byte[] ComputeHmac(IDigest inner, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
+    /// <summary>
+    /// Borrow the per-thread HMac for a given hash algorithm. Caller MUST fully complete
+    /// one Init → BlockUpdate* → DoFinal cycle before any other caller borrows the same
+    /// instance. Used by Hkdf.ExpandSha2 to avoid the per-Expand HMac/Digest allocation.
+    /// Single-threaded use only (enforced by [ThreadStatic]).
+    /// </summary>
+    internal static HMac BorrowHmac(HashAlgorithmName hash)
     {
-        // BC's KeyParameter constructor takes byte[]; one allocation is unavoidable for the key.
-        // Past that, BlockUpdate(ReadOnlySpan) on data avoids a second copy.
-        var h = new HMac(inner);
-        h.Init(new KeyParameter(key.ToArray()));
-        if (!data.IsEmpty) h.BlockUpdate(data);
-        byte[] result = new byte[h.GetMacSize()];
-        h.DoFinal(result, 0);
+        if (hash == HashAlgorithmName.SHA256) return _hmacSha256 ??= new HMac(new Sha256Digest());
+        if (hash == HashAlgorithmName.SHA384) return _hmacSha384 ??= new HMac(new Sha384Digest());
+        if (hash == HashAlgorithmName.SHA512) return _hmacSha512 ??= new HMac(new Sha512Digest());
+        throw new ArgumentException($"Unsupported HMAC hash: {hash}");
+    }
+
+    private static byte[] ComputeHmacPooled(HMac hmac, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
+    {
+        // BC's KeyParameter still wraps a byte[] — one unavoidable copy for the key.
+        // Init() resets the digest and re-applies ipad/opad XORs from the new key,
+        // so the pooled HMac is fully re-initialised here (no state leak across calls).
+        hmac.Init(new KeyParameter(key.ToArray()));
+        if (!data.IsEmpty) hmac.BlockUpdate(data);
+        byte[] result = new byte[hmac.GetMacSize()];
+        hmac.DoFinal(result, 0);
         return result;
     }
 }

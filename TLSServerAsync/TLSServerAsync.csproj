@@ -8,6 +8,11 @@
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Server + concurrent (background) GC: parallel ephemeral collections across cores,
+         concurrent Gen2 marking. NativeAOT default is environment-dependent; set it
+         explicitly so a server build always gets the server-tuned GC. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <Import Project="..\TLS\TLS.projitems" Label="Shared" />

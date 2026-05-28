@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Packable class-library wrapper around the TLS/ shared project. The TLS sources live in
+    a shared project (TLS/Open-TLS1.3.shproj + TLS.projitems) so the demo executables can
+    import them; a .shproj can't produce a NuGet package, so this csproj compiles the same
+    source set into a single OpenTls13.dll and adds the package metadata.
+
+    Everything (BouncyCastle, BrotliSharpLib, ZstdSharp, OpenGost) is source-vendored inside
+    TLS/ and compiled in here, so the produced package has ZERO transitive NuGet dependencies.
+  -->
+
+  <PropertyGroup>
+    <!-- net7.0 is EOL (May 2024); floor at net8.0 (LTS). net9 current, net10 latest. -->
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- The record-layer async read paths use Span<byte> locals inside async methods
+         (they never cross an await — pure compile-time lifetime analysis). That's a C# 13
+         relaxation; net9/net10 default to C# 13/14 but net8.0 defaults to C# 12, so pin
+         the language version uniformly. It's compiler-only — no net8.0 runtime dependency. -->
+    <LangVersion>13.0</LangVersion>
+
+    <!-- The shared project's root namespace is TLS; keep it so type names match the source. -->
+    <RootNamespace>TLS</RootNamespace>
+    <AssemblyName>OpenTls13</AssemblyName>
+
+    <!--
+      AOT note: the demo executables already publish with PublishAot=true, so the code is
+      AOT-safe in practice. We deliberately do NOT set <IsAotCompatible>true</IsAotCompatible>
+      here: it turns on the trim/AOT analyzers across the whole compiled assembly, which floods
+      warnings from the vendored BouncyCastle reflection paths (they carry their own
+      #pragma warning disable IL2026/IL3050 in upstream files, but the analyzer still inspects
+      everything). Consumers can publish their app with NativeAOT regardless.
+    -->
+
+    <!-- ===================== NuGet package metadata ===================== -->
+    <IsPackable>true</IsPackable>
+    <PackageId>OpenTls13</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>arsium</Authors>
+    <Product>OpenTls13</Product>
+    <Title>OpenTls13 — pure-managed TLS 1.3 for .NET</Title>
+    <Description>Pure-managed TLS 1.3 (RFC 8446) for .NET — client and server, sync and async, with no BCrypt/OpenSSL P/Invoke (a single BCryptGenRandom entropy import remains). Includes X25519MLKEM768 hybrid post-quantum key exchange (FIPS 203 ML-KEM-768), mTLS, PSK resumption, 0-RTT early data, HelloRetryRequest, ALPN, OCSP stapling, Encrypted Client Hello (RFC 9849), certificate compression (RFC 8879), and the GOST (RFC 9367) and Chinese SM (RFC 8998) national cipher suites. NativeAOT-friendly; zero transitive dependencies (all crypto is source-vendored).</Description>
+    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>tls;tls1.3;tls13;rfc8446;cryptography;security;mtls;ml-kem;post-quantum;gost;sm2;sm4;chacha20;aes-gcm;aot;managed</PackageTags>
+    <PackageProjectUrl>https://github.com/arsium/Open-TLS1.3</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/arsium/Open-TLS1.3</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <Copyright>Copyright (c) 2026 arsium</Copyright>
+
+    <!-- Embed source-reproducibility + symbols for a publishable package. -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+
+    <!-- The vendored crypto carries upstream analyzer-suppression pragmas; silence the few
+         doc-comment / obsolete warnings that leak through so the package builds clean. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <Import Project="..\TLS\TLS.projitems" Label="Shared" />
+
+  <!-- Files shipped inside the .nupkg (root). README renders on nuget.org; the notices file
+       satisfies the MIT / Bouncy Castle copyright-retention requirement for the vendored code. -->
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+    <None Include="THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

@@ -1,10 +1,14 @@
-# Open-TLS1.3
+# TLSServer
 
 A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptographic primitive runs through managed code — **no BCrypt / OpenSSL P/Invoke**. The published binary has a single bcrypt.dll import (`BCryptGenRandom`) which serves as the OS entropy source; everything else — hashes, HMACs, AEADs, EC point arithmetic, signatures — is pure C#. AES-NI is used via JIT-emitted CPU intrinsics (not a P/Invoke, gated by `Aes.IsSupported`), so the workhorse cipher stays hardware-fast while remaining portable to non-x86 CPUs.
 
+![A TLS 1.3 session from this stack captured in Wireshark on the loopback interface: ClientHello (SNI=localhost), ServerHello, ChangeCipherSpec, and encrypted Application Data records, all recognised as TLSv1.3.](https://raw.githubusercontent.com/arsium/Open-TLS1.3/main/TLS1-3_1.png)
+
+*A loopback session captured in Wireshark — the full TLS 1.3 handshake (ClientHello → ServerHello → ChangeCipherSpec → encrypted Application Data) is recognised as TLSv1.3 on the wire. The red `::1` RST rows at the top are the client's IPv6-first connection attempt against the v4-only demo listener (it then falls back to `127.0.0.1`); see the performance note below.*
+
 > **Note 1 :** AI driven prompt project.
 
-> **Note 2 :** if you wanna a nuget package including DLLs, create a pull request
+> **Note 2 :** a packable library project lives in `OpenTls13/` — `dotnet pack -c Release OpenTls13/OpenTls13.csproj` produces the `.nupkg` (multi-targets net8.0 / net9.0 / net10.0, AGPL-3.0-or-later, zero transitive dependencies). See *NuGet package* below.
 
 > **Note 3 :** national-crypto suites (GOST, Chinese SM) are KAT-verified against published standard vectors and pass self-interop (this client ↔ this server), but have **not** yet been cross-validated against external stacks (GmSSL / OpenSSL-GOST). See *Limitations*.
 
@@ -42,7 +46,7 @@ A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptogra
 | Certificates | X.509 v3 generation (incl. GOST / SM2 certs), CA chaining, PKCS#12/PFX, PKCS#7 |
 | Compression | Certificate compression (RFC 8879) via Brotli and Zstandard |
 
-Symmetric primitives (AES-GCM, SHA-2 family, HMAC) and the asymmetric handshake primitives (RSA, NIST P-256/P-384/P-521 ECDSA/ECDH) go through BouncyCastle's vendored pure-managed implementations — no `System.Security.Cryptography.*` runtime calls into BCrypt or OpenSSL. ChaCha20-Poly1305 is a hand-written RFC 8439 implementation. The ML-KEM-768 NTT/InvNTT, X25519 / X448 / Ed25519, SM2/SM3/SM4, and Keccak are implemented from scratch. GOST primitives are vendored from OpenGost, with EC scalar-mult upgraded to Jacobian projective coordinates (one modular inverse per scalar mult instead of one per point operation).
+Symmetric primitives (AES-GCM, SHA-2 family, HMAC) and the asymmetric handshake primitives (RSA, NIST P-256/P-384/P-521 ECDSA/ECDH, X25519, X448) go through BouncyCastle's vendored pure-managed implementations — no `System.Security.Cryptography.*` runtime calls into BCrypt or OpenSSL. The NIST EC paths use BouncyCastle's optimized `Custom*Curve` classes (`CustomNamedCurves`) and X25519/X448 use its `Rfc7748` packed-limb implementations — both far lighter on allocations than a generic `System.Numerics.BigInteger` ladder. ChaCha20-Poly1305 is a hand-written RFC 8439 implementation. The ML-KEM-768 NTT/InvNTT, Ed25519, SM2/SM3/SM4, and Keccak are implemented from scratch. GOST primitives are vendored from OpenGost, with EC scalar-mult on Jacobian projective coordinates (one modular inverse per scalar mult instead of one per point operation).
 
 ### Cipher suites
 
@@ -159,8 +163,9 @@ Then point Wireshark to the key log file under *Preferences > Protocols > TLS > 
 A dependency-free test suite lives in `Tests/` (known-answer vectors + end-to-end loopback matrix).
 
 ```bash
-dotnet run -c Release --project Tests           # all tests (51 KAT + loopback)
-dotnet run -c Release --project Tests bench     # throughput + handshake benchmarks
+dotnet run -c Release --project Tests           # all tests (83 KAT + loopback + record-layer + wire-format round-trips)
+dotnet run -c Release --project Tests bench     # AEAD throughput + handshake + bulk-transfer benchmarks
+dotnet run -c Release --project Tests profile   # per-phase allocation breakdown of one handshake per suite
 dotnet run -c Release --project Tests bulk      # 20 MB + 50 MB bulk loopback (AES-128/256-GCM + ChaCha20)
 dotnet run -c Release --project Tests fuzz      # parser fuzz harness (120k inputs across 12 parsers)
 dotnet run -c Release --project Tests fuzz 50000  # heavier fuzz (~600k inputs)
@@ -168,15 +173,33 @@ dotnet run -c Release --project Tests fuzz 50000  # heavier fuzz (~600k inputs)
 
 Coverage includes KATs vs published vectors (MGM RFC 9058, SM4/SM3 GB/T, SM4-GCM/CCM RFC 8998, Streebog, GOST R 34.10-2012 and SM2 signatures, HKDF RFC 5869, X25519 RFC 7748, ChaCha20 / Poly1305 / AEAD-ChaCha20-Poly1305 RFC 8439) and full handshake+data loopbacks for every cipher suite plus mTLS plus RFC 8879 cert compression.
 
-### Measured throughput (loopback, single-thread, this dev box)
+### Measured performance (loopback, single-thread, this dev box)
 
-| Cipher | 50 MB bulk |
+Bulk data throughput (50 MB, end-to-end through TLS record framing):
+
+| Cipher | Throughput |
 |---|---|
-| AES-128-GCM | ~99 MB/s |
-| AES-256-GCM | ~106 MB/s |
-| ChaCha20-Poly1305 (managed RFC 8439) | ~104 MB/s |
-| GOST handshake | ~2.06 s (Jacobian EC) |
-| SM handshake | ~2.06 s (Jacobian EC) |
+| AES-128-GCM | ~90–100 MB/s |
+| AES-256-GCM | ~90–100 MB/s |
+| ChaCha20-Poly1305 (managed RFC 8439) | ~85–95 MB/s |
+
+Full TLS 1.3 handshake (loopback, after the allocation overhaul — see `changelog.txt`):
+
+| Suite | Latency | Allocation / handshake |
+|---|---|---|
+| default (X25519 + AES-256-GCM + ECDSA P-256 cert) | ~5–7 ms | ~1.05 MB |
+| GOST (Kuznyechik-MGM + GC256A + GOST cert) | ~14 ms | ~6.4 MB |
+| SM (SM4-GCM + curveSM2 + SM2 cert) | ~13 ms | ~7.3 MB |
+
+> Earlier revisions of this table reported ~2 s GOST/SM handshakes — that was an
+> IPv6 loopback-fallback artifact in the benchmark (the client resolved `localhost`
+> to `::1` first, where the v4-only listener refused it, then fell back to v4 after
+> ~2 s of SYN→RST backoff). The benchmark now connects to `127.0.0.1` directly.
+> National-suite latency is dominated by their `System.Numerics.BigInteger`-based EC
+> scalar multiplication; the default suite uses BouncyCastle's optimized curve paths.
+> Bulk throughput is cipher-bound, not allocation-bound, so it is unchanged by the
+> allocation work — that work cut per-handshake allocation ~10× and per-record bulk
+> allocation ~14× (see `changelog.txt` for the before/after numbers).
 
 ## Native AOT
 
@@ -185,6 +208,37 @@ All projects are configured for native AOT compilation:
 ```bash
 dotnet publish -c Release --project TLSServer
 ```
+
+## NuGet package
+
+The core library ships as a packable class library in `OpenTls13/` that compiles the
+shared `TLS/` sources (plus the vendored BouncyCastle / BrotliSharpLib / ZstdSharp /
+OpenGost) into a single `OpenTls13.dll` — **zero transitive NuGet dependencies**.
+
+```bash
+dotnet pack -c Release OpenTls13/OpenTls13.csproj
+# → OpenTls13/bin/Release/OpenTls13.<version>.nupkg  (+ .snupkg symbols)
+```
+
+- **Package id:** `OpenTls13`  ·  **License:** `AGPL-3.0-or-later`  ·  **Targets:** net8.0 / net9.0 / net10.0
+- AOT-friendly (the demo apps publish with `PublishAot=true`), though `IsAotCompatible`
+  is intentionally left off the library to avoid analyzer noise from the vendored crypto.
+- Consume it with only the public API (`TlsServer`, `TlsClient`, `TlsStream`,
+  `CertificateUtils`, `CipherSuite`, `NamedGroup`, …):
+
+```csharp
+using TLS;
+var ca   = CertificateUtils.GenerateCA("My CA");
+var cert = CertificateUtils.IssueCertificate("localhost", ca, CertificateProfile.Server);
+var server = new TlsServer(cert);
+server.Listen(8443);
+using var s = server.Accept();          // TlsStream — Read/Write encrypted app data
+```
+
+> **AGPL note:** AGPL-3.0 is strong copyleft — network use of a derivative obliges source
+> disclosure. The vendored crypto stays under its original permissive MIT / Bouncy Castle
+> terms (see `OpenTls13/THIRD-PARTY-NOTICES.txt`); only the OpenTls13 code as a whole is AGPL.
+> If you need a non-copyleft option, dual-licensing is the author's call.
 
 ## RFC Compliance
 

@@ -51,6 +51,10 @@ public sealed class TlsServer : IDisposable
         _listener.Start();
     }
 
+    /// <summary>The local port the listener is bound to (set after <see cref="Listen"/>).
+    /// Use this after binding to port 0 to read back the OS-assigned port.</summary>
+    public int? LocalPort => (_listener?.LocalEndpoint as IPEndPoint)?.Port;
+
     /// <summary>Accept one TCP connection, perform the TLS handshake, return an encrypted stream.</summary>
     public TlsStream Accept()
     {

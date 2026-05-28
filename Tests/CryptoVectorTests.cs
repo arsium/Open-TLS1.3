@@ -234,20 +234,25 @@ public static class CryptoVectorTests
         var expectedTag = H("1ae10b594f09e26a7e902ecbd0600691");
         using (var aead = new ChaCha20Poly1305Managed(aeadKey))
         {
-            byte[] ct = new byte[aeadPlain.Length];
-            byte[] gotTag = new byte[16];
-            aead.Encrypt(aeadNonce, aeadPlain, ct, gotTag, aad);
+            // New API: single output span (ct||tag). Slice to compare against the
+            // RFC vectors which give ciphertext and tag separately.
+            byte[] ctTag = new byte[aeadPlain.Length + 16];
+            aead.Encrypt(aeadNonce, aeadPlain, ctTag, aad);
+            byte[] ct = ctTag[..aeadPlain.Length];
+            byte[] gotTag = ctTag[aeadPlain.Length..];
             Eq("AEAD-ChaCha20-Poly1305 ciphertext (RFC 8439 §2.8.2)", X(ct), X(expectedAead));
             Eq("AEAD-ChaCha20-Poly1305 tag (RFC 8439 §2.8.2)", X(gotTag), X(expectedTag));
 
             // Round-trip: decrypt produces the original plaintext, and a flipped tag is rejected.
             byte[] pt = new byte[ct.Length];
-            aead.Decrypt(aeadNonce, ct, gotTag, pt, aad);
+            aead.Decrypt(aeadNonce, ctTag, pt, aad);
             Check("AEAD-ChaCha20-Poly1305 decrypt roundtrip", Eqb(pt, aeadPlain));
 
-            byte[] badTag = (byte[])gotTag.Clone(); badTag[0] ^= 1;
+            // Flip a tag byte in a fresh copy and confirm decrypt rejects.
+            byte[] badCtTag = (byte[])ctTag.Clone();
+            badCtTag[aeadPlain.Length] ^= 1;
             bool rejected = false;
-            try { aead.Decrypt(aeadNonce, ct, badTag, pt, aad); }
+            try { aead.Decrypt(aeadNonce, badCtTag, pt, aad); }
             catch (System.Security.Cryptography.AuthenticationTagMismatchException) { rejected = true; }
             Check("AEAD-ChaCha20-Poly1305 rejects bad tag", rejected);
         }

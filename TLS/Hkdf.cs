@@ -32,16 +32,21 @@ public static class Hkdf
 
     /// <summary>HKDF-Expand(PRK, info, L) → OKM</summary>
     public static byte[] Expand(HashAlgorithmName hash, byte[] prk, byte[] info, int length)
+        => Expand(hash, prk, (ReadOnlySpan<byte>)info, length);
+
+    /// <summary>HKDF-Expand with a span-typed <paramref name="info"/> so callers that build
+    /// the info on the stack (e.g. ExpandLabel) avoid the round-trip through a heap byte[].</summary>
+    public static byte[] Expand(HashAlgorithmName hash, byte[] prk, ReadOnlySpan<byte> info, int length)
     {
         // Streebog and SM3 still go through their one-shot HMACs — those don't expose an
         // incremental API. SHA-2 uses BC's HMac with Init-once / Reset-per-round so we
         // allocate the HMac + KeyParameter exactly once instead of every round.
         if (GostKdf.IsStreebog(hash) || Sm3Kdf.IsSm3(hash))
-            return ExpandOneShot(hash, prk, info, length);
+            return ExpandOneShot(hash, prk, info.ToArray(), length);
         return ExpandSha2(hash, prk, info, length);
     }
 
-    private static byte[] ExpandSha2(HashAlgorithmName hash, byte[] prk, byte[] info, int length)
+    private static byte[] ExpandSha2(HashAlgorithmName hash, byte[] prk, ReadOnlySpan<byte> info, int length)
     {
         int hashLen = HashLen(hash);
         int n = (length + hashLen - 1) / hashLen;
@@ -49,10 +54,11 @@ public static class Hkdf
         byte[] block = new byte[hashLen];
         byte[] prev = Array.Empty<byte>();
 
-        // One HMac + one KeyParameter allocated up front. Reset() rewinds to the keyed
-        // inner state between rounds so subsequent BlockUpdate calls produce T(i) over
-        // the same prk without redoing key padding.
-        var hmac = new HMac(NewDigest(hash));
+        // Borrow the per-thread HMac (pooled by Sha2Managed) — saves ~420 B of HMac+Digest
+        // allocation per Expand call (this runs ~50× per handshake). Init() rebinds the
+        // pad state to `prk`; Reset() rewinds to that keyed state between rounds so
+        // subsequent BlockUpdate calls produce T(i) without redoing key padding.
+        var hmac = Sha2Managed.BorrowHmac(hash);
         hmac.Init(new KeyParameter(prk));
         Span<byte> counter = stackalloc byte[1];
 
@@ -62,7 +68,7 @@ public static class Hkdf
             {
                 hmac.Reset();
                 if (prev.Length > 0) hmac.BlockUpdate(prev, 0, prev.Length);
-                if (info.Length > 0) hmac.BlockUpdate(info, 0, info.Length);
+                if (!info.IsEmpty) hmac.BlockUpdate(info);
                 counter[0] = (byte)i;
                 hmac.BlockUpdate(counter);
                 hmac.DoFinal(block, 0);
@@ -125,32 +131,37 @@ public static class Hkdf
         return result;
     }
 
-    private static Org.BouncyCastle.Crypto.IDigest NewDigest(HashAlgorithmName hash)
-    {
-        if (hash == HashAlgorithmName.SHA256) return new Sha256Digest();
-        if (hash == HashAlgorithmName.SHA384) return new Sha384Digest();
-        if (hash == HashAlgorithmName.SHA512) return new Sha512Digest();
-        throw new ArgumentException($"Unsupported hash: {hash}");
-    }
-
     /// <summary>
     /// HKDF-Expand-Label(Secret, Label, Context, Length)
     /// = HKDF-Expand(Secret, HkdfLabel, Length)
     /// where HkdfLabel = uint16(Length) ‖ "tls13 "+Label (with length prefix) ‖ Context (with length prefix)
     /// </summary>
+    // The HkdfLabel buffer is filled sequentially (header → label → context) with no
+    // intermediate reads, so skipping the localloc zeroing is safe and saves ~80 B
+    // of memset per HKDF derivation (~50× per handshake).
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     public static byte[] ExpandLabel(HashAlgorithmName hash, byte[] secret,
         string label, byte[] context, int length)
     {
-        byte[] fullLabel = System.Text.Encoding.ASCII.GetBytes("tls13 " + label);
+        // TLS 1.3 labels are short ASCII (≤ ~16 chars), context is at most a hash output
+        // (≤ 64 bytes for SHA-512), so the whole HkdfLabel fits comfortably on the stack.
+        // Building it in-place avoids the string concat + Encoding.GetBytes + MemoryStream
+        // + ToArray chain that fired on every key derivation (~50× per handshake).
+        int labelLen = 6 + label.Length;                       // "tls13 " is 6 bytes
+        int total = 2 + 1 + labelLen + 1 + context.Length;
+        Span<byte> buf = total <= 256 ? stackalloc byte[total] : new byte[total];
 
-        using var ms = new MemoryStream();
-        BinaryHelper.WriteUInt16(ms, (ushort)length);
-        ms.WriteByte((byte)fullLabel.Length);
-        ms.Write(fullLabel);
-        ms.WriteByte((byte)context.Length);
-        ms.Write(context);
+        BinaryHelper.WriteUInt16(buf, (ushort)length);
+        buf[2] = (byte)labelLen;
+        buf[3] = (byte)'t'; buf[4] = (byte)'l'; buf[5] = (byte)'s';
+        buf[6] = (byte)'1'; buf[7] = (byte)'3'; buf[8] = (byte)' ';
+        for (int i = 0; i < label.Length; i++)
+            buf[9 + i] = (byte)label[i];                       // labels are pure ASCII
+        int p = 9 + label.Length;
+        buf[p++] = (byte)context.Length;
+        context.AsSpan().CopyTo(buf.Slice(p));
 
-        return Expand(hash, secret, ms.ToArray(), length);
+        return Expand(hash, secret, (ReadOnlySpan<byte>)buf, length);
     }
 
     /// <summary>

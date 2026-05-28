@@ -1,13 +1,18 @@
 namespace TLS;
 
-using System.Numerics;
-using System.Security.Cryptography;
+using BcX448 = Org.BouncyCastle.Math.EC.Rfc7748.X448;
 
+/// <summary>
+/// X448 Diffie-Hellman key exchange (RFC 7748).
+///
+/// Thin wrapper over BouncyCastle's vendored Rfc7748.X448 — same rationale as X25519.cs.
+/// The previous BigInteger-based ladder allocated ~30 BigInts × 448 iterations ≈
+/// **~1.6 MB per ScalarMult** (the heaviest single allocator in the eager-keygen block).
+/// BC's packed-limb impl drops that to ~1 KB.
+/// </summary>
 public static class X448
 {
-    private static readonly BigInteger P = (BigInteger.One << 448) - (BigInteger.One << 224) - 1;
-    private static readonly BigInteger A24 = 39081;
-
+    /// <summary>Generate a clamped 56-byte X448 private key from the RFC 8937 RNG wrapper.</summary>
     public static byte[] GeneratePrivateKey()
     {
         byte[] key = RandomnessWrapper.GetKeyBytes(56);
@@ -15,90 +20,28 @@ public static class X448
         return key;
     }
 
+    /// <summary>X448(privateKey, basepoint) — derive the matching 56-byte public key.</summary>
     public static byte[] PublicFromPrivate(byte[] privateKey)
     {
-        byte[] basePoint = new byte[56];
-        basePoint[0] = 5;
-        return ScalarMult(privateKey, basePoint);
+        byte[] result = new byte[56];
+        BcX448.ScalarMultBase(privateKey.AsSpan(), result.AsSpan());
+        return result;
     }
 
+    /// <summary>X448(myPrivate, theirPublic) — derive the 56-byte shared secret.
+    /// Throws on an all-zero result (small-subgroup attack rejection).</summary>
     public static byte[] SharedSecret(byte[] myPrivate, byte[] theirPublic)
     {
-        byte[] result = ScalarMult(myPrivate, theirPublic);
-        bool allZero = true;
-        for (int i = 0; i < result.Length; i++)
-            if (result[i] != 0) { allZero = false; break; }
-        if (allZero)
+        byte[] result = new byte[56];
+        if (!BcX448.CalculateAgreement(myPrivate.AsSpan(), theirPublic.AsSpan(), result.AsSpan()))
             throw new TlsException(AlertDescription.IllegalParameter, "X448 produced all-zero shared secret");
         return result;
     }
 
+    /// <summary>RFC 7748 §5: clear the bottom two bits of byte 0, set the high bit of byte 55.</summary>
     private static void Clamp(byte[] k)
     {
         k[0] &= 252;
         k[55] |= 128;
-    }
-
-    private static byte[] ScalarMult(byte[] scalar, byte[] uBytes)
-    {
-        byte[] k = (byte[])scalar.Clone();
-        Clamp(k);
-        BigInteger kInt = DecodeLE(k);
-        BigInteger u = DecodeLE(uBytes);
-        u &= (BigInteger.One << 448) - 1;
-
-        BigInteger x_1 = u;
-        BigInteger x_2 = BigInteger.One, z_2 = BigInteger.Zero;
-        BigInteger x_3 = u, z_3 = BigInteger.One;
-        bool swap = false;
-
-        for (int t = 447; t >= 0; t--)
-        {
-            bool kt = ((kInt >> t) & 1) == 1;
-            swap ^= kt;
-            if (swap) { (x_2, x_3) = (x_3, x_2); (z_2, z_3) = (z_3, z_2); }
-            swap = kt;
-
-            BigInteger A = Mod(x_2 + z_2);
-            BigInteger AA = Mod(A * A);
-            BigInteger B = Mod(x_2 - z_2);
-            BigInteger BB = Mod(B * B);
-            BigInteger E = Mod(AA - BB);
-            BigInteger C = Mod(x_3 + z_3);
-            BigInteger D = Mod(x_3 - z_3);
-            BigInteger DA = Mod(D * A);
-            BigInteger CB = Mod(C * B);
-            x_3 = Mod(Mod(DA + CB) * Mod(DA + CB));
-            z_3 = Mod(x_1 * Mod(Mod(DA - CB) * Mod(DA - CB)));
-            x_2 = Mod(AA * BB);
-            z_2 = Mod(E * Mod(AA + A24 * E));
-        }
-
-        if (swap) { (x_2, x_3) = (x_3, x_2); (z_2, z_3) = (z_3, z_2); }
-        BigInteger result = Mod(x_2 * BigInteger.ModPow(z_2, P - 2, P));
-        return EncodeLE(result, 56);
-    }
-
-    private static BigInteger Mod(BigInteger v)
-    {
-        BigInteger r = v % P;
-        return r < 0 ? r + P : r;
-    }
-
-    private static BigInteger DecodeLE(byte[] b)
-    {
-        byte[] padded = new byte[b.Length + 1];
-        Buffer.BlockCopy(b, 0, padded, 0, b.Length);
-        return new BigInteger(padded);
-    }
-
-    private static byte[] EncodeLE(BigInteger v, int size)
-    {
-        byte[] raw = v.ToByteArray();
-        byte[] result = new byte[size];
-        int len = Math.Min(raw.Length, size);
-        if (raw.Length > size && raw[^1] == 0) len = size;
-        Buffer.BlockCopy(raw, 0, result, 0, len);
-        return result;
     }
 }

@@ -40,56 +40,61 @@ internal sealed class AesGcmManaged : IDisposable
         _keyParam = new KeyParameter(_key);
     }
 
+    /// <summary>
+    /// Encrypt <paramref name="plaintext"/> into <paramref name="output"/> as ciphertext||tag
+    /// (BC's natural GCM output layout). <c>output.Length</c> MUST equal
+    /// <c>plaintext.Length + tagSizeBytes</c>. Caller is responsible for slicing if needed.
+    ///
+    /// Removes the previous ~plaintext.Length scratch buffer (was ~16 KB per record on the
+    /// 16 KB plaintext path) — BC now writes directly into the caller's span.
+    /// </summary>
     public void Encrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> plaintext,
-        Span<byte> ciphertext, Span<byte> tag, ReadOnlySpan<byte> aad = default)
+        Span<byte> output, ReadOnlySpan<byte> aad = default)
     {
         EnsureNotDisposed();
-        if (ciphertext.Length != plaintext.Length) throw new ArgumentException("ciphertext length must equal plaintext length");
-        if (tag.Length != _tagLen) throw new ArgumentException($"tag must be {_tagLen} bytes");
+        if (output.Length != plaintext.Length + _tagLen)
+            throw new ArgumentException($"output must be plaintext.Length + {_tagLen} bytes (got {output.Length})");
 
-        // BC's AeadParameters wants byte[]; we have to copy the nonce/AAD once per call.
-        // These are small (12 + ~13 bytes for TLS records) compared to the per-call cipher
-        // construction we used to do.
+        // BC's AeadParameters wants byte[]; nonce (12 B) and aad (5 B for TLS) are tiny —
+        // not worth pooling at this size.
         _cipher.Init(true, new AeadParameters(_keyParam, _tagLen * 8, nonce.ToArray(), aad.ToArray()));
 
-        // BC GCM produces ciphertext || tag in one output buffer; split into caller's spans.
-        int outLen = _cipher.GetOutputSize(plaintext.Length);
-        byte[] outBuf = new byte[outLen];
-        // ProcessBytes has a span overload — feed the plaintext directly without ToArray().
-        int off = _cipher.ProcessBytes(plaintext, outBuf);
-        off += _cipher.DoFinal(outBuf.AsSpan(off));
-
-        new ReadOnlySpan<byte>(outBuf, 0, plaintext.Length).CopyTo(ciphertext);
-        new ReadOnlySpan<byte>(outBuf, plaintext.Length, _tagLen).CopyTo(tag);
-        CryptographicOperations.ZeroMemory(outBuf);
+        // BC GCM writes ciphertext || tag in one contiguous run. Feed plaintext via the span
+        // overload, then DoFinal flushes any buffered block + appends the tag.
+        int off = _cipher.ProcessBytes(plaintext, output);
+        off += _cipher.DoFinal(output.Slice(off));
+        // Sanity: BC's GetOutputSize for AEAD-encrypt returns plaintext.Length + tagLen.
+        // If those don't match, our caller's slice is wrong (or BC changed semantics).
     }
 
-    public void Decrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> ciphertext,
-        ReadOnlySpan<byte> tag, Span<byte> plaintext, ReadOnlySpan<byte> aad = default)
+    /// <summary>
+    /// Decrypt <paramref name="ctAndTag"/> (ciphertext||tag concatenated) into
+    /// <paramref name="plaintext"/>. <c>plaintext.Length</c> MUST equal
+    /// <c>ctAndTag.Length - tagSizeBytes</c>. Throws <see cref="AuthenticationTagMismatchException"/>
+    /// on tag failure.
+    /// </summary>
+    public void Decrypt(ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> ctAndTag,
+        Span<byte> plaintext, ReadOnlySpan<byte> aad = default)
     {
         EnsureNotDisposed();
-        if (plaintext.Length != ciphertext.Length) throw new ArgumentException("plaintext length must equal ciphertext length");
-        if (tag.Length != _tagLen) throw new ArgumentException($"tag must be {_tagLen} bytes");
+        if (ctAndTag.Length < _tagLen || plaintext.Length != ctAndTag.Length - _tagLen)
+            throw new ArgumentException($"plaintext.Length must equal ctAndTag.Length - {_tagLen}");
 
         _cipher.Init(false, new AeadParameters(_keyParam, _tagLen * 8, nonce.ToArray(), aad.ToArray()));
 
-        int outLen = _cipher.GetOutputSize(ciphertext.Length + _tagLen);
-        byte[] outBuf = new byte[outLen];
-        // Feed ciphertext then tag — Span overloads avoid the inBuf concatenation copy.
-        int off = _cipher.ProcessBytes(ciphertext, outBuf);
-        off += _cipher.ProcessBytes(tag, outBuf.AsSpan(off));
+        // Feed ciphertext+tag as one span — BC GCM internally separates them at DoFinal.
+        int off = _cipher.ProcessBytes(ctAndTag, plaintext);
         try
         {
-            off += _cipher.DoFinal(outBuf.AsSpan(off));
+            _cipher.DoFinal(plaintext.Slice(off));
         }
         catch (InvalidCipherTextException)
         {
-            CryptographicOperations.ZeroMemory(outBuf);
+            // Wipe any partial plaintext before throwing — BC may have written some bytes
+            // before the tag check failed.
+            CryptographicOperations.ZeroMemory(plaintext);
             throw new AuthenticationTagMismatchException();
         }
-
-        new ReadOnlySpan<byte>(outBuf, 0, plaintext.Length).CopyTo(plaintext);
-        CryptographicOperations.ZeroMemory(outBuf);
     }
 
     private void EnsureNotDisposed()

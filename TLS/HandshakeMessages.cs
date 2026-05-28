@@ -1,5 +1,6 @@
 namespace TLS;
 
+using System.Buffers;
 using System.Security.Cryptography;
 
 /// <summary>TLS 1.3 handshake message construction and parsing.</summary>
@@ -89,27 +90,29 @@ public static class HandshakeMessages
         (byte[] identity, uint age, byte[] binder)? psk, bool offerEarlyData,
         string[]? alpnProtocols, bool requestOcspStapling, ushort ticketRequestCount = 0)
     {
-        using var ms = new MemoryStream();
+        // ClientHello body fits comfortably in 1-2 KB without PSK; pre-size to avoid
+        // most internal regrowths inside ArrayBufferWriter.
+        var bw = new ArrayBufferWriter<byte>(1024);
 
-        BinaryHelper.WriteUInt16(ms, TlsConst.LegacyVersion); // legacy_version
-        ms.Write(clientRandom);                                 // random (32)
+        BinaryHelper.WriteUInt16(bw, TlsConst.LegacyVersion); // legacy_version
+        BinaryHelper.WriteBytes(bw, clientRandom);              // random (32)
 
-        ms.WriteByte((byte)sessionId.Length);                   // session_id
-        ms.Write(sessionId);
+        BinaryHelper.WriteByte(bw, (byte)sessionId.Length);    // session_id
+        BinaryHelper.WriteBytes(bw, sessionId);
 
         // cipher_suites — prepend a GREASE value (RFC 8701); the peer MUST ignore it
-        BinaryHelper.WriteUInt16(ms, (ushort)((suites.Length + 1) * 2));
-        BinaryHelper.WriteUInt16(ms, Grease.CipherSuite);
-        foreach (var s in suites) BinaryHelper.WriteUInt16(ms, (ushort)s);
+        BinaryHelper.WriteUInt16(bw, (ushort)((suites.Length + 1) * 2));
+        BinaryHelper.WriteUInt16(bw, Grease.CipherSuite);
+        foreach (var s in suites) BinaryHelper.WriteUInt16(bw, (ushort)s);
 
-        ms.WriteByte(1); ms.WriteByte(0);                       // compression_methods = {null}
+        BinaryHelper.WriteByte(bw, 1); BinaryHelper.WriteByte(bw, 0); // compression_methods = {null}
 
         byte[] ext = BuildClientHelloExtensions(keyShares, serverName, cookie,
             psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, null);
-        BinaryHelper.WriteUInt16(ms, (ushort)ext.Length);       // extensions length
-        ms.Write(ext);
+        BinaryHelper.WriteUInt16(bw, (ushort)ext.Length);       // extensions length
+        BinaryHelper.WriteBytes(bw, ext);
 
-        return Frame(HandshakeType.ClientHello, ms.ToArray());
+        return Frame(HandshakeType.ClientHello, bw.WrittenSpan.ToArray());
     }
 
     public static ParsedClientHello ParseClientHello(byte[] body)
@@ -300,62 +303,60 @@ public static class HandshakeMessages
     public static byte[] BuildServerHello(byte[] serverRandom, byte[] sessionId,
         CipherSuite suite, NamedGroup group, byte[] pubKey)
     {
-        using var ms = new MemoryStream();
+        var bw = new ArrayBufferWriter<byte>(256);
 
-        BinaryHelper.WriteUInt16(ms, TlsConst.LegacyVersion);
-        ms.Write(serverRandom);
+        BinaryHelper.WriteUInt16(bw, TlsConst.LegacyVersion);
+        BinaryHelper.WriteBytes(bw, serverRandom);
 
-        ms.WriteByte((byte)sessionId.Length);
-        ms.Write(sessionId);
+        BinaryHelper.WriteByte(bw, (byte)sessionId.Length);
+        BinaryHelper.WriteBytes(bw, sessionId);
 
-        BinaryHelper.WriteUInt16(ms, (ushort)suite);
-        ms.WriteByte(0); // compression = null
+        BinaryHelper.WriteUInt16(bw, (ushort)suite);
+        BinaryHelper.WriteByte(bw, 0); // compression = null
 
         // Extensions
-        using var ems = new MemoryStream();
+        var ebw = new ArrayBufferWriter<byte>(128);
         // supported_versions → TLS 1.3
-        WriteExtension(ems, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
+        WriteExtension(ebw, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
         // key_share: group + key
         {
-            using var ks = new MemoryStream();
+            var ks = new ArrayBufferWriter<byte>(4 + pubKey.Length);
             BinaryHelper.WriteUInt16(ks, (ushort)group);
             BinaryHelper.WriteUInt16(ks, (ushort)pubKey.Length);
-            ks.Write(pubKey);
-            WriteExtension(ems, ExtensionType.KeyShare, ks.ToArray());
+            BinaryHelper.WriteBytes(ks, pubKey);
+            WriteExtension(ebw, ExtensionType.KeyShare, ks.WrittenSpan);
         }
 
-        byte[] extBytes = ems.ToArray();
-        BinaryHelper.WriteUInt16(ms, (ushort)extBytes.Length);
-        ms.Write(extBytes);
+        BinaryHelper.WriteUInt16(bw, (ushort)ebw.WrittenCount);
+        BinaryHelper.WriteBytes(bw, ebw.WrittenSpan);
 
-        return Frame(HandshakeType.ServerHello, ms.ToArray());
+        return Frame(HandshakeType.ServerHello, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Build a HelloRetryRequest (encoded as ServerHello with sentinel random).</summary>
     public static byte[] BuildHelloRetryRequest(byte[] sessionId, CipherSuite suite, NamedGroup requestedGroup)
     {
-        using var ms = new MemoryStream();
+        var bw = new ArrayBufferWriter<byte>(128);
 
-        BinaryHelper.WriteUInt16(ms, TlsConst.LegacyVersion);
-        ms.Write(HrrSentinel); // sentinel random
+        BinaryHelper.WriteUInt16(bw, TlsConst.LegacyVersion);
+        BinaryHelper.WriteBytes(bw, HrrSentinel); // sentinel random
 
-        ms.WriteByte((byte)sessionId.Length);
-        ms.Write(sessionId);
+        BinaryHelper.WriteByte(bw, (byte)sessionId.Length);
+        BinaryHelper.WriteBytes(bw, sessionId);
 
-        BinaryHelper.WriteUInt16(ms, (ushort)suite);
-        ms.WriteByte(0); // compression = null
+        BinaryHelper.WriteUInt16(bw, (ushort)suite);
+        BinaryHelper.WriteByte(bw, 0); // compression = null
 
         // Extensions
-        using var ems = new MemoryStream();
-        WriteExtension(ems, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
+        var ebw = new ArrayBufferWriter<byte>(32);
+        WriteExtension(ebw, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
         // key_share for HRR: just the selected group (2 bytes)
-        WriteExtension(ems, ExtensionType.KeyShare, UInt16Bytes((ushort)requestedGroup));
+        WriteExtension(ebw, ExtensionType.KeyShare, UInt16Bytes((ushort)requestedGroup));
 
-        byte[] extBytes = ems.ToArray();
-        BinaryHelper.WriteUInt16(ms, (ushort)extBytes.Length);
-        ms.Write(extBytes);
+        BinaryHelper.WriteUInt16(bw, (ushort)ebw.WrittenCount);
+        BinaryHelper.WriteBytes(bw, ebw.WrittenSpan);
 
-        return Frame(HandshakeType.ServerHello, ms.ToArray());
+        return Frame(HandshakeType.ServerHello, bw.WrittenSpan.ToArray());
     }
 
     public static ParsedServerHello ParseServerHello(byte[] body)
@@ -438,42 +439,41 @@ public static class HandshakeMessages
         string? alpnProtocol = null, ushort certCompressionAlgorithm = 0,
         ushort recordSizeLimit = 0)
     {
-        using var ms = new MemoryStream();
-        using var ext = new MemoryStream();
+        var bw = new ArrayBufferWriter<byte>(64);
+        var ext = new ArrayBufferWriter<byte>(48);
 
         if (acceptEarlyData)
-            WriteExtension(ext, ExtensionType.EarlyData, Array.Empty<byte>());
+            WriteExtension(ext, ExtensionType.EarlyData, ReadOnlySpan<byte>.Empty);
 
         if (recordSizeLimit > 0)
         {
-            byte[] rsl = new byte[2];
-            BinaryHelper.WriteUInt16(rsl.AsSpan(), recordSizeLimit);
+            Span<byte> rsl = stackalloc byte[2];
+            BinaryHelper.WriteUInt16(rsl, recordSizeLimit);
             WriteExtension(ext, ExtensionType.RecordSizeLimit, rsl);
         }
 
         if (alpnProtocol != null)
         {
             byte[] proto = System.Text.Encoding.ASCII.GetBytes(alpnProtocol);
-            using var alpnBody = new MemoryStream();
+            var alpnBody = new ArrayBufferWriter<byte>(3 + proto.Length);
             ushort listLen = (ushort)(1 + proto.Length);
             BinaryHelper.WriteUInt16(alpnBody, listLen);
-            alpnBody.WriteByte((byte)proto.Length);
-            alpnBody.Write(proto);
-            WriteExtension(ext, ExtensionType.Alpn, alpnBody.ToArray());
+            BinaryHelper.WriteByte(alpnBody, (byte)proto.Length);
+            BinaryHelper.WriteBytes(alpnBody, proto);
+            WriteExtension(ext, ExtensionType.Alpn, alpnBody.WrittenSpan);
         }
 
         if (certCompressionAlgorithm != 0)
         {
-            byte[] ccBody = new byte[3];
+            Span<byte> ccBody = stackalloc byte[3];
             ccBody[0] = 2; // byte length of algorithms list (one 2-byte entry)
-            BinaryHelper.WriteUInt16(ccBody.AsSpan(1), certCompressionAlgorithm);
+            BinaryHelper.WriteUInt16(ccBody.Slice(1), certCompressionAlgorithm);
             WriteExtension(ext, ExtensionType.CertificateCompression, ccBody);
         }
 
-        byte[] extBytes = ext.ToArray();
-        BinaryHelper.WriteUInt16(ms, (ushort)extBytes.Length);
-        if (extBytes.Length > 0) ms.Write(extBytes);
-        return Frame(HandshakeType.EncryptedExtensions, ms.ToArray());
+        BinaryHelper.WriteUInt16(bw, (ushort)ext.WrittenCount);
+        if (ext.WrittenCount > 0) BinaryHelper.WriteBytes(bw, ext.WrittenSpan);
+        return Frame(HandshakeType.EncryptedExtensions, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Parse EncryptedExtensions. Returns early_data accepted, negotiated ALPN, cert compression alg.</summary>
@@ -526,36 +526,35 @@ public static class HandshakeMessages
     public static byte[] BuildServerHelloWithPsk(byte[] serverRandom, byte[] sessionId,
         CipherSuite suite, NamedGroup group, byte[] pubKey, ushort selectedPskIndex)
     {
-        using var ms = new MemoryStream();
+        var bw = new ArrayBufferWriter<byte>(256);
 
-        BinaryHelper.WriteUInt16(ms, TlsConst.LegacyVersion);
-        ms.Write(serverRandom);
+        BinaryHelper.WriteUInt16(bw, TlsConst.LegacyVersion);
+        BinaryHelper.WriteBytes(bw, serverRandom);
 
-        ms.WriteByte((byte)sessionId.Length);
-        ms.Write(sessionId);
+        BinaryHelper.WriteByte(bw, (byte)sessionId.Length);
+        BinaryHelper.WriteBytes(bw, sessionId);
 
-        BinaryHelper.WriteUInt16(ms, (ushort)suite);
-        ms.WriteByte(0); // compression = null
+        BinaryHelper.WriteUInt16(bw, (ushort)suite);
+        BinaryHelper.WriteByte(bw, 0); // compression = null
 
         // Extensions
-        using var ems = new MemoryStream();
-        WriteExtension(ems, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
+        var ebw = new ArrayBufferWriter<byte>(128);
+        WriteExtension(ebw, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
         // key_share
         {
-            using var ks = new MemoryStream();
+            var ks = new ArrayBufferWriter<byte>(4 + pubKey.Length);
             BinaryHelper.WriteUInt16(ks, (ushort)group);
             BinaryHelper.WriteUInt16(ks, (ushort)pubKey.Length);
-            ks.Write(pubKey);
-            WriteExtension(ems, ExtensionType.KeyShare, ks.ToArray());
+            BinaryHelper.WriteBytes(ks, pubKey);
+            WriteExtension(ebw, ExtensionType.KeyShare, ks.WrittenSpan);
         }
         // pre_shared_key (selected index)
-        WriteExtension(ems, ExtensionType.PreSharedKey, BuildPreSharedKeyServerExtension(selectedPskIndex));
+        WriteExtension(ebw, ExtensionType.PreSharedKey, BuildPreSharedKeyServerExtension(selectedPskIndex));
 
-        byte[] extBytes = ems.ToArray();
-        BinaryHelper.WriteUInt16(ms, (ushort)extBytes.Length);
-        ms.Write(extBytes);
+        BinaryHelper.WriteUInt16(bw, (ushort)ebw.WrittenCount);
+        BinaryHelper.WriteBytes(bw, ebw.WrittenSpan);
 
-        return Frame(HandshakeType.ServerHello, ms.ToArray());
+        return Frame(HandshakeType.ServerHello, bw.WrittenSpan.ToArray());
     }
 
     // ================================================================
@@ -566,31 +565,30 @@ public static class HandshakeMessages
     public static byte[] BuildCertificateRequest(byte[] context, SignatureScheme[] sigAlgorithms,
         SignatureScheme[]? certSigAlgorithms = null)
     {
-        using var ms = new MemoryStream();
-        ms.WriteByte((byte)context.Length);
-        ms.Write(context);
+        var bw = new ArrayBufferWriter<byte>(128);
+        BinaryHelper.WriteByte(bw, (byte)context.Length);
+        BinaryHelper.WriteBytes(bw, context);
 
         // Extensions — signature_algorithms is mandatory
-        using var ext = new MemoryStream();
-        using var sigBody = new MemoryStream();
+        var ext = new ArrayBufferWriter<byte>(64);
+        var sigBody = new ArrayBufferWriter<byte>(2 + sigAlgorithms.Length * 2);
         BinaryHelper.WriteUInt16(sigBody, (ushort)(sigAlgorithms.Length * 2));
         foreach (var s in sigAlgorithms) BinaryHelper.WriteUInt16(sigBody, (ushort)s);
-        WriteExtension(ext, ExtensionType.SignatureAlgorithms, sigBody.ToArray());
+        WriteExtension(ext, ExtensionType.SignatureAlgorithms, sigBody.WrittenSpan);
 
         // RFC 8446 §4.2.3 + RFC 9963 §3: signature_algorithms_cert extension (optional)
         if (certSigAlgorithms != null && certSigAlgorithms.Length > 0)
         {
-            using var certSigBody = new MemoryStream();
+            var certSigBody = new ArrayBufferWriter<byte>(2 + certSigAlgorithms.Length * 2);
             BinaryHelper.WriteUInt16(certSigBody, (ushort)(certSigAlgorithms.Length * 2));
             foreach (var s in certSigAlgorithms) BinaryHelper.WriteUInt16(certSigBody, (ushort)s);
-            WriteExtension(ext, ExtensionType.SignatureAlgorithmsCert, certSigBody.ToArray());
+            WriteExtension(ext, ExtensionType.SignatureAlgorithmsCert, certSigBody.WrittenSpan);
         }
 
-        byte[] extBytes = ext.ToArray();
-        BinaryHelper.WriteUInt16(ms, (ushort)extBytes.Length);
-        ms.Write(extBytes);
+        BinaryHelper.WriteUInt16(bw, (ushort)ext.WrittenCount);
+        BinaryHelper.WriteBytes(bw, ext.WrittenSpan);
 
-        return Frame(HandshakeType.CertificateRequest, ms.ToArray());
+        return Frame(HandshakeType.CertificateRequest, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Parse a CertificateRequest message body.</summary>
@@ -643,13 +641,16 @@ public static class HandshakeMessages
     /// <summary>Build a Certificate message with empty context (server). Optionally includes chain certs and OCSP response.</summary>
     public static byte[] BuildCertificate(byte[] certDer, byte[][]? chainCerts = null, byte[]? ocspResponse = null)
     {
-        using var ms = new MemoryStream();
-        ms.WriteByte(0); // certificate_request_context (empty for server)
+        // Estimate: 1 (ctx) + 3 (list_len) + leaf + chain + a generous ocsp slot
+        int estimate = 4 + certDer.Length + (ocspResponse?.Length ?? 0) + 32;
+        if (chainCerts != null) foreach (var cc in chainCerts) estimate += cc.Length + 5;
+        var bw = new ArrayBufferWriter<byte>(estimate);
+        BinaryHelper.WriteByte(bw, 0); // certificate_request_context (empty for server)
 
-        using var list = new MemoryStream();
+        var list = new ArrayBufferWriter<byte>(estimate);
         // Leaf cert
         BinaryHelper.WriteUInt24(list, (uint)certDer.Length);
-        list.Write(certDer);
+        BinaryHelper.WriteBytes(list, certDer);
         WritePerCertExtensions(list, ocspResponse); // OCSP staple on leaf only
 
         // Chain certs (CA, intermediates)
@@ -658,30 +659,31 @@ public static class HandshakeMessages
             foreach (var cc in chainCerts)
             {
                 BinaryHelper.WriteUInt24(list, (uint)cc.Length);
-                list.Write(cc);
+                BinaryHelper.WriteBytes(list, cc);
                 BinaryHelper.WriteUInt16(list, 0); // no per-cert extensions
             }
         }
 
-        byte[] listBytes = list.ToArray();
-        BinaryHelper.WriteUInt24(ms, (uint)listBytes.Length);
-        ms.Write(listBytes);
+        BinaryHelper.WriteUInt24(bw, (uint)list.WrittenCount);
+        BinaryHelper.WriteBytes(bw, list.WrittenSpan);
 
-        return Frame(HandshakeType.Certificate, ms.ToArray());
+        return Frame(HandshakeType.Certificate, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Build a Certificate message with context (client mTLS). Null certDer = empty list.</summary>
     public static byte[] BuildCertificateMsg(byte[]? certDer, byte[] context, byte[][]? chainCerts = null)
     {
-        using var ms = new MemoryStream();
-        ms.WriteByte((byte)context.Length);
-        ms.Write(context);
+        int estimate = 4 + context.Length + (certDer?.Length ?? 0);
+        if (chainCerts != null) foreach (var cc in chainCerts) estimate += cc.Length + 5;
+        var bw = new ArrayBufferWriter<byte>(estimate);
+        BinaryHelper.WriteByte(bw, (byte)context.Length);
+        BinaryHelper.WriteBytes(bw, context);
 
         if (certDer != null)
         {
-            using var list = new MemoryStream();
+            var list = new ArrayBufferWriter<byte>(estimate);
             BinaryHelper.WriteUInt24(list, (uint)certDer.Length);
-            list.Write(certDer);
+            BinaryHelper.WriteBytes(list, certDer);
             BinaryHelper.WriteUInt16(list, 0); // per-cert extensions
 
             if (chainCerts != null)
@@ -689,21 +691,20 @@ public static class HandshakeMessages
                 foreach (var cc in chainCerts)
                 {
                     BinaryHelper.WriteUInt24(list, (uint)cc.Length);
-                    list.Write(cc);
+                    BinaryHelper.WriteBytes(list, cc);
                     BinaryHelper.WriteUInt16(list, 0);
                 }
             }
 
-            byte[] listBytes = list.ToArray();
-            BinaryHelper.WriteUInt24(ms, (uint)listBytes.Length);
-            ms.Write(listBytes);
+            BinaryHelper.WriteUInt24(bw, (uint)list.WrittenCount);
+            BinaryHelper.WriteBytes(bw, list.WrittenSpan);
         }
         else
         {
-            BinaryHelper.WriteUInt24(ms, 0); // empty certificate list
+            BinaryHelper.WriteUInt24(bw, 0); // empty certificate list
         }
 
-        return Frame(HandshakeType.Certificate, ms.ToArray());
+        return Frame(HandshakeType.Certificate, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Returns the first certificate DER bytes from a Certificate message body.</summary>
@@ -769,11 +770,11 @@ public static class HandshakeMessages
 
     public static byte[] BuildCertificateVerify(SignatureScheme scheme, byte[] signature)
     {
-        using var ms = new MemoryStream();
-        BinaryHelper.WriteUInt16(ms, (ushort)scheme);
-        BinaryHelper.WriteUInt16(ms, (ushort)signature.Length);
-        ms.Write(signature);
-        return Frame(HandshakeType.CertificateVerify, ms.ToArray());
+        var bw = new ArrayBufferWriter<byte>(4 + signature.Length);
+        BinaryHelper.WriteUInt16(bw, (ushort)scheme);
+        BinaryHelper.WriteUInt16(bw, (ushort)signature.Length);
+        BinaryHelper.WriteBytes(bw, signature);
+        return Frame(HandshakeType.CertificateVerify, bw.WrittenSpan.ToArray());
     }
 
     public static (SignatureScheme scheme, byte[] signature) ParseCertificateVerify(byte[] body)
@@ -813,26 +814,26 @@ public static class HandshakeMessages
     public static byte[] BuildNewSessionTicket(uint lifetime, uint ageAdd, byte[] nonce,
         byte[] ticket, uint maxEarlyDataSize)
     {
-        using var ms = new MemoryStream();
-        BinaryHelper.WriteUInt32(ms, lifetime);
-        BinaryHelper.WriteUInt32(ms, ageAdd);
-        ms.WriteByte((byte)nonce.Length);
-        ms.Write(nonce);
-        BinaryHelper.WriteUInt16(ms, (ushort)ticket.Length);
-        ms.Write(ticket);
+        var bw = new ArrayBufferWriter<byte>(16 + nonce.Length + ticket.Length + 16);
+        BinaryHelper.WriteUInt32(bw, lifetime);
+        BinaryHelper.WriteUInt32(bw, ageAdd);
+        BinaryHelper.WriteByte(bw, (byte)nonce.Length);
+        BinaryHelper.WriteBytes(bw, nonce);
+        BinaryHelper.WriteUInt16(bw, (ushort)ticket.Length);
+        BinaryHelper.WriteBytes(bw, ticket);
 
         // Extensions: early_data (max_early_data_size)
-        using var ext = new MemoryStream();
+        var ext = new ArrayBufferWriter<byte>(16);
         if (maxEarlyDataSize > 0)
         {
-            using var edBody = new MemoryStream();
+            Span<byte> edBody = stackalloc byte[4];
             BinaryHelper.WriteUInt32(edBody, maxEarlyDataSize);
-            WriteExtension(ext, ExtensionType.EarlyData, edBody.ToArray());
+            WriteExtension(ext, ExtensionType.EarlyData, edBody);
         }
-        BinaryHelper.WriteUInt16(ms, (ushort)ext.Length);
-        if (ext.Length > 0) ms.Write(ext.ToArray());
+        BinaryHelper.WriteUInt16(bw, (ushort)ext.WrittenCount);
+        if (ext.WrittenCount > 0) BinaryHelper.WriteBytes(bw, ext.WrittenSpan);
 
-        return Frame(HandshakeType.NewSessionTicket, ms.ToArray());
+        return Frame(HandshakeType.NewSessionTicket, bw.WrittenSpan.ToArray());
     }
 
     public static ParsedNewSessionTicket ParseNewSessionTicket(byte[] body)
@@ -879,19 +880,21 @@ public static class HandshakeMessages
     /// <summary>Build pre_shared_key extension data for ClientHello (identities + binders).</summary>
     public static byte[] BuildPreSharedKeyExtension(byte[] identity, uint obfuscatedAge, byte[] binder)
     {
-        using var ms = new MemoryStream();
+        // Fixed-shape: 2 + 2 + identity + 4 + 2 + 1 + binder
+        int size = 2 + 2 + identity.Length + 4 + 2 + 1 + binder.Length;
+        var bw = new ArrayBufferWriter<byte>(size);
         // Identities list
         ushort identityEntryLen = (ushort)(2 + identity.Length + 4); // len(2) + identity + age(4)
-        BinaryHelper.WriteUInt16(ms, identityEntryLen);
-        BinaryHelper.WriteUInt16(ms, (ushort)identity.Length);
-        ms.Write(identity);
-        BinaryHelper.WriteUInt32(ms, obfuscatedAge);
+        BinaryHelper.WriteUInt16(bw, identityEntryLen);
+        BinaryHelper.WriteUInt16(bw, (ushort)identity.Length);
+        BinaryHelper.WriteBytes(bw, identity);
+        BinaryHelper.WriteUInt32(bw, obfuscatedAge);
         // Binders list
         ushort bindersLen = (ushort)(1 + binder.Length); // len(1) + binder
-        BinaryHelper.WriteUInt16(ms, bindersLen);
-        ms.WriteByte((byte)binder.Length);
-        ms.Write(binder);
-        return ms.ToArray();
+        BinaryHelper.WriteUInt16(bw, bindersLen);
+        BinaryHelper.WriteByte(bw, (byte)binder.Length);
+        BinaryHelper.WriteBytes(bw, binder);
+        return bw.WrittenSpan.ToArray();
     }
 
     /// <summary>Compute the PSK binder HMAC value.</summary>
@@ -1018,86 +1021,103 @@ public static class HandshakeMessages
         ushort ticketRequestCount = 0,
         byte[]? echExtensionData = null)
     {
-        using var ms = new MemoryStream();
+        // 768 B fits a typical ClientHello extensions block (a few hundred bytes of
+        // groups/sigalgs + key_shares of various sizes). The writer grows if needed.
+        var bw = new ArrayBufferWriter<byte>(768);
 
         // SNI
         if (serverName != null)
         {
             byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes(serverName);
-            using var body = new MemoryStream();
+            // body layout: nameListLen(2) + nameType(1) + nameLen(2) + nameBytes
+            var body = new ArrayBufferWriter<byte>(5 + nameBytes.Length);
             ushort nameListLen = (ushort)(1 + 2 + nameBytes.Length);
             BinaryHelper.WriteUInt16(body, nameListLen);
-            body.WriteByte(0x00); // host_name
+            BinaryHelper.WriteByte(body, 0x00); // host_name
             BinaryHelper.WriteUInt16(body, (ushort)nameBytes.Length);
-            body.Write(nameBytes);
-            WriteExtension(ms, ExtensionType.ServerName, body.ToArray());
+            BinaryHelper.WriteBytes(body, nameBytes);
+            WriteExtension(bw, ExtensionType.ServerName, body.WrittenSpan);
         }
 
         // Status Request (OCSP stapling — RFC 6066 §8)
         if (requestOcspStapling)
         {
             // CertificateStatusRequest: status_type=ocsp(1), responder_id_list=empty, request_extensions=empty
-            byte[] srBody = { 0x01, 0x00, 0x00, 0x00, 0x00 };
-            WriteExtension(ms, ExtensionType.StatusRequest, srBody);
+            ReadOnlySpan<byte> srBody = stackalloc byte[] { 0x01, 0x00, 0x00, 0x00, 0x00 };
+            WriteExtension(bw, ExtensionType.StatusRequest, srBody);
         }
 
         // ALPN
         if (alpnProtocols != null && alpnProtocols.Length > 0)
         {
-            using var body = new MemoryStream();
-            using var list = new MemoryStream();
+            // Compute exact size: list_len(2) + Σ(1 + proto.Length)
+            int totalProtoBytes = 0;
+            foreach (var p in alpnProtocols)
+                totalProtoBytes += 1 + System.Text.Encoding.ASCII.GetByteCount(p);
+            var body = new ArrayBufferWriter<byte>(2 + totalProtoBytes);
+            BinaryHelper.WriteUInt16(body, (ushort)totalProtoBytes);
             foreach (var proto in alpnProtocols)
             {
                 byte[] pb = System.Text.Encoding.ASCII.GetBytes(proto);
-                list.WriteByte((byte)pb.Length);
-                list.Write(pb);
+                BinaryHelper.WriteByte(body, (byte)pb.Length);
+                BinaryHelper.WriteBytes(body, pb);
             }
-            BinaryHelper.WriteUInt16(body, (ushort)list.Length);
-            body.Write(list.ToArray());
-            WriteExtension(ms, ExtensionType.Alpn, body.ToArray());
+            WriteExtension(bw, ExtensionType.Alpn, body.WrittenSpan);
         }
 
         // Certificate Compression (advertise brotli = 0x0002, zstd = 0x0003)
         {
-            byte[] ccBody = new byte[5];
+            Span<byte> ccBody = stackalloc byte[5];
             ccBody[0] = 4; // byte length of algorithms list (two 2-byte entries)
-            BinaryHelper.WriteUInt16(ccBody.AsSpan(1), 0x0002); // brotli
-            BinaryHelper.WriteUInt16(ccBody.AsSpan(3), 0x0003); // zstd
-            WriteExtension(ms, ExtensionType.CertificateCompression, ccBody);
+            BinaryHelper.WriteUInt16(ccBody.Slice(1), 0x0002); // brotli
+            BinaryHelper.WriteUInt16(ccBody.Slice(3), 0x0003); // zstd
+            WriteExtension(bw, ExtensionType.CertificateCompression, ccBody);
         }
 
         // Supported Groups
         {
-            NamedGroup[] groups = { NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
-                NamedGroup.Secp256r1, NamedGroup.Secp384r1 };
-            using var body = new MemoryStream();
+            ReadOnlySpan<NamedGroup> groups = stackalloc NamedGroup[] {
+                NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
+                NamedGroup.Secp256r1, NamedGroup.Secp384r1
+            };
+            int bodyLen = 2 + (groups.Length + 1) * 2; // listLen + GREASE + groups
+            Span<byte> body = stackalloc byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)((groups.Length + 1) * 2));
-            BinaryHelper.WriteUInt16(body, Grease.Group); // RFC 8701
+            BinaryHelper.WriteUInt16(body.Slice(2), Grease.Group); // RFC 8701
+            int off = 4;
             foreach (var g in groups)
-                BinaryHelper.WriteUInt16(body, (ushort)g);
-            WriteExtension(ms, ExtensionType.SupportedGroups, body.ToArray());
+            {
+                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)g);
+                off += 2;
+            }
+            WriteExtension(bw, ExtensionType.SupportedGroups, body);
         }
 
         // Signature Algorithms (for handshake signatures)
         {
-            SignatureScheme[] sigAlgs = {
+            ReadOnlySpan<SignatureScheme> sigAlgs = stackalloc SignatureScheme[] {
                 SignatureScheme.EcdsaSecp256r1Sha256,
                 SignatureScheme.EcdsaSecp384r1Sha384,
                 SignatureScheme.Ed25519,
                 SignatureScheme.RsaPssRsaeSha256,
                 SignatureScheme.RsaPssRsaeSha384
             };
-            using var body = new MemoryStream();
+            int bodyLen = 2 + (sigAlgs.Length + 1) * 2;
+            Span<byte> body = stackalloc byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)((sigAlgs.Length + 1) * 2));
-            BinaryHelper.WriteUInt16(body, Grease.SignatureAlgorithm); // RFC 8701
+            BinaryHelper.WriteUInt16(body.Slice(2), Grease.SignatureAlgorithm); // RFC 8701
+            int off = 4;
             foreach (var s in sigAlgs)
-                BinaryHelper.WriteUInt16(body, (ushort)s);
-            WriteExtension(ms, ExtensionType.SignatureAlgorithms, body.ToArray());
+            {
+                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)s);
+                off += 2;
+            }
+            WriteExtension(bw, ExtensionType.SignatureAlgorithms, body);
         }
 
         // Signature Algorithms Cert (RFC 8446 §4.2.3 + RFC 9963 §3 - for certificate verification)
         {
-            SignatureScheme[] certSigAlgs = {
+            ReadOnlySpan<SignatureScheme> certSigAlgs = stackalloc SignatureScheme[] {
                 SignatureScheme.EcdsaSecp256r1Sha256,
                 SignatureScheme.EcdsaSecp384r1Sha384,
                 SignatureScheme.Ed25519,
@@ -1108,88 +1128,98 @@ public static class HandshakeMessages
                 SignatureScheme.RsaPkcs1Sha384,
                 SignatureScheme.RsaPkcs1Sha512
             };
-            using var body = new MemoryStream();
+            int bodyLen = 2 + certSigAlgs.Length * 2;
+            Span<byte> body = stackalloc byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)(certSigAlgs.Length * 2));
+            int off = 2;
             foreach (var s in certSigAlgs)
-                BinaryHelper.WriteUInt16(body, (ushort)s);
-            WriteExtension(ms, ExtensionType.SignatureAlgorithmsCert, body.ToArray());
+            {
+                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)s);
+                off += 2;
+            }
+            WriteExtension(bw, ExtensionType.SignatureAlgorithmsCert, body);
         }
 
         // Cookie (from HRR, if present)
         if (cookie != null)
         {
-            using var body = new MemoryStream();
+            // length-prefixed cookie: 2 + cookie.Length
+            int bodyLen = 2 + cookie.Length;
+            Span<byte> body = bodyLen <= 256 ? stackalloc byte[bodyLen] : new byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)cookie.Length);
-            body.Write(cookie);
-            WriteExtension(ms, ExtensionType.Cookie, body.ToArray());
+            cookie.AsSpan().CopyTo(body.Slice(2));
+            WriteExtension(bw, ExtensionType.Cookie, body);
         }
 
         // Supported Versions (GREASE value first, then TLS 1.3 — RFC 8701)
         {
-            using var body = new MemoryStream();
-            body.WriteByte(4); // list length (two 2-byte versions)
-            BinaryHelper.WriteUInt16(body, Grease.Version);
-            BinaryHelper.WriteUInt16(body, TlsConst.Tls13Version);
-            WriteExtension(ms, ExtensionType.SupportedVersions, body.ToArray());
+            Span<byte> body = stackalloc byte[5];
+            body[0] = 4; // list length (two 2-byte versions)
+            BinaryHelper.WriteUInt16(body.Slice(1), Grease.Version);
+            BinaryHelper.WriteUInt16(body.Slice(3), TlsConst.Tls13Version);
+            WriteExtension(bw, ExtensionType.SupportedVersions, body);
         }
 
         // record_size_limit (RFC 8449): advertise our maximum receivable record plaintext size
         {
-            byte[] rsl = new byte[2];
-            BinaryHelper.WriteUInt16(rsl.AsSpan(), (ushort)TlsConst.MaxPlaintextLength);
-            WriteExtension(ms, ExtensionType.RecordSizeLimit, rsl);
+            Span<byte> rsl = stackalloc byte[2];
+            BinaryHelper.WriteUInt16(rsl, (ushort)TlsConst.MaxPlaintextLength);
+            WriteExtension(bw, ExtensionType.RecordSizeLimit, rsl);
         }
 
         // GREASE extension (RFC 8701): a reserved extension type with empty body
-        WriteExtension(ms, (ExtensionType)Grease.Extension, Array.Empty<byte>());
+        WriteExtension(bw, (ExtensionType)Grease.Extension, ReadOnlySpan<byte>.Empty);
 
         // PSK Key Exchange Modes
         {
-            using var body = new MemoryStream();
-            body.WriteByte(1);
-            body.WriteByte(0x01); // psk_dhe_ke
-            WriteExtension(ms, ExtensionType.PskKeyExchangeModes, body.ToArray());
+            ReadOnlySpan<byte> body = stackalloc byte[] { 1, 0x01 }; // length=1, psk_dhe_ke
+            WriteExtension(bw, ExtensionType.PskKeyExchangeModes, body);
         }
 
         // Key Share (all offered groups)
         {
-            using var body = new MemoryStream();
             int totalLen = 2 + 2 + 1; // GREASE entry: group(2) + len(2) + 1-byte key (RFC 8701)
             foreach (var (_, pubKey) in keyShares)
                 totalLen += 2 + 2 + pubKey.Length; // group(2) + len(2) + key
 
+            // body = listLen(2) + GREASE entry(5) + real entries
+            int bodyLen = 2 + totalLen;
+            // ML-KEM-768 key_share is ~1.2 KB; can exceed stack budget — guard.
+            Span<byte> body = bodyLen <= 256 ? stackalloc byte[bodyLen] : new byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)totalLen);
             // GREASE key_share entry (single zero byte), placed first
-            BinaryHelper.WriteUInt16(body, Grease.Group);
-            BinaryHelper.WriteUInt16(body, 1);
-            body.WriteByte(0x00);
+            BinaryHelper.WriteUInt16(body.Slice(2), Grease.Group);
+            BinaryHelper.WriteUInt16(body.Slice(4), 1);
+            body[6] = 0x00;
+            int off = 7;
             foreach (var (group, pubKey) in keyShares)
             {
-                BinaryHelper.WriteUInt16(body, (ushort)group);
-                BinaryHelper.WriteUInt16(body, (ushort)pubKey.Length);
-                body.Write(pubKey);
+                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)group); off += 2;
+                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)pubKey.Length); off += 2;
+                pubKey.AsSpan().CopyTo(body.Slice(off));
+                off += pubKey.Length;
             }
-            WriteExtension(ms, ExtensionType.KeyShare, body.ToArray());
+            WriteExtension(bw, ExtensionType.KeyShare, body);
         }
 
         // Early Data (must come before pre_shared_key)
         if (offerEarlyData)
         {
-            WriteExtension(ms, ExtensionType.EarlyData, Array.Empty<byte>());
+            WriteExtension(bw, ExtensionType.EarlyData, ReadOnlySpan<byte>.Empty);
         }
 
         // Ticket Request (RFC 9149 §3)
         if (ticketRequestCount > 0)
         {
-            byte[] trBody = new byte[2];
-            BinaryHelper.WriteUInt16(trBody.AsSpan(), ticketRequestCount);
-            WriteExtension(ms, ExtensionType.TicketRequest, trBody);
+            Span<byte> trBody = stackalloc byte[2];
+            BinaryHelper.WriteUInt16(trBody, ticketRequestCount);
+            WriteExtension(bw, ExtensionType.TicketRequest, trBody);
         }
 
         // Encrypted Client Hello (RFC 9849 §7)
         if (echExtensionData != null)
         {
-            WriteExtension(ms, ExtensionType.EncryptedClientHello, echExtensionData);
+            WriteExtension(bw, ExtensionType.EncryptedClientHello, echExtensionData);
         }
 
         // Pre-Shared Key (MUST be the last extension — RFC 8446 §4.2.11)
@@ -1197,21 +1227,21 @@ public static class HandshakeMessages
         {
             var (identity, age, binder) = psk.Value;
             byte[] pskData = BuildPreSharedKeyExtension(identity, age, binder);
-            WriteExtension(ms, ExtensionType.PreSharedKey, pskData);
+            WriteExtension(bw, ExtensionType.PreSharedKey, pskData);
         }
 
-        return ms.ToArray();
+        return bw.WrittenSpan.ToArray();
     }
 
-    private static void WriteExtension(MemoryStream ms, ExtensionType type, byte[] data)
+    private static void WriteExtension(IBufferWriter<byte> w, ExtensionType type, ReadOnlySpan<byte> data)
     {
-        BinaryHelper.WriteUInt16(ms, (ushort)type);
-        BinaryHelper.WriteUInt16(ms, (ushort)data.Length);
-        ms.Write(data);
+        BinaryHelper.WriteUInt16(w, (ushort)type);
+        BinaryHelper.WriteUInt16(w, (ushort)data.Length);
+        BinaryHelper.WriteBytes(w, data);
     }
 
     /// <summary>Write per-certificate extensions (RFC 8446 §4.4.2.1). If ocspResponse is provided, writes status_request extension wrapping the response in a CertificateStatus struct.</summary>
-    private static void WritePerCertExtensions(MemoryStream list, byte[]? ocspResponse)
+    private static void WritePerCertExtensions(IBufferWriter<byte> list, byte[]? ocspResponse)
     {
         if (ocspResponse != null)
         {
@@ -1220,21 +1250,20 @@ public static class HandshakeMessages
             //       CertificateStatusType status_type;  // uint8 = 1 (ocsp)
             //       opaque OCSPResponse<1..2^24-1>;
             //   } CertificateStatus;
-            using var certStatus = new MemoryStream();
-            certStatus.WriteByte(0x01); // status_type = ocsp(1)
-            BinaryHelper.WriteUInt24(certStatus, (uint)ocspResponse.Length);
-            certStatus.Write(ocspResponse);
-            byte[] certStatusBody = certStatus.ToArray();
-
-            using var extMs = new MemoryStream();
-            BinaryHelper.WriteUInt16(extMs, (ushort)ExtensionType.StatusRequest);
-            BinaryHelper.WriteUInt16(extMs, (ushort)certStatusBody.Length);
-            extMs.Write(certStatusBody);
-            byte[] extData = extMs.ToArray();
+            // certStatus layout: 1B status_type + 3B uint24 length + N bytes response
+            int certStatusLen = 1 + 3 + ocspResponse.Length;
+            // ext header (4B: type + length) + body
+            int extDataLen = 4 + certStatusLen;
 
             // extensions<0..2^16-1> list length prefix
-            BinaryHelper.WriteUInt16(list, (ushort)extData.Length);
-            list.Write(extData);
+            BinaryHelper.WriteUInt16(list, (ushort)extDataLen);
+            // extension header
+            BinaryHelper.WriteUInt16(list, (ushort)ExtensionType.StatusRequest);
+            BinaryHelper.WriteUInt16(list, (ushort)certStatusLen);
+            // CertificateStatus body
+            BinaryHelper.WriteByte(list, 0x01); // status_type = ocsp(1)
+            BinaryHelper.WriteUInt24(list, (uint)ocspResponse.Length);
+            BinaryHelper.WriteBytes(list, ocspResponse);
         }
         else
         {
@@ -1281,12 +1310,12 @@ public static class HandshakeMessages
         var (_, certBody) = Unframe(certMsg);
         byte[] compressed = CertificateCompression.Compress(certBody, algorithm);
 
-        using var ms = new MemoryStream();
-        BinaryHelper.WriteUInt16(ms, algorithm);
-        BinaryHelper.WriteUInt24(ms, (uint)certBody.Length); // uncompressed_length
-        BinaryHelper.WriteUInt24(ms, (uint)compressed.Length);
-        ms.Write(compressed);
-        return Frame(HandshakeType.CompressedCertificate, ms.ToArray());
+        var bw = new ArrayBufferWriter<byte>(8 + compressed.Length);
+        BinaryHelper.WriteUInt16(bw, algorithm);
+        BinaryHelper.WriteUInt24(bw, (uint)certBody.Length); // uncompressed_length
+        BinaryHelper.WriteUInt24(bw, (uint)compressed.Length);
+        BinaryHelper.WriteBytes(bw, compressed);
+        return Frame(HandshakeType.CompressedCertificate, bw.WrittenSpan.ToArray());
     }
 
     /// <summary>Parse a CompressedCertificate message body, decompress and return as Certificate body.</summary>

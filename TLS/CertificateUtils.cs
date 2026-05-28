@@ -624,6 +624,8 @@ public static class CertificateUtils
                     {
                         var (_, _, is512) = GostParams(scheme);
                         byte[] h = is512 ? GostCrypto.Streebog.Hash512(data) : GostCrypto.Streebog.Hash256(data);
+                        // NB: see GostEcdh for why we don't route through BC's GOST curves —
+                        // they fall back to generic FpCurve and end up worse than OpenGost.
                         using (var g = ImportGostKey(null, publicKey, scheme))
                             return g.VerifyHash(h, signature);
                     }

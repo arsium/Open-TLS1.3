@@ -1,8 +1,8 @@
 namespace TLS;
 
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using Org.BouncyCastle.Asn1;
-using Org.BouncyCastle.Asn1.Sec;
 using Org.BouncyCastle.Asn1.X9;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Digests;
@@ -30,21 +30,47 @@ internal sealed class EcdsaManaged : IDisposable
 
     private EcdsaManaged() { }
 
-    /// <summary>Empty instance — caller imports parameters after.</summary>
-    public static EcdsaManaged Create() => new EcdsaManaged
+    // Cache (X9ECParameters, ECDomainParameters) per NIST curve so that:
+    //   - we don't re-construct ECDomainParameters per call (~10-50 KB each)
+    //   - W-NAF / comb table precomputation on the basepoint persists across calls
+    //     (BC stores it on the curve instance, which is shared via CustomNamedCurves).
+    private static readonly ConcurrentDictionary<string, (X9ECParameters parms, ECDomainParameters domain)> _curveCache = new();
+
+    // Per-thread SecureRandom — same rationale as in EcdhManaged: BC's default ctor
+    // builds a fresh DRBG every call, costing ~1-2 KB. ThreadStatic dodges contention
+    // while keeping each thread's DRBG hot.
+    [ThreadStatic] private static SecureRandom? _tlsRandom;
+    private static SecureRandom Random => _tlsRandom ??= new SecureRandom();
+
+    private static (X9ECParameters parms, ECDomainParameters domain) GetCurve(string secName)
     {
-        _curveParams = SecNamedCurves.GetByName("secp256r1"),
-        _curveName = "secp256r1",
-    };
+        return _curveCache.GetOrAdd(secName, n =>
+        {
+            var p = CustomNamedCurves.GetByName(n)
+                ?? throw new CryptographicException($"BC curve lookup failed for {n}");
+            return (p, new ECDomainParameters(p));
+        });
+    }
+
+    /// <summary>Empty instance — caller imports parameters after.</summary>
+    public static EcdsaManaged Create()
+    {
+        var (parms, _) = GetCurve("secp256r1");
+        return new EcdsaManaged
+        {
+            _curveParams = parms,
+            _curveName = "secp256r1",
+        };
+    }
 
     /// <summary>Mirrors ECDsa.Create(curve): generate a fresh keypair on the named curve.</summary>
     public static EcdsaManaged Create(string curveOid)
     {
-        var (name, parms) = LookupCurve(curveOid);
-        var domain = new ECDomainParameters(parms);
+        var (name, _) = LookupCurve(curveOid);
+        var (parms, domain) = GetCurve(name);
 
         var gen = new ECKeyPairGenerator();
-        gen.Init(new ECKeyGenerationParameters(domain, new SecureRandom()));
+        gen.Init(new ECKeyGenerationParameters(domain, Random));
         var pair = gen.GenerateKeyPair();
         return new EcdsaManaged
         {
@@ -58,8 +84,8 @@ internal sealed class EcdsaManaged : IDisposable
     /// <summary>Import from raw scalar D and uncompressed point Q (0x04 || X || Y).</summary>
     public void ImportFromComponents(string curveOid, byte[]? d, byte[] uncompressedQ)
     {
-        var (name, parms) = LookupCurve(curveOid);
-        var domain = new ECDomainParameters(parms);
+        var (name, _) = LookupCurve(curveOid);
+        var (parms, domain) = GetCurve(name);
         _curveParams = parms;
         _curveName = name;
 
@@ -91,7 +117,7 @@ internal sealed class EcdsaManaged : IDisposable
         digest.DoFinal(hash, 0);
 
         var signer = new ECDsaSigner();
-        signer.Init(true, new ParametersWithRandom(_priv, new SecureRandom()));
+        signer.Init(true, new ParametersWithRandom(_priv, Random));
         BcBigInteger[] rs = signer.GenerateSignature(hash);
         var seq = new DerSequence(new DerInteger(rs[0]), new DerInteger(rs[1]));
         return seq.GetEncoded();
@@ -101,19 +127,25 @@ internal sealed class EcdsaManaged : IDisposable
     public bool VerifyDataDer(byte[] data, byte[] derSignature, HashAlgorithmName hashAlg)
     {
         if (_pub == null) throw new CryptographicException("No public key available");
+        HandshakePhaseHook.Mark("ecdsa/verify/enter");
         IDigest digest = NewDigest(hashAlg);
         byte[] hash = new byte[digest.GetDigestSize()];
         digest.BlockUpdate(data, 0, data.Length);
         digest.DoFinal(hash, 0);
+        HandshakePhaseHook.Mark("ecdsa/verify/after-hash");
 
         try
         {
             var seq = Asn1Sequence.GetInstance(Asn1Object.FromByteArray(derSignature));
             var r = ((DerInteger)seq[0]).Value;
             var s = ((DerInteger)seq[1]).Value;
+            HandshakePhaseHook.Mark("ecdsa/verify/after-asn1-decode");
             var verifier = new ECDsaSigner();
             verifier.Init(false, _pub);
-            return verifier.VerifySignature(hash, r, s);
+            HandshakePhaseHook.Mark("ecdsa/verify/after-init");
+            bool ok = verifier.VerifySignature(hash, r, s);
+            HandshakePhaseHook.Mark("ecdsa/verify/after-VerifySignature");
+            return ok;
         }
         catch
         {
@@ -141,9 +173,12 @@ internal sealed class EcdsaManaged : IDisposable
             "1.3.132.0.35" or "secp521r1" or "nistP521" or "P-521" => "secp521r1",
             _ => throw new CryptographicException($"Unsupported curve: {nameOrOid}")
         };
-        // CustomNamedCurves provides the W-NAF-preconfigured basepoint that the EC key
-        // generator's safety check relies on.
-        var p = SecNamedCurves.GetByName(sec);
+        // CustomNamedCurves provides the curve-specific optimized field arithmetic
+        // (e.g. SecP256R1Curve with Mersenne-style reduction) PLUS cached basepoint
+        // W-NAF / comb tables. Using SecNamedCurves instead uses the generic FpCurve
+        // path which re-precomputes scalar-mult tables per call — measured at ~4.4 MB
+        // per ECDSA verify (~99% of the entire default TLS handshake allocation budget).
+        var p = CustomNamedCurves.GetByName(sec);
         if (p == null) throw new CryptographicException($"BC curve lookup failed for {sec}");
         return (sec, p);
     }

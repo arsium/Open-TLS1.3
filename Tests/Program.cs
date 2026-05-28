@@ -1,8 +1,20 @@
 using Tests;
 
+if (args.Contains("mintest"))
+{
+    MinTLS.MinBcTest.Run();
+    return 0;
+}
+
 if (args.Contains("bench"))
 {
     Benchmark.Run();
+    return 0;
+}
+
+if (args.Contains("profile"))
+{
+    Profile.Run();
     return 0;
 }
 
