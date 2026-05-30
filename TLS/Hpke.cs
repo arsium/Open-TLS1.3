@@ -4,7 +4,8 @@ using System.Security.Cryptography;
 
 /// <summary>
 /// HPKE (Hybrid Public Key Encryption) implementation per RFC 9180.
-/// Supports DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM.
+/// DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + AEAD ∈ {AES-128-GCM, ChaCha20Poly1305}.
+/// The AEAD is selectable (ECH needs both); the KEM and KDF are fixed.
 /// </summary>
 public static class Hpke
 {
@@ -12,13 +13,21 @@ public static class Hpke
     public const ushort KEM_DHKEM_X25519_HKDF_SHA256 = 0x0020;
     public const ushort KDF_HKDF_SHA256 = 0x0001;
     public const ushort AEAD_AES_128_GCM = 0x0001;
+    public const ushort AEAD_CHACHA20_POLY1305 = 0x0003;
 
     // Algorithm parameters
-    private const int Nk = 16;  // AES-128 key size
-    private const int Nn = 12;  // AES-GCM nonce size
+    private const int Nn = 12;  // AEAD nonce size (12 for both AES-GCM and ChaCha20Poly1305)
     private const int Nh = 32;  // SHA-256 hash size
     private const int Nsecret = 32; // X25519 shared secret size
     private const int Nenc = 32;   // X25519 encoded public key size
+
+    /// <summary>AEAD key length Nk for the given HPKE AEAD id (RFC 9180 §7.3).</summary>
+    internal static int AeadKeyLength(ushort aeadId) => aeadId switch
+    {
+        AEAD_AES_128_GCM => 16,
+        AEAD_CHACHA20_POLY1305 => 32,
+        _ => throw new NotSupportedException($"HPKE AEAD 0x{aeadId:x4} not supported")
+    };
 
     // HPKE labels for HKDF-Expand-Label
     private const string HPKE_V1_LABEL = "HPKE-v1";
@@ -28,33 +37,40 @@ public static class Hpke
     {
         private readonly byte[] _key;
         private readonly byte[] _baseNonce;
+        private readonly ushort _aeadId;
         private ulong _sequenceNumber;
         private readonly object _lock = new();
 
-        internal HpkeContext(byte[] key, byte[] baseNonce)
+        internal HpkeContext(byte[] key, byte[] baseNonce, ushort aeadId)
         {
             _key = key;
             _baseNonce = baseNonce;
+            _aeadId = aeadId;
             _sequenceNumber = 0;
         }
 
-        /// <summary>Seal (encrypt) plaintext with associated data.</summary>
+        /// <summary>Seal (encrypt) plaintext with associated data. Output is ciphertext||tag.</summary>
         public byte[] Seal(byte[] aad, byte[] plaintext)
         {
             lock (_lock)
             {
                 byte[] nonce = ComputeNonce(_sequenceNumber++);
-
-                // AesGcmManaged.Encrypt now writes ciphertext||tag straight into a single
-                // output span — no separate scratch buffers and no concatenation copy.
                 byte[] result = new byte[plaintext.Length + 16];
-                using var aes = new AesGcmManaged(_key, 16);
-                aes.Encrypt(nonce, plaintext, result, aad);
+                if (_aeadId == AEAD_CHACHA20_POLY1305)
+                {
+                    using var c = new ChaCha20Poly1305Managed(_key);
+                    c.Encrypt(nonce, plaintext, result, aad);
+                }
+                else
+                {
+                    using var aes = new AesGcmManaged(_key, 16);
+                    aes.Encrypt(nonce, plaintext, result, aad);
+                }
                 return result;
             }
         }
 
-        /// <summary>Open (decrypt) ciphertext with associated data.</summary>
+        /// <summary>Open (decrypt) ciphertext||tag with associated data. Null on auth failure.</summary>
         public byte[]? Open(byte[] aad, byte[] ciphertext)
         {
             if (ciphertext.Length < 16) return null; // Too short for tag
@@ -62,15 +78,20 @@ public static class Hpke
             lock (_lock)
             {
                 byte[] nonce = ComputeNonce(_sequenceNumber++);
-
-                int plaintextLen = ciphertext.Length - 16;
-                byte[] plaintext = new byte[plaintextLen];
+                byte[] plaintext = new byte[ciphertext.Length - 16];
 
                 try
                 {
-                    using var aes = new AesGcmManaged(_key, 16);
-                    // Pass the full ct||tag span; Decrypt slices internally.
-                    aes.Decrypt(nonce, ciphertext, plaintext, aad);
+                    if (_aeadId == AEAD_CHACHA20_POLY1305)
+                    {
+                        using var c = new ChaCha20Poly1305Managed(_key);
+                        c.Decrypt(nonce, ciphertext, plaintext, aad);
+                    }
+                    else
+                    {
+                        using var aes = new AesGcmManaged(_key, 16);
+                        aes.Decrypt(nonce, ciphertext, plaintext, aad);
+                    }
                     return plaintext;
                 }
                 catch (CryptographicException)
@@ -162,38 +183,28 @@ public static class Hpke
     /// <summary>HPKE Key Schedule for deriving encryption keys.</summary>
     public static class KeySchedule
     {
-        /// <summary>Setup sender context (mode_base = 0x00).</summary>
-        public static (byte[] enc, HpkeContext context) SetupBaseSender(byte[] pkR, byte[] info)
+        /// <summary>Setup sender context (mode_base = 0x00). aeadId selects AES-128-GCM (default) or ChaCha20Poly1305.</summary>
+        public static (byte[] enc, HpkeContext context) SetupBaseSender(byte[] pkR, byte[] info, ushort aeadId = AEAD_AES_128_GCM)
         {
             var (enc, sharedSecret) = DhKem.Encap(pkR);
-            var context = KeyScheduleS(0x00, sharedSecret, info);
+            var context = KeyScheduleBase(0x00, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>(), aeadId);
             CryptographicOperations.ZeroMemory(sharedSecret);
             return (enc, context);
         }
 
         /// <summary>Setup receiver context (mode_base = 0x00).</summary>
-        public static HpkeContext SetupBaseReceiver(byte[] enc, byte[] skR, byte[] info)
+        public static HpkeContext SetupBaseReceiver(byte[] enc, byte[] skR, byte[] info, ushort aeadId = AEAD_AES_128_GCM)
         {
             byte[] sharedSecret = DhKem.Decap(enc, skR);
-            var context = KeyScheduleR(0x00, sharedSecret, info);
+            var context = KeyScheduleBase(0x00, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>(), aeadId);
             CryptographicOperations.ZeroMemory(sharedSecret);
             return context;
         }
 
-        private static HpkeContext KeyScheduleS(byte mode, byte[] sharedSecret, byte[] info)
-        {
-            return KeyScheduleBase(mode, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>());
-        }
-
-        private static HpkeContext KeyScheduleR(byte mode, byte[] sharedSecret, byte[] info)
-        {
-            return KeyScheduleBase(mode, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>());
-        }
-
-        private static HpkeContext KeyScheduleBase(byte mode, byte[] sharedSecret, byte[] info, byte[] psk, byte[] pskId)
+        private static HpkeContext KeyScheduleBase(byte mode, byte[] sharedSecret, byte[] info, byte[] psk, byte[] pskId, ushort aeadId)
         {
             // RFC 9180 §5.1: Key Schedule
-            string suiteId = BuildSuiteId();
+            string suiteId = BuildSuiteId(aeadId);
             byte[] suiteIdBytes = System.Text.Encoding.UTF8.GetBytes(suiteId);
 
             // Verify PSK inputs
@@ -207,19 +218,19 @@ public static class Hpke
 
             byte[] secret = LabeledExtract(sharedSecret, "secret", psk, suiteIdBytes);
 
-            byte[] key = LabeledExpand(secret, "key", keyScheduleContext, Nk, suiteIdBytes);
+            byte[] key = LabeledExpand(secret, "key", keyScheduleContext, AeadKeyLength(aeadId), suiteIdBytes);
             byte[] baseNonce = LabeledExpand(secret, "base_nonce", keyScheduleContext, Nn, suiteIdBytes);
 
             CryptographicOperations.ZeroMemory(secret);
-            return new HpkeContext(key, baseNonce);
+            return new HpkeContext(key, baseNonce, aeadId);
         }
 
-        private static string BuildSuiteId()
+        private static string BuildSuiteId(ushort aeadId)
         {
             return "HPKE" +
                    ((char)(KEM_DHKEM_X25519_HKDF_SHA256 >> 8)) + ((char)(KEM_DHKEM_X25519_HKDF_SHA256 & 0xFF)) +
                    ((char)(KDF_HKDF_SHA256 >> 8)) + ((char)(KDF_HKDF_SHA256 & 0xFF)) +
-                   ((char)(AEAD_AES_128_GCM >> 8)) + ((char)(AEAD_AES_128_GCM & 0xFF));
+                   ((char)(aeadId >> 8)) + ((char)(aeadId & 0xFF));
         }
     }
 

@@ -88,7 +88,8 @@ public static class HandshakeMessages
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
         string? serverName, byte[]? cookie,
         (byte[] identity, uint age, byte[] binder)? psk, bool offerEarlyData,
-        string[]? alpnProtocols, bool requestOcspStapling, ushort ticketRequestCount = 0)
+        string[]? alpnProtocols, bool requestOcspStapling, ushort ticketRequestCount = 0,
+        byte[]? echExtensionData = null)
     {
         // ClientHello body fits comfortably in 1-2 KB without PSK; pre-size to avoid
         // most internal regrowths inside ArrayBufferWriter.
@@ -108,7 +109,7 @@ public static class HandshakeMessages
         BinaryHelper.WriteByte(bw, 1); BinaryHelper.WriteByte(bw, 0); // compression_methods = {null}
 
         byte[] ext = BuildClientHelloExtensions(keyShares, serverName, cookie,
-            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, null);
+            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, echExtensionData);
         BinaryHelper.WriteUInt16(bw, (ushort)ext.Length);       // extensions length
         BinaryHelper.WriteBytes(bw, ext);
 
@@ -151,6 +152,7 @@ public static class HandshakeMessages
         SignatureScheme[]? sigAlgsCert = null;
         byte[]? echData = null;
         bool isOuterCH = false;
+        bool offersPskDheKe = false;
 
         if (p < body.Length)
         {
@@ -250,6 +252,19 @@ public static class HandshakeMessages
                     if (ed.Length >= 2)
                         ticketRequestCount = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                 }
+                else if (et == ExtensionType.PskKeyExchangeModes)
+                {
+                    // RFC 8446 §4.2.9: ke_modes<1..255> — list-length byte then 1 byte per mode.
+                    // We only do psk_dhe_ke (0x01); record whether the client advertised it so the
+                    // server can (a) gate PSK selection on it and (b) decide to issue tickets.
+                    if (ed.Length >= 1)
+                    {
+                        int modesLen = ed[0];
+                        EnsureRemaining(ed, 1, modesLen, "psk_key_exchange_modes list");
+                        for (int m = 0; m < modesLen; m++)
+                            if (ed[1 + m] == 0x01) offersPskDheKe = true; // psk_dhe_ke
+                    }
+                }
                 else if (et == ExtensionType.SignatureAlgorithmsCert)
                 {
                     // RFC 8446 §4.2.3: signature_algorithms_cert extension
@@ -292,7 +307,8 @@ public static class HandshakeMessages
             RecordSizeLimit = recordSizeLimit,
             SignatureAlgorithmsCert = sigAlgsCert,
             EncryptedClientHelloData = echData,
-            IsOuterClientHello = isOuterCH
+            IsOuterClientHello = isOuterCH,
+            OffersPskDheKe = offersPskDheKe
         };
     }
 
@@ -334,7 +350,8 @@ public static class HandshakeMessages
     }
 
     /// <summary>Build a HelloRetryRequest (encoded as ServerHello with sentinel random).</summary>
-    public static byte[] BuildHelloRetryRequest(byte[] sessionId, CipherSuite suite, NamedGroup requestedGroup)
+    public static byte[] BuildHelloRetryRequest(byte[] sessionId, CipherSuite suite, NamedGroup requestedGroup,
+        bool withEch = false)
     {
         var bw = new ArrayBufferWriter<byte>(128);
 
@@ -352,6 +369,10 @@ public static class HandshakeMessages
         WriteExtension(ebw, ExtensionType.SupportedVersions, UInt16Bytes(TlsConst.Tls13Version));
         // key_share for HRR: just the selected group (2 bytes)
         WriteExtension(ebw, ExtensionType.KeyShare, UInt16Bytes((ushort)requestedGroup));
+        // ECH HRR accept-confirmation (draft §7.2.1): 8 bytes, written last so the framed message's
+        // tail-8 bytes are the confirmation (the caller computes + patches them).
+        if (withEch)
+            WriteExtension(ebw, ExtensionType.EncryptedClientHello, new byte[8]);
 
         BinaryHelper.WriteUInt16(bw, (ushort)ebw.WrittenCount);
         BinaryHelper.WriteBytes(bw, ebw.WrittenSpan);
@@ -437,7 +458,7 @@ public static class HandshakeMessages
 
     public static byte[] BuildEncryptedExtensions(bool acceptEarlyData = false,
         string? alpnProtocol = null, ushort certCompressionAlgorithm = 0,
-        ushort recordSizeLimit = 0)
+        ushort recordSizeLimit = 0, byte[]? echRetryConfigs = null)
     {
         var bw = new ArrayBufferWriter<byte>(64);
         var ext = new ArrayBufferWriter<byte>(48);
@@ -471,6 +492,10 @@ public static class HandshakeMessages
             WriteExtension(ext, ExtensionType.CertificateCompression, ccBody);
         }
 
+        // ECH retry_configs (draft §7.1): on ECH reject, hand the client a fresh ECHConfigList.
+        if (echRetryConfigs != null)
+            WriteExtension(ext, ExtensionType.EncryptedClientHello, echRetryConfigs);
+
         BinaryHelper.WriteUInt16(bw, (ushort)ext.WrittenCount);
         if (ext.WrittenCount > 0) BinaryHelper.WriteBytes(bw, ext.WrittenSpan);
         return Frame(HandshakeType.EncryptedExtensions, bw.WrittenSpan.ToArray());
@@ -483,6 +508,7 @@ public static class HandshakeMessages
         string? alpn = null;
         ushort certComp = 0;
         ushort recordSizeLimit = 0;
+        byte[]? echRetryConfigs = null;
 
         int p = 0;
         if (body.Length < 2) return new ParsedEncryptedExtensions();
@@ -507,6 +533,10 @@ public static class HandshakeMessages
             {
                 recordSizeLimit = BinaryHelper.ReadUInt16(ed.AsSpan());
             }
+            else if (et == ExtensionType.EncryptedClientHello)
+            {
+                echRetryConfigs = ed.ToArray(); // ECH retry_configs = an ECHConfigList
+            }
         }
 
         return new ParsedEncryptedExtensions
@@ -514,7 +544,8 @@ public static class HandshakeMessages
             AcceptEarlyData = earlyData,
             AlpnProtocol = alpn,
             CertCompressionAlgorithm = certComp,
-            RecordSizeLimit = recordSizeLimit
+            RecordSizeLimit = recordSizeLimit,
+            EchRetryConfigs = echRetryConfigs
         };
     }
 
@@ -563,7 +594,7 @@ public static class HandshakeMessages
 
     /// <summary>Build a CertificateRequest message (server → client, mTLS).</summary>
     public static byte[] BuildCertificateRequest(byte[] context, SignatureScheme[] sigAlgorithms,
-        SignatureScheme[]? certSigAlgorithms = null)
+        SignatureScheme[]? certSigAlgorithms = null, ushort[]? certCompAlgs = null)
     {
         var bw = new ArrayBufferWriter<byte>(128);
         BinaryHelper.WriteByte(bw, (byte)context.Length);
@@ -585,10 +616,51 @@ public static class HandshakeMessages
             WriteExtension(ext, ExtensionType.SignatureAlgorithmsCert, certSigBody.WrittenSpan);
         }
 
+        // RFC 8879: compress_certificate in CertificateRequest advertises the algorithms the SERVER
+        // can decompress, letting the client compress its own (mTLS) certificate.
+        if (certCompAlgs != null && certCompAlgs.Length > 0)
+        {
+            var ccBody = new ArrayBufferWriter<byte>(1 + certCompAlgs.Length * 2);
+            BinaryHelper.WriteByte(ccBody, (byte)(certCompAlgs.Length * 2));
+            foreach (var a in certCompAlgs) BinaryHelper.WriteUInt16(ccBody, a);
+            WriteExtension(ext, ExtensionType.CertificateCompression, ccBody.WrittenSpan);
+        }
+
         BinaryHelper.WriteUInt16(bw, (ushort)ext.WrittenCount);
         BinaryHelper.WriteBytes(bw, ext.WrittenSpan);
 
         return Frame(HandshakeType.CertificateRequest, bw.WrittenSpan.ToArray());
+    }
+
+    /// <summary>Extract the compress_certificate algorithms advertised in a CertificateRequest body
+    /// (RFC 8879), or null if absent/malformed. Standalone so the existing ParseCertificateRequest
+    /// callers don't need to change.</summary>
+    public static ushort[]? ParseCertReqCertCompression(byte[] body)
+    {
+        try
+        {
+            int p = 0;
+            if (body.Length < 1) return null;
+            int ctxLen = body[p++];
+            if (p + ctxLen + 2 > body.Length) return null;
+            p += ctxLen;
+            ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+            int extEnd = Math.Min(p + extLen, body.Length);
+            while (p < extEnd)
+            {
+                var (et, ed, np) = ReadExtension(body, p); p = np;
+                if (et == ExtensionType.CertificateCompression && ed.Length >= 1)
+                {
+                    int n = ed[0];
+                    if ((n & 1) != 0 || 1 + n > ed.Length) return null;
+                    var algs = new ushort[n / 2];
+                    for (int i = 0; i < algs.Length; i++) algs[i] = BinaryHelper.ReadUInt16(ed.AsSpan(1 + i * 2));
+                    return algs;
+                }
+            }
+        }
+        catch (TlsException) { /* malformed — treat as not advertised */ }
+        return null;
     }
 
     /// <summary>Parse a CertificateRequest message body.</summary>
@@ -1065,20 +1137,23 @@ public static class HandshakeMessages
             WriteExtension(bw, ExtensionType.Alpn, body.WrittenSpan);
         }
 
-        // Certificate Compression (advertise brotli = 0x0002, zstd = 0x0003)
+        // Certificate Compression (advertise brotli = 0x0002, zstd = 0x0003, zlib = 0x0001).
+        // Order = preference; the server picks the first it supports. zlib last (lowest ratio) —
+        // it's the RFC 8879 baseline some peers only offer.
         {
-            Span<byte> ccBody = stackalloc byte[5];
-            ccBody[0] = 4; // byte length of algorithms list (two 2-byte entries)
+            Span<byte> ccBody = stackalloc byte[7];
+            ccBody[0] = 6; // byte length of algorithms list (three 2-byte entries)
             BinaryHelper.WriteUInt16(ccBody.Slice(1), 0x0002); // brotli
             BinaryHelper.WriteUInt16(ccBody.Slice(3), 0x0003); // zstd
+            BinaryHelper.WriteUInt16(ccBody.Slice(5), 0x0001); // zlib
             WriteExtension(bw, ExtensionType.CertificateCompression, ccBody);
         }
 
         // Supported Groups
         {
             ReadOnlySpan<NamedGroup> groups = stackalloc NamedGroup[] {
-                NamedGroup.X25519MLKEM768, NamedGroup.X25519, NamedGroup.X448,
-                NamedGroup.Secp256r1, NamedGroup.Secp384r1
+                NamedGroup.X25519MLKEM768, NamedGroup.SecP256r1MLKEM768, NamedGroup.SecP384r1MLKEM1024,
+                NamedGroup.X25519, NamedGroup.X448, NamedGroup.Secp256r1, NamedGroup.Secp384r1
             };
             int bodyLen = 2 + (groups.Length + 1) * 2; // listLen + GREASE + groups
             Span<byte> body = stackalloc byte[bodyLen];
@@ -1356,6 +1431,7 @@ public sealed class ParsedClientHello
     public SignatureScheme[]? SignatureAlgorithmsCert { get; init; }
     public byte[]? EncryptedClientHelloData { get; init; }  // ECH extension payload
     public bool IsOuterClientHello { get; init; }           // True if this is an ECH outer ClientHello
+    public bool OffersPskDheKe { get; init; }               // RFC 8446 §4.2.9: client advertised psk_dhe_ke
 }
 
 /// <summary>A certificate entry from a TLS Certificate message, with optional per-cert extensions.</summary>
@@ -1392,4 +1468,5 @@ public sealed class ParsedEncryptedExtensions
     public string? AlpnProtocol { get; init; }
     public ushort CertCompressionAlgorithm { get; init; }
     public ushort RecordSizeLimit { get; init; } // RFC 8449; 0 = not negotiated
+    public byte[]? EchRetryConfigs { get; init; } // ECH retry_configs (draft §7.1), an ECHConfigList
 }

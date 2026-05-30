@@ -39,9 +39,30 @@ public static class LoopbackTests
 
         Section("Loopback: mTLS (client certificate)");
         MutualTls(ca, ecCert);
+        MutualTls(ca, ecCert, useCompression: true);
 
         Section("Loopback: RFC 8879 certificate compression (BrotliSharpLib + ZstdSharp)");
         HandshakeWithCertCompression("compressed cert handshake", ecCert);
+
+        Section("Loopback: hybrid post-quantum key exchange (draft-ietf-tls-ecdhe-mlkem)");
+        Handshake("X25519MLKEM768 hybrid + AES-256-GCM", ecCert, null, new[] { NamedGroup.X25519MLKEM768 }, 1024);
+        Handshake("X25519MLKEM768 hybrid large (40KB)", ecCert, null, new[] { NamedGroup.X25519MLKEM768 }, 40000);
+        Handshake("SecP256r1MLKEM768 hybrid (ECDH-first) + AES-256-GCM", ecCert, null, new[] { NamedGroup.SecP256r1MLKEM768 }, 1024);
+        Handshake("SecP256r1MLKEM768 hybrid large (40KB)", ecCert, null, new[] { NamedGroup.SecP256r1MLKEM768 }, 40000);
+        Handshake("SecP384r1MLKEM1024 hybrid (P-384 + ML-KEM-1024) + AES-256-GCM", ecCert, null, new[] { NamedGroup.SecP384r1MLKEM1024 }, 1024);
+        Handshake("SecP384r1MLKEM1024 hybrid large (40KB)", ecCert, null, new[] { NamedGroup.SecP384r1MLKEM1024 }, 40000);
+        MlKemRoundTrip();
+
+        Section("Loopback: async handshake paths (ConnectAsync / AcceptAsync)");
+        AsyncHandshake("async X25519 default", ecCert, null, 1024);
+        AsyncHandshake("async X25519MLKEM768 hybrid", ecCert, new[] { NamedGroup.X25519MLKEM768 }, 4096);
+        AsyncHandshake("async SecP256r1MLKEM768 hybrid", ecCert, new[] { NamedGroup.SecP256r1MLKEM768 }, 4096);
+
+        Section("Loopback: session resumption + 0-RTT early data (RFC 8446 §4.6.1 / §4.2.10 / §8)");
+        ResumptionAndEarlyData("resumption + 0-RTT", ecCert);
+
+        EchHandshake(ecCert);
+        ForceHrrHandshake(ecCert);
 
         Section("Record layer: malformed records rejected cleanly (RFC 8446 §5.2)");
         MalformedRecordRejection();
@@ -301,11 +322,331 @@ public static class LoopbackTests
         finally { srv.Wait(6000); server.Stop(); }
     }
 
-    private static void MutualTls(TlsCertificate ca, TlsCertificate serverCert)
+    // ML-KEM-768 (FIPS 203) primitive round-trip + implicit-rejection check. The hybrid TLS group
+    // rides on this; a regression here would silently break X25519MLKEM768 key agreement.
+    private static void MlKemRoundTrip()
+    {
+        var (ek, dk) = MlKem768.KeyGen();
+        var (ssEncaps, ct) = MlKem768.Encaps(ek);
+        byte[] ssDecaps = MlKem768.Decaps(dk, ct);
+        Check("ML-KEM-768 sizes (ek=1184, dk=2400, ct=1088, ss=32)",
+            ek.Length == 1184 && dk.Length == 2400 && ct.Length == 1088 && ssEncaps.Length == 32);
+        Check("ML-KEM-768 Encaps/Decaps shared-secret agreement", Eqb(ssEncaps, ssDecaps));
+
+        // FIPS 203 implicit rejection: a tampered ciphertext must decapsulate to a pseudo-random
+        // secret (derived from the dk's rejection key z), NOT the original — and never throw.
+        ct[0] ^= 0xFF;
+        byte[] ssBad = MlKem768.Decaps(dk, ct);
+        Check("ML-KEM-768 implicit rejection on corrupted ciphertext", !Eqb(ssBad, ssEncaps));
+    }
+
+    // Exercises true PSK resumption + 0-RTT early data + 0-RTT anti-replay end-to-end — paths that
+    // had no runtime coverage before. The server now issues NewSessionTickets unsolicited (RFC 8446
+    // §4.6.1) once the client advertises psk_dhe_ke, so resumption bootstraps with no special client
+    // config beyond a TicketStore.
+    private static void ResumptionAndEarlyData(string name, TlsCertificate cert)
+    {
+        int port = ++_port;
+        var server = new TlsServer(cert)
+        {
+            TicketEncryption = new TicketEncryption(),
+            Accept0Rtt = true,
+            MaxEarlyDataSize = 16384,
+        };
+        server.Listen(port);
+
+        var serverEarly = new byte[3][];
+        string? serverErr = null;
+        var srv = Task.Run(() =>
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                try
+                {
+                    using var s = server.Accept();
+                    serverEarly[i] = s.ReceivedEarlyData ?? Array.Empty<byte>();
+                    var b = new byte[1024];
+                    int n = s.Read(b);
+                    if (n > 0) s.Write(b, 0, n);
+                    Thread.Sleep(50);
+                }
+                catch (Exception e) { serverErr ??= $"conn{i}: {e.GetType().Name}: {e.Message}"; }
+            }
+        });
+
+        try
+        {
+            // conn1 — full handshake. The post-handshake NewSessionTickets arrive before the echo on
+            // the wire, so reading the echo also pumps them into the store via the ticket callback.
+            var s1 = new SessionTicketStore();
+            using (var st1 = new TlsClient { HandshakeTimeoutMs = 12000, TicketStore = s1 }.Connect("localhost", port))
+            {
+                var m = Encoding.ASCII.GetBytes("full");
+                st1.Write(m);
+                var buf = new byte[1024]; int got = st1.Read(buf);
+                Check($"{name}: conn1 echo (full handshake)", got == m.Length && buf.AsSpan(0, got).SequenceEqual(m));
+                Check($"{name}: conn1 NOT resumed", !st1.IsResumed);
+            }
+
+            var ticket = s1.Get("localhost");
+            Check($"{name}: server issued a ticket unsolicited", ticket != null);
+            if (ticket == null) return;
+
+            // conn2 — resume with 0-RTT early data; the server must accept and surface it.
+            byte[] early = Encoding.ASCII.GetBytes("zero-rtt-early-data");
+            var s2 = new SessionTicketStore(); s2.Add("localhost", ticket);
+            using (var st2 = new TlsClient { HandshakeTimeoutMs = 12000, TicketStore = s2 }.Connect("localhost", port, earlyData: early))
+            {
+                Check($"{name}: conn2 resumed (PSK)", st2.IsResumed);
+                Check($"{name}: conn2 0-RTT accepted by client", st2.EarlyDataAccepted);
+                var m = Encoding.ASCII.GetBytes("after");
+                st2.Write(m);
+                var buf = new byte[1024]; int got = st2.Read(buf);
+                Check($"{name}: conn2 1-RTT echo", got == m.Length && buf.AsSpan(0, got).SequenceEqual(m));
+            }
+            Check($"{name}: server received the 0-RTT data",
+                serverEarly[1].AsSpan().SequenceEqual(early));
+
+            // conn3 — replay the SAME ticket with 0-RTT. Resumption still succeeds, but the early data
+            // MUST be refused (single-use anti-replay, RFC 8446 §8).
+            var s3 = new SessionTicketStore(); s3.Add("localhost", ticket);
+            using (var st3 = new TlsClient { HandshakeTimeoutMs = 12000, TicketStore = s3 }.Connect("localhost", port, earlyData: early))
+            {
+                Check($"{name}: conn3 resumed (PSK)", st3.IsResumed);
+                Check($"{name}: conn3 0-RTT replay REFUSED", !st3.EarlyDataAccepted);
+                var m = Encoding.ASCII.GetBytes("again");
+                st3.Write(m);
+                var buf = new byte[1024]; int got = st3.Read(buf);
+                Check($"{name}: conn3 1-RTT echo after replay refusal", got == m.Length && buf.AsSpan(0, got).SequenceEqual(m));
+            }
+            Check($"{name}: server did NOT surface replayed early data", serverEarly[2].Length == 0);
+        }
+        catch (Exception e) { Check($"{name} [{e.GetType().Name}: {e.Message}] | server: {serverErr}", false); }
+        finally { srv.Wait(12000); server.Stop(); }
+    }
+
+    // Encrypted Client Hello (draft-esni-18): the client HPKE-seals a real-SNI ClientHelloInner under
+    // the server's ECHConfig; the server decrypts and both drive the handshake off the inner CH, with
+    // the §7.2 accept-confirmation binding it. A successful echo proves the inner transcript matched on
+    // both sides (a wrong/outer transcript would fail Finished). Covers both HPKE AEADs + a reject.
+    private static void EchHandshake(TlsCertificate cert)
+    {
+        Section("Loopback: Encrypted Client Hello (draft-ietf-tls-esni-18)");
+
+        foreach (var (aead, name) in new[] {
+            (Hpke.AEAD_AES_128_GCM, "AES-128-GCM"),
+            (Hpke.AEAD_CHACHA20_POLY1305, "ChaCha20Poly1305") })
+        {
+            byte[] echPriv = X25519.GeneratePrivateKey();
+            byte[] list = EncryptedClientHello.BuildEchConfigList(
+                EncryptedClientHello.BuildEchConfig(7, X25519.PublicFromPrivate(echPriv),
+                    new[] { (Hpke.KDF_HKDF_SHA256, aead) }, 64, "public.example.test"));
+
+            int port = ++_port;
+            var server = new TlsServer(cert) { EchPrivateKey = echPriv, EchConfigList = list };
+            server.Listen(port);
+            var srv = Task.Run(() =>
+            {
+                try { using var s = server.Accept(); var b = new byte[256]; int n = s.Read(b); if (n > 0) s.Write(b, 0, n); Thread.Sleep(50); }
+                catch { }
+            });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000, EchConfigList = list };
+                using var st = c.Connect("localhost", port); // real SNI=localhost; observers see public.example.test
+                Check($"ECH {name}: client confirms acceptance", st.EchAccepted);
+                var msg = Encoding.ASCII.GetBytes("secret-over-ech");
+                st.Write(msg);
+                var buf = new byte[256]; int got = st.Read(buf);
+                Check($"ECH {name}: echo over the inner handshake", got == msg.Length && buf.AsSpan(0, got).SequenceEqual(msg));
+            }
+            catch (Exception e) { Check($"ECH {name} [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+
+        // Reject: client offers a config the server doesn't hold. The server can't decrypt, completes
+        // to the public_name, and returns retry_configs; the client surfaces them (draft §7.1). The
+        // public_name is "localhost" so the public-name handshake validates against the test cert.
+        {
+            byte[] clientPriv = X25519.GeneratePrivateKey();
+            byte[] clientList = EncryptedClientHello.BuildEchConfigList(
+                EncryptedClientHello.BuildEchConfig(1, X25519.PublicFromPrivate(clientPriv),
+                    new[] { (Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM) }, 64, "localhost"));
+            byte[] serverPriv = X25519.GeneratePrivateKey();
+            byte[] serverList = EncryptedClientHello.BuildEchConfigList(
+                EncryptedClientHello.BuildEchConfig(9, X25519.PublicFromPrivate(serverPriv),
+                    new[] { (Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM) }, 64, "localhost"));
+            int port = ++_port;
+            var server = new TlsServer(cert) { EchPrivateKey = serverPriv, EchConfigList = serverList };
+            server.Listen(port);
+            var srv = Task.Run(() => { try { using var s = server.Accept(); var b = new byte[64]; int n = s.Read(b); if (n > 0) s.Write(b, 0, n); Thread.Sleep(50); } catch { } });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000, EchConfigList = clientList };
+                using var st = c.Connect("localhost", port);
+                var msg = Encoding.ASCII.GetBytes("public-name-handshake");
+                st.Write(msg); var buf = new byte[64]; int got = st.Read(buf);
+                Check("ECH reject: completes to public_name, not accepted", !st.EchAccepted && got == msg.Length);
+                Check("ECH reject: client surfaced retry_configs", st.EchRetryConfigs != null && st.EchRetryConfigs.Length > 0);
+            }
+            catch (Exception e) { Check($"ECH reject [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+
+        // Async ECH parity (ConnectAsync / AcceptAsync).
+        {
+            byte[] echPriv = X25519.GeneratePrivateKey();
+            byte[] list = EncryptedClientHello.BuildEchConfigList(
+                EncryptedClientHello.BuildEchConfig(7, X25519.PublicFromPrivate(echPriv),
+                    new[] { (Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM) }, 64, "public.example.test"));
+            int port = ++_port;
+            var server = new TlsServer(cert) { EchPrivateKey = echPriv, EchConfigList = list };
+            server.Listen(port);
+            var srv = Task.Run(async () =>
+            {
+                try { using var s = await server.AcceptAsync(); var b = new byte[256]; int n = await s.ReadAsync(b, 0, b.Length); if (n > 0) await s.WriteAsync(b, 0, n); await Task.Delay(50); }
+                catch { }
+            });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000, EchConfigList = list };
+                using var st = c.ConnectAsync("localhost", port).GetAwaiter().GetResult();
+                Check("ECH async: client confirms acceptance", st.EchAccepted);
+                var msg = Encoding.ASCII.GetBytes("async-secret-over-ech");
+                st.WriteAsync(msg, 0, msg.Length).GetAwaiter().GetResult();
+                var buf = new byte[256]; int got = st.ReadAsync(buf, 0, buf.Length).GetAwaiter().GetResult();
+                Check("ECH async: echo over the inner handshake", got == msg.Length && buf.AsSpan(0, got).SequenceEqual(msg));
+            }
+            catch (Exception e) { Check($"ECH async [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+
+        // GREASE-ECH: client emits a fake ECH ext; server (no ECH) ignores it and completes normally.
+        {
+            int port = ++_port;
+            var server = new TlsServer(cert);
+            server.Listen(port);
+            var srv = Task.Run(() => { try { using var s = server.Accept(); var b = new byte[64]; int n = s.Read(b); if (n > 0) s.Write(b, 0, n); Thread.Sleep(50); } catch { } });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000, GreaseEch = true };
+                using var st = c.Connect("localhost", port);
+                var msg = Encoding.ASCII.GetBytes("greased");
+                st.Write(msg);
+                var buf = new byte[64]; int got = st.Read(buf);
+                Check("GREASE-ECH: normal handshake completes, not accepted",
+                    !st.EchAccepted && got == msg.Length && buf.AsSpan(0, got).SequenceEqual(msg));
+            }
+            catch (Exception e) { Check($"GREASE-ECH [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+    }
+
+    // Forced HelloRetryRequest (test knob) — exercises the HRR path end-to-end, which otherwise never
+    // triggers in loopback (the server accepts any offered key-share group). Covers plain HRR and the
+    // ECH HRR accept-confirmation (draft §7.2.1) on both sync and async.
+    private static void ForceHrrHandshake(TlsCertificate cert)
+    {
+        Section("Loopback: HelloRetryRequest (forced) — plain + ECH");
+
+        // Plain forced HRR: server sends one HRR, client retries on CH2, handshake completes.
+        {
+            int port = ++_port;
+            var server = new TlsServer(cert) { ForceHelloRetryRequest = true };
+            server.Listen(port);
+            var srv = Task.Run(() => { try { using var s = server.Accept(); var b = new byte[256]; int n = s.Read(b); if (n > 0) s.Write(b, 0, n); Thread.Sleep(50); } catch { } });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000 };
+                using var st = c.Connect("localhost", port);
+                var msg = Encoding.ASCII.GetBytes("after-hrr");
+                st.Write(msg); var buf = new byte[256]; int got = st.Read(buf);
+                Check("HRR (forced): handshake completes after retry", got == msg.Length && buf.AsSpan(0, got).SequenceEqual(msg));
+            }
+            catch (Exception e) { Check($"HRR forced [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+
+        // ECH + forced HRR (sync and async): the §7.2.1 HRR accept-confirmation flows; ECH still accepted on CH2.
+        foreach (bool useAsync in new[] { false, true })
+        {
+            byte[] echPriv = X25519.GeneratePrivateKey();
+            byte[] list = EncryptedClientHello.BuildEchConfigList(
+                EncryptedClientHello.BuildEchConfig(7, X25519.PublicFromPrivate(echPriv),
+                    new[] { (Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM) }, 64, "public.example.test"));
+            string tag = useAsync ? "async" : "sync";
+            int port = ++_port;
+            var server = new TlsServer(cert) { EchPrivateKey = echPriv, EchConfigList = list, ForceHelloRetryRequest = true };
+            server.Listen(port);
+            var srv = Task.Run(async () =>
+            {
+                try
+                {
+                    using var s = useAsync ? await server.AcceptAsync() : server.Accept();
+                    var b = new byte[256]; int n = s.Read(b); if (n > 0) s.Write(b, 0, n); Thread.Sleep(50);
+                }
+                catch { }
+            });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 12000, EchConfigList = list };
+                using var st = useAsync ? c.ConnectAsync("localhost", port).GetAwaiter().GetResult() : c.Connect("localhost", port);
+                Check($"ECH+HRR {tag}: client confirms acceptance after retry", st.EchAccepted);
+                var msg = Encoding.ASCII.GetBytes("ech-over-hrr-" + tag);
+                st.Write(msg); var buf = new byte[256]; int got = st.Read(buf);
+                Check($"ECH+HRR {tag}: echo over the inner handshake", got == msg.Length && buf.AsSpan(0, got).SequenceEqual(msg));
+            }
+            catch (Exception e) { Check($"ECH+HRR {tag} [{e.GetType().Name}: {e.Message}]", false); }
+            finally { srv.Wait(6000); server.Stop(); }
+        }
+    }
+
+    // Exercises the async handshake state machines (HandshakeAsClientAsync / HandshakeAsServerAsync)
+    // + async record IO — the loopback Handshake() helper only drives the sync paths.
+    private static void AsyncHandshake(string name, TlsCertificate cert, NamedGroup[]? groups, int msgLen)
+    {
+        int port = ++_port;
+        var server = new TlsServer(cert);
+        server.Listen(port);
+        var srv = Task.Run(async () =>
+        {
+            try
+            {
+                using var s = await server.AcceptAsync();
+                var b = new byte[msgLen + 4096];
+                int got = 0;
+                while (got < msgLen) { int n = await s.ReadAsync(b, got, b.Length - got); if (n <= 0) break; got += n; }
+                await s.WriteAsync(b, 0, got);
+                await Task.Delay(100);
+            }
+            catch { }
+        });
+        try
+        {
+            var c = new TlsClient { HandshakeTimeoutMs = 12000 };
+            if (groups != null) c.NamedGroups = groups;
+            using var st = c.ConnectAsync("localhost", port).GetAwaiter().GetResult();
+            byte[] msg = Encoding.ASCII.GetBytes(new string('A', msgLen));
+            st.WriteAsync(msg, 0, msg.Length).GetAwaiter().GetResult();
+            var buf = new byte[msgLen + 4096];
+            int got = 0;
+            while (got < msgLen) { int n = st.ReadAsync(buf, got, buf.Length - got).GetAwaiter().GetResult(); if (n <= 0) break; got += n; }
+            Check(name, got == msgLen && buf.AsSpan(0, got).SequenceEqual(msg));
+        }
+        catch (Exception e) { Check($"{name} [{e.GetType().Name}: {e.Message}]", false); }
+        finally { srv.Wait(6000); server.Stop(); }
+    }
+
+    private static void MutualTls(TlsCertificate ca, TlsCertificate serverCert, bool useCompression = false)
     {
         int port = ++_port;
         var clientCert = CertificateUtils.IssueCertificate("test-client", ca, CertificateProfile.Client);
-        var server = new TlsServer(serverCert) { RequireClientCertificate = true, CaCertificate = ca };
+        var server = new TlsServer(serverCert)
+        {
+            RequireClientCertificate = true,
+            CaCertificate = ca,
+            UseCertificateCompression = useCompression, // RFC 8879: also advertises it in CertificateRequest
+        };
         server.Listen(port);
         string? seenCn = null;
         var srv = Task.Run(() =>
@@ -325,7 +666,7 @@ public static class LoopbackTests
             var msg = Encoding.ASCII.GetBytes("mtls-hello");
             st.Write(msg);
             var buf = new byte[256]; int n = st.Read(buf);
-            Check("mTLS handshake + client cert seen",
+            Check($"mTLS handshake + client cert seen{(useCompression ? " (compressed client cert, RFC 8879)" : "")}",
                 buf.AsSpan(0, n).SequenceEqual(msg) && seenCn == "test-client");
         }
         catch (Exception e) { Check($"mTLS [{e.GetType().Name}: {e.Message}]", false); }

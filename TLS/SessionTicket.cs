@@ -156,20 +156,20 @@ public sealed class TicketEncryption
         lock (_keyLock) { current = _keys[^1]; }
 
         byte[] iv = RandomnessWrapper.GetBytes(12);
-        byte[] ciphertext = new byte[plaintext.Length];
-        byte[] tag = new byte[16];
+        // AesGcmManaged writes ciphertext||tag contiguously (BC's natural GCM layout); the output
+        // buffer MUST be plaintext.Length + tagLen.
+        byte[] ctAndTag = new byte[plaintext.Length + 16];
 
         using var aes = new AesGcmManaged(current.Key, 16);
-        aes.Encrypt(iv, plaintext, ciphertext, tag);
+        aes.Encrypt(iv, plaintext, ctAndTag);
 
-        byte[] result = new byte[4 + 12 + ciphertext.Length + 16];
+        byte[] result = new byte[4 + 12 + ctAndTag.Length];
         result[0] = (byte)(current.KeyId >> 24);
         result[1] = (byte)(current.KeyId >> 16);
         result[2] = (byte)(current.KeyId >> 8);
         result[3] = (byte)current.KeyId;
         Buffer.BlockCopy(iv, 0, result, 4, 12);
-        Buffer.BlockCopy(ciphertext, 0, result, 16, ciphertext.Length);
-        Buffer.BlockCopy(tag, 0, result, 16 + ciphertext.Length, 16);
+        Buffer.BlockCopy(ctAndTag, 0, result, 16, ctAndTag.Length);
         return result;
     }
 
@@ -184,19 +184,18 @@ public sealed class TicketEncryption
         if (entry == null) return null;
 
         byte[] iv = blob[4..16];
-        byte[] ciphertext = blob[16..^16];
-        byte[] tag = blob[^16..];
-        byte[] plaintext = new byte[ciphertext.Length];
+        byte[] ctAndTag = blob[16..]; // ciphertext || tag, as written by Seal
+        byte[] plaintext = new byte[ctAndTag.Length - 16];
 
         try
         {
             using var aes = new AesGcmManaged(entry.Key, 16);
-            aes.Decrypt(iv, ciphertext, tag, plaintext);
+            aes.Decrypt(iv, ctAndTag, plaintext);
             return plaintext;
         }
-        catch (CryptographicException)
+        catch (Exception)
         {
-            return null;
+            return null; // forged / corrupt / rotated-away ticket — never crash the handshake
         }
     }
 

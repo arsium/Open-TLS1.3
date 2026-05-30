@@ -1,0 +1,63 @@
+OpenTls13 — Changelog
+=====================
+
+1.1.0 — 2026-05-30
+------------------
+
+Post-quantum hybrid key exchange — all three standardized groups
+  * Added SecP256r1MLKEM768 (0x11EB) and SecP384r1MLKEM1024 (0x11ED), alongside the
+    existing X25519MLKEM768 (0x11EC), per draft-ietf-tls-ecdhe-mlkem. Wired on client and
+    server, sync and async, including HelloRetryRequest. Correct per-group concatenation
+    order (ML-KEM share first for X25519MLKEM768; ECDH share first for the secp256r1/
+    secp384r1 groups).
+  * Added a pure-managed ML-KEM-1024 (FIPS 203) implementation for SecP384r1MLKEM1024.
+  * Fixed mislabeled IANA code points for the hybrid groups.
+
+Encrypted Client Hello (draft-ietf-tls-esni-18) — now fully functional
+  * Real inner/outer ClientHello encrypt-decrypt over HPKE (RFC 9180); the true SNI is
+    sealed and only the config's public_name is observable.
+  * HPKE now supports both ECH AEADs: AES-128-GCM and ChaCha20Poly1305.
+  * ECHConfig/ECHConfigList parse and build; conformant HPKE info and ClientHelloOuterAAD.
+  * EncodedClientHelloInner with outer_extensions (0xfd00) compression; the server splices
+    the referenced extensions from the outer ClientHello and reconstructs the inner exactly.
+  * Section 7.2 accept-confirmation (ServerHello.random) — server emits, client verifies.
+  * Graceful reject: the handshake completes to the public_name and the server's
+    retry_configs (an ECHConfigList) are surfaced to the caller (TlsStream.EchRetryConfigs).
+  * GREASE-ECH (TlsClient.GreaseEch) for anti-ossification.
+  * HelloRetryRequest accept-confirmation ("hrr ech accept confirmation"): server emits it
+    in the HRR; client verifies and re-seals the inner ClientHello for the second flight.
+  * Client + server, sync and async throughout.
+  * New API: TlsClient.EchConfigList / GreaseEch, TlsServer.EchPrivateKey / EchConfigList,
+    TlsStream.EchAccepted / EchRetryConfigs, and EncryptedClientHello.BuildEchConfig /
+    BuildEchConfigList for publishing a server config.
+
+Session resumption + 0-RTT early data — activated by default
+  * The server now issues NewSessionTicket messages unsolicited (RFC 8446 4.6.1) once the
+    client advertises psk_dhe_ke, so PSK resumption and 0-RTT bootstrap with just a client
+    ticket store. Configurable via TlsServer.DefaultNewSessionTicketCount.
+  * The server now validates psk_key_exchange_modes (RFC 8446 4.2.9) before selecting a PSK.
+  * Added 0-RTT anti-replay for the external-PSK path (single-use, keyed on the binder).
+  * Fixed a latent bug in TicketEncryption.Seal/Open (wrong AEAD buffer layout) that would
+    have thrown the first time a server actually issued a session ticket.
+
+Certificate compression (RFC 8879)
+  * Added the zlib (algorithm 1) codec, in addition to brotli and zstd, using the vendored
+    BouncyCastle JZlib (no native dependency).
+  * Added mutual-TLS client-certificate compression: the server advertises the algorithms
+    in its CertificateRequest and the client compresses its own certificate.
+
+Tests
+  * Added end-to-end loopback coverage for: all three PQ hybrid groups; ML-KEM-768 and
+    ML-KEM-1024 known-answer/round-trip tests; session resumption, true 0-RTT and 0-RTT
+    replay rejection; async handshakes; HPKE round-trips for both AEADs; ECH accept (both
+    AEADs), reject + retry_configs, GREASE-ECH; and HelloRetryRequest (plain and ECH+HRR,
+    sync and async, via an internal force-HRR test hook).
+
+
+1.0.0
+-----
+  Initial release: pure-managed TLS 1.3 (RFC 8446), client and server, sync and async,
+  no BCrypt/OpenSSL P/Invoke. X25519MLKEM768 hybrid post-quantum key exchange, mTLS,
+  PSK resumption, 0-RTT, HelloRetryRequest, ALPN, OCSP stapling, certificate compression
+  (brotli/zstd), a first Encrypted Client Hello scaffold, and the GOST (RFC 9367) and
+  Chinese SM (RFC 8998) national cipher suites. Zero transitive dependencies.

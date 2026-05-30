@@ -20,6 +20,8 @@ public static class CryptoVectorTests
         X25519Kat();
         ChaCha20Poly1305Kat();
         CertificateCompressionRoundtrip();
+        MlKem768DeterministicKat();
+        HpkeRoundTrip();
     }
 
     // RFC 9058 Appendix — MGM over Kuznyechik.
@@ -261,6 +263,90 @@ public static class CryptoVectorTests
     // RFC 8879 cert compression — both backends are vendored pure-managed ports
     // (BrotliSharpLib for Brotli, ZstdSharp for Zstd). Verifies round-trip and that the
     // compressed form is actually smaller than the input.
+    // ML-KEM-768 (FIPS 203) deterministic known-answer test. Drives the seeded internal entry
+    // points (KeyGenInternal(d,z) / EncapsInternal(ek,m)) so outputs are fully reproducible, then
+    // locks a golden digest over (ek‖dk‖ct‖ss) as a byte-exact regression vector. (Cross-checking
+    // the golden against NIST ACVP vectors is a follow-up; this catches any drift in our impl.)
+    private static void MlKem768DeterministicKat()
+    {
+        Section("ML-KEM-768 (FIPS 203) — deterministic seeded KAT");
+
+        byte[] d = new byte[32], z = new byte[32], m = new byte[32];
+        for (int i = 0; i < 32; i++) { d[i] = (byte)i; z[i] = (byte)(0x40 + i); m[i] = (byte)(0x80 + i); }
+
+        var (ek, dk) = MlKem768.KeyGenInternal(d, z);
+        var (ss, ct) = MlKem768.EncapsInternal(ek, m);
+        byte[] ssDecaps = MlKem768.Decaps(dk, ct);
+
+        Check("ML-KEM-768 KAT sizes (ek=1184, dk=2400, ct=1088, ss=32)",
+            ek.Length == 1184 && dk.Length == 2400 && ct.Length == 1088 && ss.Length == 32);
+        Check("ML-KEM-768 KAT round-trip (Encaps/Decaps agree)", Eqb(ss, ssDecaps));
+
+        // Determinism: identical seeds MUST give identical outputs (no hidden RNG dependence).
+        var (ek2, dk2) = MlKem768.KeyGenInternal(d, z);
+        var (ss2, ct2) = MlKem768.EncapsInternal(ek, m);
+        Check("ML-KEM-768 KeyGen deterministic", Eqb(ek, ek2) && Eqb(dk, dk2));
+        Check("ML-KEM-768 Encaps deterministic", Eqb(ss, ss2) && Eqb(ct, ct2));
+
+        byte[] all = new byte[ek.Length + dk.Length + ct.Length + ss.Length];
+        int o = 0;
+        Buffer.BlockCopy(ek, 0, all, o, ek.Length); o += ek.Length;
+        Buffer.BlockCopy(dk, 0, all, o, dk.Length); o += dk.Length;
+        Buffer.BlockCopy(ct, 0, all, o, ct.Length); o += ct.Length;
+        Buffer.BlockCopy(ss, 0, all, o, ss.Length);
+        string golden = Convert.ToHexString(Sha2Managed.Sha256(all));
+        Check("ML-KEM-768 KAT golden digest (byte-exact regression lock)",
+            golden == "0CCCBDA39DE04D3410ED736D93BE1B13B9EFB42E4E2A49243E85B1185DDD5B51");
+
+        // ML-KEM-1024 (k=4, du=11, dv=5) — same seeded harness.
+        var (ek4, dk4) = MlKem1024.KeyGenInternal(d, z);
+        var (ss4, ct4) = MlKem1024.EncapsInternal(ek4, m);
+        byte[] ss4Decaps = MlKem1024.Decaps(dk4, ct4);
+        Check("ML-KEM-1024 KAT sizes (ek=1568, dk=3168, ct=1568, ss=32)",
+            ek4.Length == 1568 && dk4.Length == 3168 && ct4.Length == 1568 && ss4.Length == 32);
+        Check("ML-KEM-1024 KAT round-trip (Encaps/Decaps agree)", Eqb(ss4, ss4Decaps));
+        var (ek4b, _) = MlKem1024.KeyGenInternal(d, z);
+        Check("ML-KEM-1024 KeyGen deterministic", Eqb(ek4, ek4b));
+        ct4[0] ^= 0xFF;
+        Check("ML-KEM-1024 implicit rejection on corrupted ciphertext", !Eqb(MlKem1024.Decaps(dk4, ct4), ss4));
+
+        byte[] all4 = new byte[ek4.Length + dk4.Length + ct4.Length + ss4.Length];
+        int o4 = 0;
+        Buffer.BlockCopy(ek4, 0, all4, o4, ek4.Length); o4 += ek4.Length;
+        Buffer.BlockCopy(dk4, 0, all4, o4, dk4.Length); o4 += dk4.Length;
+        // NB: ct4 was tampered above; recompute a clean ciphertext for the golden lock.
+        var (ssG, ctG) = MlKem1024.EncapsInternal(ek4, m);
+        Buffer.BlockCopy(ctG, 0, all4, o4, ctG.Length); o4 += ctG.Length;
+        Buffer.BlockCopy(ssG, 0, all4, o4, ssG.Length);
+        string golden4 = Convert.ToHexString(Sha2Managed.Sha256(all4));
+        Check("ML-KEM-1024 KAT golden digest (byte-exact regression lock)",
+            golden4 == "2F5F9120816D2CCCEC5D803E3DEC97BB5F440F38E7984C0544FD3C9FD0E8840C");
+    }
+
+    // HPKE (RFC 9180) seal/open round-trip for both AEADs ECH needs — the foundation of ECH.
+    private static void HpkeRoundTrip()
+    {
+        Section("HPKE (RFC 9180) — DHKEM(X25519,HKDF-SHA256), AES-128-GCM + ChaCha20Poly1305");
+        foreach (var (aead, name) in new[] {
+            (Hpke.AEAD_AES_128_GCM, "AES-128-GCM"),
+            (Hpke.AEAD_CHACHA20_POLY1305, "ChaCha20Poly1305") })
+        {
+            byte[] skR = X25519.GeneratePrivateKey();
+            byte[] pkR = X25519.PublicFromPrivate(skR);
+            byte[] info = Encoding.ASCII.GetBytes("hpke-info");
+            byte[] aad = Encoding.ASCII.GetBytes("associated-data");
+            byte[] pt = Encoding.ASCII.GetBytes("the quick brown fox sealed over HPKE");
+
+            var (enc, sctx) = Hpke.KeySchedule.SetupBaseSender(pkR, info, aead);
+            byte[] ct = sctx.Seal(aad, pt);
+            byte[]? dec = Hpke.KeySchedule.SetupBaseReceiver(enc, skR, info, aead).Open(aad, ct);
+            Check($"HPKE {name} seal/open round-trip", dec != null && Eqb(dec, pt));
+
+            byte[]? bad = Hpke.KeySchedule.SetupBaseReceiver(enc, skR, info, aead).Open(Encoding.ASCII.GetBytes("wrong-aad"), ct);
+            Check($"HPKE {name} rejects tampered AAD", bad == null);
+        }
+    }
+
     private static void CertificateCompressionRoundtrip()
     {
         Section("Cert compression (RFC 8879) — managed backends");
@@ -275,6 +361,7 @@ public static class CryptoVectorTests
         Buffer.BlockCopy(cert2.DerData, 0, data, ca.DerData.Length + cert1.DerData.Length, cert2.DerData.Length);
 
         foreach (var (alg, name) in new[] {
+            (CertificateCompression.AlgorithmZlib,   "zlib (BouncyCastle JZlib)"),
             (CertificateCompression.AlgorithmBrotli, "Brotli (BrotliSharpLib)"),
             (CertificateCompression.AlgorithmZstd,   "Zstd (ZstdSharp)") })
         {

@@ -3,40 +3,42 @@ namespace TLS;
 using System.Security.Cryptography;
 
 /// <summary>
-/// ML-KEM-768 (formerly CRYSTALS-Kyber-768) key encapsulation mechanism (FIPS 203).
-/// Post-quantum lattice-based KEM for hybrid key exchange in TLS 1.3.
-/// Parameters: n=256, k=3, q=3329, eta1=2, eta2=2, du=10, dv=4.
+/// ML-KEM-1024 (formerly CRYSTALS-Kyber-1024) key encapsulation mechanism (FIPS 203).
+/// Post-quantum lattice-based KEM for hybrid key exchange in TLS 1.3 (SecP384r1MLKEM1024).
+/// Parameters: n=256, k=4, q=3329, eta1=2, eta2=2, du=11, dv=5.
+/// Byte-for-byte the ML-KEM algorithm of <see cref="MlKem768"/> with k/du/dv bumped — the NTT,
+/// CBD, and generic ByteEncode/ByteDecode/Compress are all parameter-driven, not size-hardcoded.
 /// </summary>
-public static class MlKem768
+public static class MlKem1024
 {
-    // ML-KEM-768 parameters
+    // ML-KEM-1024 parameters
     private const int N = 256;   // polynomial degree
-    private const int K = 3;     // module rank
+    private const int K = 4;     // module rank
     private const int Q = 3329;  // modulus
     private const int Eta1 = 2;  // CBD noise parameter for secret/randomness vectors
     private const int Eta2 = 2;  // CBD noise parameter for error terms
-    private const int Du = 10;   // compression bits for u vector
-    private const int Dv = 4;    // compression bits for v scalar
+    private const int Du = 11;   // compression bits for u vector
+    private const int Dv = 5;    // compression bits for v scalar
 
     // Derived sizes
     private const int PolyBytes = 384;              // 12 bits * 256 / 8 = 384 bytes per uncompressed polynomial
-    private const int PolyVecBytes = K * PolyBytes;  // 1152 bytes for k=3
-    private const int EkSize = PolyVecBytes + 32;    // 1184 bytes (encoded t_hat || rho)
-    private const int DkSize = PolyVecBytes + EkSize + 32 + 32; // 2400 bytes
-    private const int CompressedPolyDu = N * Du / 8; // 320 bytes per compressed polynomial (du=10)
-    private const int CompressedPolyDv = N * Dv / 8; // 128 bytes for compressed v (dv=4)
-    private const int CiphertextSize = K * CompressedPolyDu + CompressedPolyDv; // 1088 bytes
+    private const int PolyVecBytes = K * PolyBytes;  // 1536 bytes for k=4
+    private const int EkSize = PolyVecBytes + 32;    // 1568 bytes (encoded t_hat || rho)
+    private const int DkSize = PolyVecBytes + EkSize + 32 + 32; // 3168 bytes
+    private const int CompressedPolyDu = N * Du / 8; // 352 bytes per compressed polynomial (du=11)
+    private const int CompressedPolyDv = N * Dv / 8; // 160 bytes for compressed v (dv=5)
+    private const int CiphertextSize = K * CompressedPolyDu + CompressedPolyDv; // 1568 bytes
 
     // Precomputed NTT zeta powers in bit-reversed order
     // zeta = 17 is a primitive 256th root of unity mod 3329
     private static readonly short[] Zetas = PrecomputeZetas();
 
     /// <summary>
-    /// Generate an ML-KEM-768 key pair.
+    /// Generate an ML-KEM-1024 key pair.
     /// </summary>
     /// <returns>
-    /// encapsulationKey (1184 bytes): the public encapsulation key.
-    /// decapsulationKey (2400 bytes): the private decapsulation key.
+    /// encapsulationKey (1568 bytes): the public encapsulation key.
+    /// decapsulationKey (3168 bytes): the private decapsulation key.
     /// </returns>
     public static (byte[] encapsulationKey, byte[] decapsulationKey) KeyGen()
     {
@@ -48,16 +50,16 @@ public static class MlKem768
     /// <summary>
     /// Encapsulate a shared secret against an encapsulation key.
     /// </summary>
-    /// <param name="encapsulationKey">1184-byte encapsulation key from KeyGen.</param>
+    /// <param name="encapsulationKey">1568-byte encapsulation key from KeyGen.</param>
     /// <returns>
     /// sharedSecret (32 bytes): the shared secret K.
-    /// ciphertext (1088 bytes): the ciphertext c to send to the decapsulator.
+    /// ciphertext (1568 bytes): the ciphertext c to send to the decapsulator.
     /// </returns>
     public static (byte[] sharedSecret, byte[] ciphertext) Encaps(byte[] encapsulationKey)
     {
         if (encapsulationKey == null || encapsulationKey.Length != EkSize)
             throw new TlsException(AlertDescription.IllegalParameter,
-                $"ML-KEM-768 encapsulation key must be {EkSize} bytes");
+                $"ML-KEM-1024 encapsulation key must be {EkSize} bytes");
 
         byte[] m = RandomnessWrapper.GetKeyBytes(32);
         return EncapsInternal(encapsulationKey, m);
@@ -67,17 +69,17 @@ public static class MlKem768
     /// Decapsulate a ciphertext using the decapsulation key to recover the shared secret.
     /// Uses implicit rejection: returns a pseudorandom value on failure rather than an error.
     /// </summary>
-    /// <param name="decapsulationKey">2400-byte decapsulation key from KeyGen.</param>
-    /// <param name="ciphertext">1088-byte ciphertext from Encaps.</param>
+    /// <param name="decapsulationKey">3168-byte decapsulation key from KeyGen.</param>
+    /// <param name="ciphertext">1568-byte ciphertext from Encaps.</param>
     /// <returns>The 32-byte shared secret.</returns>
     public static byte[] Decaps(byte[] decapsulationKey, byte[] ciphertext)
     {
         if (decapsulationKey == null || decapsulationKey.Length != DkSize)
             throw new TlsException(AlertDescription.IllegalParameter,
-                $"ML-KEM-768 decapsulation key must be {DkSize} bytes");
+                $"ML-KEM-1024 decapsulation key must be {DkSize} bytes");
         if (ciphertext == null || ciphertext.Length != CiphertextSize)
             throw new TlsException(AlertDescription.IllegalParameter,
-                $"ML-KEM-768 ciphertext must be {CiphertextSize} bytes");
+                $"ML-KEM-1024 ciphertext must be {CiphertextSize} bytes");
 
         // Parse dk = encode(s_hat) || ek || H(ek) || z
         int offset = 0;

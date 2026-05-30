@@ -40,14 +40,14 @@
     <!-- ===================== NuGet package metadata ===================== -->
     <IsPackable>true</IsPackable>
     <PackageId>OpenTls13</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>arsium</Authors>
     <Product>OpenTls13</Product>
     <Title>OpenTls13 — pure-managed TLS 1.3 for .NET</Title>
-    <Description>Pure-managed TLS 1.3 (RFC 8446) for .NET — client and server, sync and async, with no BCrypt/OpenSSL P/Invoke (a single BCryptGenRandom entropy import remains). Includes X25519MLKEM768 hybrid post-quantum key exchange (FIPS 203 ML-KEM-768), mTLS, PSK resumption, 0-RTT early data, HelloRetryRequest, ALPN, OCSP stapling, Encrypted Client Hello (RFC 9849), certificate compression (RFC 8879), and the GOST (RFC 9367) and Chinese SM (RFC 8998) national cipher suites. NativeAOT-friendly; zero transitive dependencies (all crypto is source-vendored).</Description>
+    <Description>Pure-managed TLS 1.3 (RFC 8446) for .NET — client and server, sync and async, with no BCrypt/OpenSSL P/Invoke (a single BCryptGenRandom entropy import remains). Includes the X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrid post-quantum key exchanges (FIPS 203 ML-KEM-768 and ML-KEM-1024, per draft-ietf-tls-ecdhe-mlkem), mTLS (with RFC 8879 client-certificate compression), PSK resumption, 0-RTT early data, HelloRetryRequest, ALPN, OCSP stapling, Encrypted Client Hello (draft-ietf-tls-esni-18 — incl. accept-confirmation, outer_extensions compression, GREASE and retry_configs), certificate compression (RFC 8879: zlib/brotli/zstd), and the GOST (RFC 9367) and Chinese SM (RFC 8998) national cipher suites. NativeAOT-friendly; zero transitive dependencies (all crypto is source-vendored).</Description>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageTags>tls;tls1.3;tls13;rfc8446;cryptography;security;mtls;ml-kem;post-quantum;gost;sm2;sm4;chacha20;aes-gcm;aot;managed</PackageTags>
+    <PackageTags>tls;tls1.3;tls13;rfc8446;cryptography;security;mtls;ml-kem;post-quantum;ech;esni;gost;sm2;sm4;chacha20;aes-gcm;aot;managed</PackageTags>
     <PackageProjectUrl>https://github.com/arsium/Open-TLS1.3</PackageProjectUrl>
     <RepositoryUrl>https://github.com/arsium/Open-TLS1.3</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

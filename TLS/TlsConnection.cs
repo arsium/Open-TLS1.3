@@ -92,6 +92,8 @@ public sealed class TlsConnection : IDisposable
     private static readonly NamedGroup[] ServerGroupPreference =
     {
         NamedGroup.X25519MLKEM768,
+        NamedGroup.SecP256r1MLKEM768,
+        NamedGroup.SecP384r1MLKEM1024,
         NamedGroup.X25519,
         NamedGroup.X448,
         NamedGroup.Secp256r1,
@@ -115,6 +117,8 @@ public sealed class TlsConnection : IDisposable
     private byte[]? _gostKexPriv;           // client: ephemeral GOST ECDH private key (if a GOST group offered)
     private string? _gostKexCurveOid;       // client: curve OID for _gostKexPriv
     private byte[]? _sm2KexPriv;            // client: ephemeral SM2 ECDH private key (if curveSM2 offered)
+    private byte[] _mlkemDkSecp256 = Array.Empty<byte>(); // client: ML-KEM-768 decaps key for SecP256r1MLKEM768
+    private byte[] _mlkemDkSecp384 = Array.Empty<byte>(); // client: ML-KEM-1024 decaps key for SecP384r1MLKEM1024
     private string? _negotiatedAlpn;       // result of negotiation
 
     /// <summary>Negotiated ALPN protocol, or null if ALPN was not used.</summary>
@@ -146,6 +150,7 @@ public sealed class TlsConnection : IDisposable
     private bool _accept0Rtt;
     private uint _maxEarlyDataSize;
     private ushort _ticketRequestCount;      // RFC 9149: client-requested ticket count
+    private int _defaultTicketCount = 2;     // NSTs to issue unsolicited (RFC 8446 §4.6.1) when client supports resumption
 
     // Post-handshake auth
     private PostHsAuthState _postHsAuthState = PostHsAuthState.None;
@@ -157,10 +162,24 @@ public sealed class TlsConnection : IDisposable
     private bool _requestOcspStapling;  // client: request status_request extension
     private byte[]? _ocspResponse;      // server: OCSP response to staple
 
+    // RFC 8879 mTLS client-cert compression
+    private ushort[]? _serverCertReqCompAlgs;  // client: compress_certificate algs advertised in CertificateRequest
+    private static readonly ushort[] CertCompAdvertise = { 0x0002, 0x0003, 0x0001 }; // brotli, zstd, zlib
+
     // ECH (Encrypted Client Hello)
     private EncryptedClientHello.EchConfig[]? _echConfigs;    // client: ECH configurations
     private byte[]? _echPrivateKey;                           // server: ECH decryption key
     private EncryptedClientHello.EchClientContext? _echContext; // client: ECH encryption context
+    private byte[]? _echTranscriptOverride;                   // client: inner CH to transcript (ECH accept path)
+    private byte[]? _echInnerChMsg;                           // server: reconstructed inner CH (for accept-confirmation)
+    private byte[]? _echInnerRandom;                          // both: ClientHelloInner.random
+    private byte[]? _echOuterChMsg;                           // client: the outer CH sent (transcript on ECH reject)
+    private bool _greaseEch;                                  // client: send a GREASE ECH ext when no real config
+    private bool _echServerRejected;                          // server: saw an outer CH it couldn't decrypt → send retry_configs
+    private bool _forceHrr;                                   // server (test): always send one HelloRetryRequest
+    private byte[]? _echRetryConfigs;                         // client: ECHConfigList from a rejecting server (retry_configs)
+    /// <summary>True once ECH was confirmed accepted (server: decrypted; client: confirmation verified).</summary>
+    public bool EchAccepted { get; private set; }
 
     public TlsConnection(Stream stream, bool isServer, TlsCertificate? certificate = null,
         bool requireClientCert = false, TlsCertificate? caCertificate = null)
@@ -182,13 +201,29 @@ public sealed class TlsConnection : IDisposable
     /// <summary>Set early data to send as 0-RTT (client only). Must be called before handshake.</summary>
     public void SetEarlyData(byte[] data) => _earlyData = data;
 
-    /// <summary>Configure server ticket issuance.</summary>
-    public void EnableServerTickets(TicketEncryption encryption, bool accept0Rtt = false, uint maxEarlyDataSize = 16384)
+    /// <summary>Configure server ticket issuance. <paramref name="defaultTicketCount"/> is how many
+    /// NewSessionTickets to send unsolicited (RFC 8446 §4.6.1) when the client signals resumption
+    /// support via psk_key_exchange_modes; 0 disables unsolicited issuance (the server then only
+    /// issues tickets when the client explicitly asks via RFC 9149 ticket_request).</summary>
+    public void EnableServerTickets(TicketEncryption encryption, bool accept0Rtt = false,
+        uint maxEarlyDataSize = 16384, int defaultTicketCount = 2)
     {
         _ticketEncryption = encryption;
         _enableTickets = true;
         _accept0Rtt = accept0Rtt;
         _maxEarlyDataSize = maxEarlyDataSize;
+        _defaultTicketCount = defaultTicketCount;
+    }
+
+    /// <summary>How many NewSessionTickets to send after this handshake. Honors an explicit RFC 9149
+    /// ticket_request count if present, else the server default — but only when ticket issuance is
+    /// enabled AND the client advertised psk_dhe_ke (RFC 8446 §4.2.9), since a client that can't do
+    /// PSK-with-(EC)DHE resumption has no use for a ticket. Capped to bound a malicious request.</summary>
+    private int EffectiveTicketCount(ParsedClientHello ch)
+    {
+        if (!_enableTickets || !ch.OffersPskDheKe) return 0;
+        int count = ch.TicketRequestCount > 0 ? ch.TicketRequestCount : _defaultTicketCount;
+        return Math.Min(count, 10);
     }
 
     /// <summary>Set ALPN protocols to offer (client) or accept (server).</summary>
@@ -203,7 +238,8 @@ public sealed class TlsConnection : IDisposable
     // Build the ClientHello key_share list, honoring an optional offered-groups override.
     // GOST groups generate a fresh ephemeral (stored for the later shared-secret computation).
     private (NamedGroup, byte[])[] BuildClientKeyShares(
-        byte[] hybridPub, byte[] x25519Pub, byte[] x448Pub, byte[] p256Pub, byte[] p384Pub)
+        byte[] hybridPub, byte[] x25519Pub, byte[] x448Pub, byte[] p256Pub, byte[] p384Pub,
+        byte[] secp256HybridPub, byte[] secp384HybridPub)
     {
         var offered = _offeredGroups ?? new[]
         {
@@ -216,6 +252,8 @@ public sealed class TlsConnection : IDisposable
             switch (g)
             {
                 case NamedGroup.X25519MLKEM768: list.Add((g, hybridPub)); break;
+                case NamedGroup.SecP256r1MLKEM768: list.Add((g, secp256HybridPub)); break;
+                case NamedGroup.SecP384r1MLKEM1024: list.Add((g, secp384HybridPub)); break;
                 case NamedGroup.X25519: list.Add((g, x25519Pub)); break;
                 case NamedGroup.X448: list.Add((g, x448Pub)); break;
                 case NamedGroup.Secp256r1: list.Add((g, p256Pub)); break;
@@ -296,6 +334,15 @@ public sealed class TlsConnection : IDisposable
     /// <summary>Configure ECH for client (set ECHConfigList from server).</summary>
     public void SetEchConfigs(EncryptedClientHello.EchConfig[] configs) => _echConfigs = configs;
 
+    /// <summary>Client: send a GREASE ECH extension (draft §6.2) when no real ECHConfig is set, so the
+    /// presence of ECH isn't a fingerprint. No effect when a real config is configured.</summary>
+    public void SetGreaseEch() => _greaseEch = true;
+
+    /// <summary>Client: ECHConfigList the server returned in retry_configs after rejecting our ECH
+    /// (draft §7.1), or null. The application should reconnect with these. Populated even though the
+    /// current connection aborts on reject.</summary>
+    public byte[]? EchRetryConfigs => _echRetryConfigs;
+
     /// <summary>Configure ECH for server (set private key for ECH decryption).</summary>
     public void SetEchPrivateKey(byte[] privateKey)
     {
@@ -303,8 +350,166 @@ public sealed class TlsConnection : IDisposable
         _echPrivateKey = privateKey;
     }
 
-    /// <summary>True if ECH was used in this connection.</summary>
+    /// <summary>True if ECH was used (attempted) in this connection.</summary>
     public bool IsEchConnection => _echContext != null;
+
+    // ECH §7.2 accept-confirmation: 8 bytes placed in ServerHello.random[24..32], binding the server's
+    // acceptance to the ClientHelloInner. <paramref name="shMsgZeroed"/> is the framed ServerHello with
+    // those 8 bytes set to zero. Server emits it; client recomputes and compares.
+    private static byte[] ComputeEchAcceptConfirmation(byte[] innerChMsg, byte[] msgZeroed,
+        byte[] innerRandom, HashAlgorithmName hash, int hashLen, string label = "ech accept confirmation")
+    {
+        var th = new TranscriptHash(hash);
+        th.Update(innerChMsg);
+        th.Update(msgZeroed);
+        byte[] confHash = th.GetHash();
+        byte[] secret = Hkdf.Extract(hash, new byte[hashLen], innerRandom); // salt=zeros, ikm=ClientHelloInner.random
+        return Hkdf.ExpandLabel(hash, secret, label, confHash, 8);
+    }
+
+    private static (HashAlgorithmName hash, int len) EchSuiteHash(CipherSuite s) =>
+        s == CipherSuite.TLS_AES_256_GCM_SHA384 ? (HashAlgorithmName.SHA384, 48) : (HashAlgorithmName.SHA256, 32);
+
+    // Server: overwrite ServerHello.random[24..32] (offset 30..38 in the framed message) with the
+    // ECH accept-confirmation, when ECH was accepted. No-op otherwise.
+    private void PatchEchAcceptConfirmation(byte[] shMsg)
+    {
+        if (!EchAccepted || _echInnerChMsg == null || _echInnerRandom == null) return;
+        byte[] shZeroed = (byte[])shMsg.Clone();
+        Array.Clear(shZeroed, 30, 8);
+        byte[] conf = ComputeEchAcceptConfirmation(_echInnerChMsg, shZeroed, _echInnerRandom,
+            _keySchedule!.HashAlgorithm, _keySchedule.HashLen);
+        Buffer.BlockCopy(conf, 0, shMsg, 30, 8);
+    }
+
+    // Server: patch the HRR accept-confirmation (draft §7.2.1) into the HRR's tail-8 bytes. No-op
+    // unless ECH was accepted. The confirmation is over ClientHelloInner1 ‖ HRR(tail-8 zeroed).
+    private void PatchEchHrrConfirmation(byte[] hrrMsg)
+    {
+        if (!EchAccepted || _echInnerChMsg == null || _echInnerRandom == null) return;
+        byte[] conf = ComputeEchAcceptConfirmation(_echInnerChMsg, hrrMsg, _echInnerRandom,
+            _keySchedule!.HashAlgorithm, _keySchedule.HashLen, "hrr ech accept confirmation");
+        Buffer.BlockCopy(conf, 0, hrrMsg, hrrMsg.Length - 8, 8);
+    }
+
+    // Client: verify the HRR accept-confirmation (tail-8 of the HRR) and commit the deferred CH1
+    // transcript (inner on accept, outer on reject). No-op unless we attempted ECH.
+    private void VerifyEchHrrAndCommit(byte[] hrrMsg, ParsedServerHello sh)
+    {
+        if (_echContext == null) return;
+        byte[] hrrZeroed = (byte[])hrrMsg.Clone();
+        Array.Clear(hrrZeroed, hrrZeroed.Length - 8, 8);
+        var (hash, hashLen) = EchSuiteHash(sh.CipherSuite);
+        byte[] expected = ComputeEchAcceptConfirmation(_echContext.InnerChMsg, hrrZeroed,
+            _echContext.InnerRandom, hash, hashLen, "hrr ech accept confirmation");
+        EchAccepted = CryptographicOperations.FixedTimeEquals(expected, hrrMsg.AsSpan(hrrMsg.Length - 8, 8));
+        _transcript.Update(EchAccepted ? _echContext.InnerChMsg : _echOuterChMsg!);
+    }
+
+    // Client: rebuild CH2 as ECH after an HRR — inner2 reuses ClientHelloInner1's random; returns the
+    // outer CH2 to send and the inner CH2 to transcript (inner on accept, outer on reject).
+    private (byte[] outer, byte[] transcript) BuildEchClientHello2(byte[] clientRandom, byte[] sessionId,
+        CipherSuite[] suites, (NamedGroup, byte[])[] keyShares, string? serverName, byte[]? cookie)
+    {
+        byte[] inner2 = HandshakeMessages.BuildClientHello(_echInnerRandom!, sessionId, suites, keyShares,
+            serverName, cookie, _alpnProtocols, _requestOcspStapling);
+        var cfg = _echConfigs![0];
+        var (outer2, _) = EncryptedClientHello.EncryptClientHello(inner2, _echInnerRandom!, cfg,
+            echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
+                cfg.PublicNameString, cookie, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody));
+        _echOuterChMsg = outer2;
+        return (outer2, EchAccepted ? inner2 : outer2);
+    }
+
+    // Client: verify the ECH accept-confirmation. If we attempted ECH and it matches, ECH was accepted
+    // (we already transcripted the inner CH). A mismatch means the server rejected ECH → abort.
+    private void VerifyEchAcceptConfirmation(byte[] shMsg, ParsedServerHello sh)
+    {
+        if (_echContext == null || sh.IsHelloRetryRequest) return;
+        byte[] shZeroed = (byte[])shMsg.Clone();
+        Array.Clear(shZeroed, 30, 8);
+        var (hash, hashLen) = EchSuiteHash(sh.CipherSuite);
+        byte[] expected = ComputeEchAcceptConfirmation(_echContext.InnerChMsg, shZeroed,
+            _echContext.InnerRandom, hash, hashLen);
+        EchAccepted = CryptographicOperations.FixedTimeEquals(expected, shMsg.AsSpan(30, 8));
+        // Commit the deferred ClientHello transcript: the inner on accept, the outer (public_name) on
+        // reject. On reject the handshake still completes to the public_name — the application checks
+        // EchAccepted + EchRetryConfigs and reconnects (draft §7.1).
+        _transcript.Update(EchAccepted ? _echContext.InnerChMsg : _echOuterChMsg!);
+    }
+
+    /// <summary>Build the ClientHelloOuter for ECH and stash the inner-CH state needed for the
+    /// accept-confirmation; returns null if ECH isn't configured (caller builds a normal CH).
+    /// Shared by the sync and async client handshakes (it is pure CPU — no IO).</summary>
+    private byte[]? TryBuildEchClientHello(byte[] clientRandom, byte[] sessionId, CipherSuite[] suites,
+        (NamedGroup, byte[])[] keyShares, string? serverName)
+    {
+        if (_echConfigs == null || _echConfigs.Length == 0 || serverName == null) return null;
+        var echConfig = _echConfigs[0];
+        byte[] innerRandom = RandomnessWrapper.GetHandshakeBytes(32);
+        byte[] innerCh = HandshakeMessages.BuildClientHello(innerRandom, sessionId, suites, keyShares,
+            serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+        string publicName = echConfig.PublicNameString;
+        var (outerCh, echContext) = EncryptedClientHello.EncryptClientHello(innerCh, innerRandom, echConfig,
+            echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
+                publicName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody));
+        _echContext = echContext;
+        _echInnerRandom = innerRandom;
+        _echTranscriptOverride = innerCh;
+        _echOuterChMsg = outerCh;
+        return outerCh;
+    }
+
+    /// <summary>GREASE-ECH (draft §6.2): a well-formed but meaningless outer ECH extension on an
+    /// otherwise-normal ClientHello, so a non-ECH client is indistinguishable from an ECH one. We do
+    /// NOT set _echContext (no acceptance is expected — the server can't decrypt random bytes and
+    /// proceeds on the real SNI). Returns null unless GREASE is enabled and no real config is set.</summary>
+    private byte[]? BuildGreaseEchClientHello(byte[] clientRandom, byte[] sessionId, CipherSuite[] suites,
+        (NamedGroup, byte[])[] keyShares, string? serverName)
+    {
+        if (!_greaseEch || (_echConfigs != null && _echConfigs.Length > 0)) return null;
+        byte[] enc = RandomnessWrapper.GetBytes(32);      // looks like an X25519 enc
+        byte[] payload = RandomnessWrapper.GetBytes(128); // plausible sealed-CH length
+        byte configId = RandomnessWrapper.GetBytes(1)[0];
+        byte[] echExt = EncryptedClientHello.BuildOuterEchExtBody(configId,
+            Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM, enc, payload);
+        return HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
+            serverName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExt);
+    }
+
+    /// <summary>Server: the ECHConfigList to return as retry_configs after an ECH reject (its own
+    /// published configs, rebuilt from their raw bytes), or null.</summary>
+    private byte[]? EchServerRetryConfigs()
+    {
+        if (!_echServerRejected || _echConfigs == null || _echConfigs.Length == 0) return null;
+        return EncryptedClientHello.BuildEchConfigList(_echConfigs.Select(c => c.RawBytes).ToArray());
+    }
+
+    /// <summary>Server: force a single HelloRetryRequest (testing only — lets the HRR + ECH-HRR-confirmation
+    /// path be exercised in a loopback where the server otherwise accepts any offered key-share group).</summary>
+    internal void ForceHelloRetryRequest() => _forceHrr = true;
+
+    /// <summary>Server: if <paramref name="ch"/> is an ECH ClientHelloOuter we can decrypt, swap it to the
+    /// inner CH and return the framed inner CH to feed the transcript; otherwise return <paramref name="chMsg"/>.
+    /// Updates EchAccepted / _echInnerChMsg / _echInnerRandom / _echServerRejected. Used for CH1 and (post-HRR) CH2.</summary>
+    private byte[] ServerDecryptEch(byte[] chMsg, byte[] chBody, ref ParsedClientHello ch)
+    {
+        if (ch.IsOuterClientHello && _echPrivateKey != null && _echConfigs != null)
+        {
+            byte[]? innerChMsg = EncryptedClientHello.DecryptClientHello(chBody, _echPrivateKey, _echConfigs);
+            if (innerChMsg != null)
+            {
+                var (_, innerBody) = HandshakeMessages.Unframe(innerChMsg);
+                ch = HandshakeMessages.ParseClientHello(innerBody);
+                EchAccepted = true;
+                _echInnerChMsg = innerChMsg;
+                _echInnerRandom = ch.ClientRandom;
+                return innerChMsg;
+            }
+            _echServerRejected = true; // couldn't decrypt → return retry_configs in EE
+        }
+        return chMsg;
+    }
 
     // ================================================================
     //  Exporter Interface (RFC 8446 §7.5)
@@ -540,7 +745,7 @@ public sealed class TlsConnection : IDisposable
             NamedGroup.Secp256r1, NamedGroup.Secp384r1
         };
 
-        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false;
+        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false, wantHybridP256 = false, wantHybridP384 = false;
         foreach (var g in offered)
         {
             switch (g)
@@ -550,13 +755,17 @@ public sealed class TlsConnection : IDisposable
                 case NamedGroup.Secp384r1: wantP384 = true; break;
                 case NamedGroup.X448: wantX448 = true; break;
                 case NamedGroup.X25519MLKEM768: wantHybrid = true; break;
+                case NamedGroup.SecP256r1MLKEM768: wantHybridP256 = true; break;
+                case NamedGroup.SecP384r1MLKEM1024: wantHybridP384 = true; break;
                 // GOST + SM2 groups are handled inside BuildClientKeyShares (their key
                 // generators live there and stash the private into _gostKexPriv / _sm2KexPriv).
             }
         }
-        // The hybrid group reuses the X25519 keypair as its ECDH component, so generating
-        // it implies an X25519 keygen even if X25519 alone wasn't offered.
+        // The hybrid groups reuse a classical keypair as their ECDH component, so generating
+        // them implies that keygen even if the classical group alone wasn't offered.
         if (wantHybrid) wantX25519 = true;
+        if (wantHybridP256) wantP256 = true;
+        if (wantHybridP384) wantP384 = true;
 
         byte[] x25519Priv = Array.Empty<byte>(), x25519Pub = Array.Empty<byte>();
         byte[] p256Priv = Array.Empty<byte>(), p256Pub = Array.Empty<byte>();
@@ -564,6 +773,8 @@ public sealed class TlsConnection : IDisposable
         byte[] x448Priv = Array.Empty<byte>(), x448Pub = Array.Empty<byte>();
         byte[] mlkemDk = Array.Empty<byte>();
         byte[] hybridPub = Array.Empty<byte>();
+        byte[] secp256HybridPub = Array.Empty<byte>();
+        byte[] secp384HybridPub = Array.Empty<byte>();
 
         if (wantX25519)
         {
@@ -586,12 +797,30 @@ public sealed class TlsConnection : IDisposable
 
         if (wantHybrid)
         {
-            // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
+            // X25519MLKEM768: ML-KEM ek ‖ X25519 share (ML-KEM first, per draft-ietf-tls-ecdhe-mlkem §4.1)
             var (mlkemEk, dk) = MlKem768.KeyGen();
             mlkemDk = dk;
             hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
             Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
             Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        }
+        if (wantHybridP256)
+        {
+            // SecP256r1MLKEM768: secp256r1 point (65) ‖ ML-KEM ek (1184) — ECDH first (§4.1)
+            var (mlkemEkP, dkP) = MlKem768.KeyGen();
+            _mlkemDkSecp256 = dkP;
+            secp256HybridPub = new byte[p256Pub.Length + mlkemEkP.Length];
+            Buffer.BlockCopy(p256Pub, 0, secp256HybridPub, 0, p256Pub.Length);
+            Buffer.BlockCopy(mlkemEkP, 0, secp256HybridPub, p256Pub.Length, mlkemEkP.Length);
+        }
+        if (wantHybridP384)
+        {
+            // SecP384r1MLKEM1024: secp384r1 point (97) ‖ ML-KEM-1024 ek (1568) — ECDH first (§4.1)
+            var (mlkemEk384, dk384) = MlKem1024.KeyGen();
+            _mlkemDkSecp384 = dk384;
+            secp384HybridPub = new byte[p384Pub.Length + mlkemEk384.Length];
+            Buffer.BlockCopy(p384Pub, 0, secp384HybridPub, 0, p384Pub.Length);
+            Buffer.BlockCopy(mlkemEk384, 0, secp384HybridPub, p384Pub.Length, mlkemEk384.Length);
         }
         HandshakePhaseHook.Mark("client/after-MLKEM-keygen");
 
@@ -605,7 +834,7 @@ public sealed class TlsConnection : IDisposable
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
             CipherSuite.TLS_AES_128_GCM_SHA256
         };
-        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub);
+        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub, secp256HybridPub, secp384HybridPub);
 
         // 2. Build ClientHello (with PSK if available)
         byte[] chMsg;
@@ -683,35 +912,16 @@ public sealed class TlsConnection : IDisposable
         }
         else
         {
-            // Check if ECH should be used
-            if (_echConfigs != null && _echConfigs.Length > 0 && serverName != null)
-            {
-                var echConfig = _echConfigs[0]; // Use first available config
-
-                // Build inner ClientHello with real server name
-                byte[] innerCh = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
+            // ECH (or GREASE-ECH) if configured, else a normal ClientHello.
+            chMsg = TryBuildEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
+                ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
+                ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
                     serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
-
-                // Build outer ClientHello template with public name
-                string publicName = System.Text.Encoding.UTF8.GetString(echConfig.PublicName);
-                byte[] outerTemplate = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                    publicName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
-
-                // Encrypt ClientHello using ECH
-                var (outerCh, echContext) = EncryptedClientHello.EncryptClientHello(innerCh, echConfig, outerTemplate);
-                _echContext = echContext;
-                chMsg = outerCh;
-            }
-            else
-            {
-                // Normal ClientHello without ECH
-                chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
-            }
         }
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
-        _transcript.Update(chMsg);
+        // ECH accept path transcripts the ClientHelloInner, not the outer that went on the wire.
+        if (_echContext == null) _transcript.Update(chMsg); // real ECH defers until accept/reject is known (at the ServerHello)
         HandshakePhaseHook.Mark("client/after-CH-sent");
 
         // 2b. Send 0-RTT early data if applicable
@@ -747,6 +957,7 @@ public sealed class TlsConnection : IDisposable
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
+        VerifyEchAcceptConfirmation(shMsg, sh);
         HandshakePhaseHook.Mark("client/after-SH-received");
 
         // 4. Handle HelloRetryRequest
@@ -758,6 +969,7 @@ public sealed class TlsConnection : IDisposable
                 _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
             }
 
+            VerifyEchHrrAndCommit(shMsg, sh); // ECH: verify HRR confirmation + commit the deferred CH1
             _transcript.ReplaceWithMessageHash();
             _transcript.Update(shMsg);
 
@@ -795,6 +1007,26 @@ public sealed class TlsConnection : IDisposable
                 Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
                 Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
                 keyShares = new (NamedGroup, byte[])[] { (NamedGroup.X25519MLKEM768, hybridPub) };
+            }
+            else if (sh.KeyShareGroup == NamedGroup.SecP256r1MLKEM768)
+            {
+                (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
+                var (mlkemEkP, dkP) = MlKem768.KeyGen();
+                _mlkemDkSecp256 = dkP;
+                secp256HybridPub = new byte[p256Pub.Length + mlkemEkP.Length];
+                Buffer.BlockCopy(p256Pub, 0, secp256HybridPub, 0, p256Pub.Length);
+                Buffer.BlockCopy(mlkemEkP, 0, secp256HybridPub, p256Pub.Length, mlkemEkP.Length);
+                keyShares = new (NamedGroup, byte[])[] { (NamedGroup.SecP256r1MLKEM768, secp256HybridPub) };
+            }
+            else if (sh.KeyShareGroup == NamedGroup.SecP384r1MLKEM1024)
+            {
+                (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
+                var (mlkemEk384, dk384) = MlKem1024.KeyGen();
+                _mlkemDkSecp384 = dk384;
+                secp384HybridPub = new byte[p384Pub.Length + mlkemEk384.Length];
+                Buffer.BlockCopy(p384Pub, 0, secp384HybridPub, 0, p384Pub.Length);
+                Buffer.BlockCopy(mlkemEk384, 0, secp384HybridPub, p384Pub.Length, mlkemEk384.Length);
+                keyShares = new (NamedGroup, byte[])[] { (NamedGroup.SecP384r1MLKEM1024, secp384HybridPub) };
             }
             else
             {
@@ -834,14 +1066,22 @@ public sealed class TlsConnection : IDisposable
                     _keySchedule.DeriveBinderKey(), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
                 HandshakeMessages.PatchPskBinder(ch2Msg, binder2);
             }
+            else if (_echContext != null)
+            {
+                // ECH after HRR: rebuild the outer CH2 carrying a re-sealed inner CH2.
+                var (outer2, transcript2) = BuildEchClientHello2(clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie);
+                ch2Msg = outer2;
+                _record.WriteRecord(ContentType.Handshake, ch2Msg);
+                _transcript.Update(transcript2);
+            }
             else
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
                     requestOcspStapling: _requestOcspStapling);
+                _record.WriteRecord(ContentType.Handshake, ch2Msg);
+                _transcript.Update(ch2Msg);
             }
-            _record.WriteRecord(ContentType.Handshake, ch2Msg);
-            _transcript.Update(ch2Msg);
 
             shMsg = NextHandshake(HandshakeType.ServerHello);
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
@@ -896,6 +1136,8 @@ public sealed class TlsConnection : IDisposable
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
         ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
+        // ECH reject: the server returned a fresh ECHConfigList (retry_configs) for the next attempt.
+        if (_echContext != null && !EchAccepted) _echRetryConfigs = ee.EchRetryConfigs;
         EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
 
         // 9. If PSK resumption: skip to Finished (no Certificate/CertificateVerify)
@@ -962,6 +1204,7 @@ public sealed class TlsConnection : IDisposable
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
             var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
             certReqContext = ctx;
+            _serverCertReqCompAlgs = HandshakeMessages.ParseCertReqCertCompression(crBody);
             nextMsg = NextHandshakeAny(out nextType);
         }
         else if (nextType != HandshakeType.Certificate && nextType != HandshakeType.CompressedCertificate)
@@ -1046,6 +1289,9 @@ public sealed class TlsConnection : IDisposable
             {
                 byte[] clientCertMsg = HandshakeMessages.BuildCertificateMsg(
                     _certificate.DerData, certReqContext, _certificate.ChainCertificates);
+                ushort clientCompAlg = SelectClientCertCompression();
+                if (clientCompAlg != 0)
+                    clientCertMsg = HandshakeMessages.BuildCompressedCertificate(clientCertMsg, clientCompAlg);
                 _record.WriteRecord(ContentType.Handshake, clientCertMsg);
                 _transcript.Update(clientCertMsg);
 
@@ -1095,22 +1341,29 @@ public sealed class TlsConnection : IDisposable
 
         // 1. Receive ClientHello
         byte[] chMsg = NextHandshake(HandshakeType.ClientHello);
-        _transcript.Update(chMsg);
         var (_, chBody) = HandshakeMessages.Unframe(chMsg);
         var ch = HandshakeMessages.ParseClientHello(chBody);
 
-        // 1b. Try ECH decryption if this is an outer ClientHello
+        // 1b. ECH: if this is a ClientHelloOuter we can decrypt, swap to the inner — and the TLS 1.3
+        // transcript MUST then be over the inner CH (draft §7). DecryptClientHello returns the framed
+        // ClientHelloInner, reconstructed byte-exactly with the client's.
+        byte[] transcriptCh = chMsg;
         if (ch.IsOuterClientHello && _echPrivateKey != null && _echConfigs != null)
         {
-            byte[]? innerChBody = EncryptedClientHello.DecryptClientHello(chBody, _echPrivateKey, _echConfigs);
-            if (innerChBody != null)
+            byte[]? innerChMsg = EncryptedClientHello.DecryptClientHello(chBody, _echPrivateKey, _echConfigs);
+            if (innerChMsg != null)
             {
-                // Successfully decrypted ECH - use inner ClientHello
-                ch = HandshakeMessages.ParseClientHello(innerChBody);
-                // Note: We continue using the outer ClientHello for transcript hash as per RFC 9849
+                var (_, innerBody) = HandshakeMessages.Unframe(innerChMsg);
+                ch = HandshakeMessages.ParseClientHello(innerBody);
+                transcriptCh = innerChMsg;
+                EchAccepted = true;
+                _echInnerChMsg = innerChMsg;
+                _echInnerRandom = ch.ClientRandom;
             }
-            // If decryption failed, continue with outer ClientHello (will likely fail later)
+            else _echServerRejected = true; // saw ECH we couldn't decrypt → return retry_configs in EE
+            // else: ECH reject — fall through to the public_name handshake on the outer CH.
         }
+        _transcript.Update(transcriptCh);
 
         // RFC 9149: Store ticket request count
         _ticketRequestCount = ch.TicketRequestCount;
@@ -1122,7 +1375,10 @@ public sealed class TlsConnection : IDisposable
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
 
-        if (ch.PreSharedKeyData != null && (_ticketEncryption != null || _externalPsk != null))
+        // RFC 8446 §4.2.9: a server MUST NOT select a PSK unless the client offered a compatible
+        // psk_key_exchange_mode. We only support psk_dhe_ke, so absent that the PSK is ignored and we
+        // fall through to a full handshake.
+        if (ch.PreSharedKeyData != null && ch.OffersPskDheKe && (_ticketEncryption != null || _externalPsk != null))
         {
             var (identities, ages, binders) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
             for (int i = 0; i < identities.Length; i++)
@@ -1207,7 +1463,15 @@ public sealed class TlsConnection : IDisposable
                         isPskResumption = true;
                         suite = _externalPsk.Suite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
                         pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
-                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0;
+                        // 0-RTT anti-replay for external PSKs (RFC 8446 §8): an external PSK identity is
+                        // long-lived, so we can't single-use the identity itself. Instead single-use the
+                        // binder, which is bound to this exact ClientHello (it covers client_random) — a
+                        // verbatim replay reuses the binder and is rejected, while a fresh ClientHello with
+                        // the same PSK still gets 0-RTT. Requires a replay store; without one we refuse
+                        // 0-RTT (fall back to 1-RTT resumption) rather than accept un-tracked early data.
+                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                            && _ticketEncryption != null
+                            && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
                         break;
                     }
                 }
@@ -1226,13 +1490,14 @@ public sealed class TlsConnection : IDisposable
         var selectedKS = SelectKeyShare(ch.KeyShares);
 
         // 6. If no key share match, send HelloRetryRequest
-        if (selectedKS == null)
+        if (selectedKS == null || _forceHrr)
         {
             NamedGroup requestedGroup = SelectGroupForHrr(ch.SupportedGroups);
 
             _transcript.ReplaceWithMessageHash();
 
-            byte[] hrrMsg = HandshakeMessages.BuildHelloRetryRequest(ch.SessionId, suite, requestedGroup);
+            byte[] hrrMsg = HandshakeMessages.BuildHelloRetryRequest(ch.SessionId, suite, requestedGroup, withEch: EchAccepted);
+            PatchEchHrrConfirmation(hrrMsg); // ECH §7.2.1 (no-op unless ECH accepted)
             _record.WriteRecord(ContentType.Handshake, hrrMsg);
             _transcript.Update(hrrMsg);
 
@@ -1244,6 +1509,7 @@ public sealed class TlsConnection : IDisposable
             // RFC 8446 §4.2.11.2: server MUST re-verify PSK binder in CH2 after HRR
             var (_, ch2Body) = HandshakeMessages.Unframe(ch2Msg);
             ch = HandshakeMessages.ParseClientHello(ch2Body);
+            byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
 
             if (isPskResumption && ch.PreSharedKeyData != null)
             {
@@ -1284,7 +1550,7 @@ public sealed class TlsConnection : IDisposable
                 accept0Rtt = false;
             }
 
-            _transcript.Update(ch2Msg);
+            _transcript.Update(transcriptCh2);
 
             selectedKS = FindKeyShare(ch.KeyShares, requestedGroup);
             if (selectedKS == null)
@@ -1305,6 +1571,7 @@ public sealed class TlsConnection : IDisposable
             shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
+        PatchEchAcceptConfirmation(shMsg); // ECH §7.2 (no-op unless ECH accepted)
         _record.WriteRecord(ContentType.Handshake, shMsg);
         _transcript.Update(shMsg);
 
@@ -1329,7 +1596,7 @@ public sealed class TlsConnection : IDisposable
         ushort certCompAlg = NegotiateCertCompression(ch.CertCompressionAlgorithms);
         // RFC 8449: echo a record_size_limit only if the client offered one; honor the client's limit.
         ushort rslToSend = ch.RecordSizeLimit > 0 ? (ushort)TlsConst.MaxPlaintextLength : (ushort)0;
-        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg, rslToSend);
+        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg, rslToSend, EchServerRetryConfigs());
         _record.WriteRecord(ContentType.Handshake, eeMsg);
         _transcript.Update(eeMsg);
         ApplyPeerRecordSizeLimit(ch.RecordSizeLimit);
@@ -1446,14 +1713,15 @@ public sealed class TlsConnection : IDisposable
             IsHandshakeComplete = true;
             IsResumed = true;
 
-            if (_enableTickets && _ticketRequestCount > 0) SendNewSessionTicket(_ticketRequestCount);
+            { int ticketCount = EffectiveTicketCount(ch); if (ticketCount > 0) SendNewSessionTicket((ushort)ticketCount); }
             return;
         }
 
         // 14. CertificateRequest (if mTLS)
         if (_requireClientCert)
         {
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs);
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs,
+                certCompAlgs: _useCertCompression ? CertCompAdvertise : null);
             _record.WriteRecord(ContentType.Handshake, crMsg);
             _transcript.Update(crMsg);
         }
@@ -1504,9 +1772,14 @@ public sealed class TlsConnection : IDisposable
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
         {
-            byte[] clientCertMsg = NextHandshake(HandshakeType.Certificate);
+            byte[] clientCertMsg = NextHandshakeAny(out HandshakeType clientCertType);
+            if (clientCertType != HandshakeType.Certificate && clientCertType != HandshakeType.CompressedCertificate)
+                AlertAndThrow(AlertDescription.UnexpectedMessage, $"Expected client Certificate, got {clientCertType}");
             _transcript.Update(clientCertMsg);
-            var (_, clientCertBody) = HandshakeMessages.Unframe(clientCertMsg);
+            var (_, clientCertRaw) = HandshakeMessages.Unframe(clientCertMsg);
+            byte[] clientCertBody = clientCertType == HandshakeType.CompressedCertificate
+                ? HandshakeMessages.ParseCompressedCertificate(clientCertRaw)  // RFC 8879 → Certificate body
+                : clientCertRaw;
             var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
 
             if (clientCertEntries.Count > 0)
@@ -1570,7 +1843,7 @@ public sealed class TlsConnection : IDisposable
         InstallAppKeys();
         IsHandshakeComplete = true;
 
-        if (_enableTickets && _ticketRequestCount > 0) SendNewSessionTicket(_ticketRequestCount);
+        { int ticketCount = EffectiveTicketCount(ch); if (ticketCount > 0) SendNewSessionTicket((ushort)ticketCount); }
     }
 
     // ================================================================
@@ -2124,8 +2397,46 @@ public sealed class TlsConnection : IDisposable
             NamedGroup.Secp256r1 => EcdhP256.SharedSecret(p256Priv, p256Pub, peerKey),
             NamedGroup.Secp384r1 => EcdhP384.SharedSecret(p384Priv, p384Pub, peerKey),
             NamedGroup.X25519MLKEM768 => ComputeHybridSharedSecret(peerKey, x25519Priv, mlkemDk),
+            NamedGroup.SecP256r1MLKEM768 => ComputeHybridP256SharedSecret(peerKey, p256Priv, p256Pub, _mlkemDkSecp256),
+            NamedGroup.SecP384r1MLKEM1024 => ComputeHybridP384SharedSecret(peerKey, p384Priv, p384Pub, _mlkemDkSecp384),
             _ => throw new TlsException(AlertDescription.IllegalParameter, $"Unsupported key share group: {group}")
         };
+    }
+
+    /// <summary>SecP256r1MLKEM768 client shared secret: ECDHE(x-coord) ‖ ML-KEM SS (ECDH first, draft §4.3).
+    /// Server share = secp256r1 point (65) ‖ ML-KEM ciphertext (1088).</summary>
+    private static byte[] ComputeHybridP256SharedSecret(byte[] serverShare, byte[] p256Priv, byte[] p256Pub, byte[] mlkemDk)
+    {
+        if (serverShare.Length != 65 + 1088)
+            throw new TlsException(AlertDescription.DecodeError, "SecP256r1MLKEM768 server share must be 1153 bytes");
+        byte[] serverP256 = serverShare[..65];
+        byte[] mlkemCiphertext = serverShare[65..];
+
+        byte[] ecdhShared = EcdhP256.SharedSecret(p256Priv, p256Pub, serverP256); // 32-byte x-coordinate
+        byte[] mlkemShared = MlKem768.Decaps(mlkemDk, mlkemCiphertext);
+
+        byte[] combined = new byte[ecdhShared.Length + mlkemShared.Length];
+        Buffer.BlockCopy(ecdhShared, 0, combined, 0, ecdhShared.Length);
+        Buffer.BlockCopy(mlkemShared, 0, combined, ecdhShared.Length, mlkemShared.Length);
+        return combined;
+    }
+
+    /// <summary>SecP384r1MLKEM1024 client shared secret: ECDHE(x-coord, 48B) ‖ ML-KEM-1024 SS (ECDH first).
+    /// Server share = secp384r1 point (97) ‖ ML-KEM-1024 ciphertext (1568).</summary>
+    private static byte[] ComputeHybridP384SharedSecret(byte[] serverShare, byte[] p384Priv, byte[] p384Pub, byte[] mlkemDk)
+    {
+        if (serverShare.Length != 97 + 1568)
+            throw new TlsException(AlertDescription.DecodeError, "SecP384r1MLKEM1024 server share must be 1665 bytes");
+        byte[] serverP384 = serverShare[..97];
+        byte[] mlkemCiphertext = serverShare[97..];
+
+        byte[] ecdhShared = EcdhP384.SharedSecret(p384Priv, p384Pub, serverP384); // 48-byte x-coordinate
+        byte[] mlkemShared = MlKem1024.Decaps(mlkemDk, mlkemCiphertext);
+
+        byte[] combined = new byte[ecdhShared.Length + mlkemShared.Length];
+        Buffer.BlockCopy(ecdhShared, 0, combined, 0, ecdhShared.Length);
+        Buffer.BlockCopy(mlkemShared, 0, combined, ecdhShared.Length, mlkemShared.Length);
+        return combined;
     }
 
     /// <summary>Compute hybrid shared secret: ML-KEM shared secret ‖ X25519 shared secret.</summary>
@@ -2176,6 +2487,51 @@ public sealed class TlsConnection : IDisposable
                 var (sPriv, sPub) = EcdhP384.GenerateKeyPair();
                 serverPublicKey = sPub;
                 return EcdhP384.SharedSecret(sPriv, sPub, clientKey);
+            }
+            case NamedGroup.SecP256r1MLKEM768:
+            {
+                // Client share: secp256r1 point (65) ‖ ML-KEM ek (1184) — ECDH first (draft §4.1)
+                if (clientKey.Length != 65 + 1184)
+                    throw new TlsException(AlertDescription.DecodeError, "SecP256r1MLKEM768 client share must be 1249 bytes");
+                byte[] clientP256 = clientKey[..65];
+                byte[] mlkemEkP = clientKey[65..];
+
+                var (sPrivP, sPubP) = EcdhP256.GenerateKeyPair();
+                byte[] ecdhShared = EcdhP256.SharedSecret(sPrivP, sPubP, clientP256); // 32-byte x-coordinate
+                var (mlkemSharedP, mlkemCtP) = MlKem768.Encaps(mlkemEkP);
+
+                // Server share: secp256r1 point (65) ‖ ML-KEM ciphertext (1088) — ECDH first (draft §4.2)
+                serverPublicKey = new byte[sPubP.Length + mlkemCtP.Length];
+                Buffer.BlockCopy(sPubP, 0, serverPublicKey, 0, sPubP.Length);
+                Buffer.BlockCopy(mlkemCtP, 0, serverPublicKey, sPubP.Length, mlkemCtP.Length);
+
+                // Shared secret: ECDHE ‖ ML-KEM (ECDH first, draft §4.3)
+                byte[] combinedP = new byte[ecdhShared.Length + mlkemSharedP.Length];
+                Buffer.BlockCopy(ecdhShared, 0, combinedP, 0, ecdhShared.Length);
+                Buffer.BlockCopy(mlkemSharedP, 0, combinedP, ecdhShared.Length, mlkemSharedP.Length);
+                return combinedP;
+            }
+            case NamedGroup.SecP384r1MLKEM1024:
+            {
+                // Client share: secp384r1 point (97) ‖ ML-KEM-1024 ek (1568) — ECDH first
+                if (clientKey.Length != 97 + 1568)
+                    throw new TlsException(AlertDescription.DecodeError, "SecP384r1MLKEM1024 client share must be 1665 bytes");
+                byte[] clientP384 = clientKey[..97];
+                byte[] mlkemEk384 = clientKey[97..];
+
+                var (sPriv384, sPub384) = EcdhP384.GenerateKeyPair();
+                byte[] ecdhShared384 = EcdhP384.SharedSecret(sPriv384, sPub384, clientP384); // 48-byte x-coord
+                var (mlkemShared384, mlkemCt384) = MlKem1024.Encaps(mlkemEk384);
+
+                // Server share: secp384r1 point (97) ‖ ML-KEM-1024 ciphertext (1568) — ECDH first
+                serverPublicKey = new byte[sPub384.Length + mlkemCt384.Length];
+                Buffer.BlockCopy(sPub384, 0, serverPublicKey, 0, sPub384.Length);
+                Buffer.BlockCopy(mlkemCt384, 0, serverPublicKey, sPub384.Length, mlkemCt384.Length);
+
+                byte[] combined384 = new byte[ecdhShared384.Length + mlkemShared384.Length];
+                Buffer.BlockCopy(ecdhShared384, 0, combined384, 0, ecdhShared384.Length);
+                Buffer.BlockCopy(mlkemShared384, 0, combined384, ecdhShared384.Length, mlkemShared384.Length);
+                return combined384;
             }
             case NamedGroup.X25519MLKEM768:
             {
@@ -2254,6 +2610,17 @@ public sealed class TlsConnection : IDisposable
         if (!_useCertCompression || clientAlgorithms == null) return 0;
         foreach (var alg in clientAlgorithms)
             if (CertificateCompression.IsSupported(alg)) return alg;
+        return 0;
+    }
+
+    /// <summary>Client (mTLS): pick the first server-advertised compress_certificate algorithm we can
+    /// produce, to compress our own certificate. Not gated on _useCertCompression (a server flag) —
+    /// the trigger is the server advertising algorithms in its CertificateRequest (RFC 8879).</summary>
+    private ushort SelectClientCertCompression()
+    {
+        if (_serverCertReqCompAlgs == null) return 0;
+        foreach (var a in _serverCertReqCompAlgs)
+            if (CertificateCompression.IsSupported(a)) return a;
         return 0;
     }
 
@@ -2712,7 +3079,7 @@ public sealed class TlsConnection : IDisposable
             NamedGroup.Secp256r1, NamedGroup.Secp384r1
         };
 
-        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false;
+        bool wantX25519 = false, wantP256 = false, wantP384 = false, wantX448 = false, wantHybrid = false, wantHybridP256 = false, wantHybridP384 = false;
         foreach (var g in offered)
         {
             switch (g)
@@ -2722,9 +3089,13 @@ public sealed class TlsConnection : IDisposable
                 case NamedGroup.Secp384r1: wantP384 = true; break;
                 case NamedGroup.X448: wantX448 = true; break;
                 case NamedGroup.X25519MLKEM768: wantHybrid = true; break;
+                case NamedGroup.SecP256r1MLKEM768: wantHybridP256 = true; break;
+                case NamedGroup.SecP384r1MLKEM1024: wantHybridP384 = true; break;
             }
         }
-        if (wantHybrid) wantX25519 = true; // hybrid reuses the X25519 keypair
+        if (wantHybrid) wantX25519 = true; // X25519MLKEM768 reuses the X25519 keypair
+        if (wantHybridP256) wantP256 = true; // SecP256r1MLKEM768 reuses the P-256 keypair
+        if (wantHybridP384) wantP384 = true; // SecP384r1MLKEM1024 reuses the P-384 keypair
 
         byte[] x25519Priv = Array.Empty<byte>(), x25519Pub = Array.Empty<byte>();
         byte[] p256Priv = Array.Empty<byte>(), p256Pub = Array.Empty<byte>();
@@ -2732,6 +3103,8 @@ public sealed class TlsConnection : IDisposable
         byte[] x448Priv = Array.Empty<byte>(), x448Pub = Array.Empty<byte>();
         byte[] mlkemDk = Array.Empty<byte>();
         byte[] hybridPub = Array.Empty<byte>();
+        byte[] secp256HybridPub = Array.Empty<byte>();
+        byte[] secp384HybridPub = Array.Empty<byte>();
 
         if (wantX25519)
         {
@@ -2747,12 +3120,30 @@ public sealed class TlsConnection : IDisposable
         }
         if (wantHybrid)
         {
-            // ML-KEM-768 hybrid: ML-KEM encapsulation key + X25519 key share (per draft-ietf-tls-ecdhe-mlkem)
+            // X25519MLKEM768: ML-KEM ek ‖ X25519 share (ML-KEM first, per draft-ietf-tls-ecdhe-mlkem §4.1)
             var (mlkemEk, dk) = MlKem768.KeyGen();
             mlkemDk = dk;
             hybridPub = new byte[mlkemEk.Length + x25519Pub.Length];
             Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
             Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
+        }
+        if (wantHybridP256)
+        {
+            // SecP256r1MLKEM768: secp256r1 point (65) ‖ ML-KEM ek (1184) — ECDH first (§4.1)
+            var (mlkemEkP, dkP) = MlKem768.KeyGen();
+            _mlkemDkSecp256 = dkP;
+            secp256HybridPub = new byte[p256Pub.Length + mlkemEkP.Length];
+            Buffer.BlockCopy(p256Pub, 0, secp256HybridPub, 0, p256Pub.Length);
+            Buffer.BlockCopy(mlkemEkP, 0, secp256HybridPub, p256Pub.Length, mlkemEkP.Length);
+        }
+        if (wantHybridP384)
+        {
+            // SecP384r1MLKEM1024: secp384r1 point (97) ‖ ML-KEM-1024 ek (1568) — ECDH first (§4.1)
+            var (mlkemEk384, dk384) = MlKem1024.KeyGen();
+            _mlkemDkSecp384 = dk384;
+            secp384HybridPub = new byte[p384Pub.Length + mlkemEk384.Length];
+            Buffer.BlockCopy(p384Pub, 0, secp384HybridPub, 0, p384Pub.Length);
+            Buffer.BlockCopy(mlkemEk384, 0, secp384HybridPub, p384Pub.Length, mlkemEk384.Length);
         }
 
         byte[] clientRandom = RandomnessWrapper.GetHandshakeBytes(32);
@@ -2765,7 +3156,7 @@ public sealed class TlsConnection : IDisposable
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
             CipherSuite.TLS_AES_128_GCM_SHA256
         };
-        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub);
+        var keyShares = BuildClientKeyShares(hybridPub, x25519Pub, x448Pub, p256Pub, p384Pub, secp256HybridPub, secp384HybridPub);
 
         // 2. Build ClientHello (with PSK if available)
         byte[] chMsg;
@@ -2807,12 +3198,15 @@ public sealed class TlsConnection : IDisposable
         }
         else
         {
-            chMsg = HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+            // ECH (or GREASE-ECH) if configured, else a normal ClientHello.
+            chMsg = TryBuildEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
+                ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
+                ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
+                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
         }
 
         await _record.WriteRecordAsync(ContentType.Handshake, chMsg, ct).ConfigureAwait(false);
-        _transcript.Update(chMsg);
+        if (_echContext == null) _transcript.Update(chMsg); // real ECH defers until accept/reject is known (at the ServerHello)
 
         // 2b. Send 0-RTT early data if applicable
         if (offer0Rtt && _keySchedule != null)
@@ -2844,6 +3238,7 @@ public sealed class TlsConnection : IDisposable
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
+        VerifyEchAcceptConfirmation(shMsg, sh);
 
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
@@ -2854,6 +3249,7 @@ public sealed class TlsConnection : IDisposable
                 _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
             }
 
+            VerifyEchHrrAndCommit(shMsg, sh); // ECH: verify HRR confirmation + commit the deferred CH1
             _transcript.ReplaceWithMessageHash();
             _transcript.Update(shMsg);
 
@@ -2891,6 +3287,26 @@ public sealed class TlsConnection : IDisposable
                 Buffer.BlockCopy(mlkemEk, 0, hybridPub, 0, mlkemEk.Length);
                 Buffer.BlockCopy(x25519Pub, 0, hybridPub, mlkemEk.Length, x25519Pub.Length);
                 keyShares = new (NamedGroup, byte[])[] { (NamedGroup.X25519MLKEM768, hybridPub) };
+            }
+            else if (sh.KeyShareGroup == NamedGroup.SecP256r1MLKEM768)
+            {
+                (p256Priv, p256Pub) = EcdhP256.GenerateKeyPair();
+                var (mlkemEkP, dkP) = MlKem768.KeyGen();
+                _mlkemDkSecp256 = dkP;
+                secp256HybridPub = new byte[p256Pub.Length + mlkemEkP.Length];
+                Buffer.BlockCopy(p256Pub, 0, secp256HybridPub, 0, p256Pub.Length);
+                Buffer.BlockCopy(mlkemEkP, 0, secp256HybridPub, p256Pub.Length, mlkemEkP.Length);
+                keyShares = new (NamedGroup, byte[])[] { (NamedGroup.SecP256r1MLKEM768, secp256HybridPub) };
+            }
+            else if (sh.KeyShareGroup == NamedGroup.SecP384r1MLKEM1024)
+            {
+                (p384Priv, p384Pub) = EcdhP384.GenerateKeyPair();
+                var (mlkemEk384, dk384) = MlKem1024.KeyGen();
+                _mlkemDkSecp384 = dk384;
+                secp384HybridPub = new byte[p384Pub.Length + mlkemEk384.Length];
+                Buffer.BlockCopy(p384Pub, 0, secp384HybridPub, 0, p384Pub.Length);
+                Buffer.BlockCopy(mlkemEk384, 0, secp384HybridPub, p384Pub.Length, mlkemEk384.Length);
+                keyShares = new (NamedGroup, byte[])[] { (NamedGroup.SecP384r1MLKEM1024, secp384HybridPub) };
             }
             else
             {
@@ -2930,14 +3346,22 @@ public sealed class TlsConnection : IDisposable
                     _keySchedule.DeriveBinderKey(), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
                 HandshakeMessages.PatchPskBinder(ch2Msg, binder2);
             }
+            else if (_echContext != null)
+            {
+                // ECH after HRR: rebuild the outer CH2 carrying a re-sealed inner CH2.
+                var (outer2, transcript2) = BuildEchClientHello2(clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie);
+                ch2Msg = outer2;
+                await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
+                _transcript.Update(transcript2);
+            }
             else
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
                     requestOcspStapling: _requestOcspStapling);
+                await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
+                _transcript.Update(ch2Msg);
             }
-            await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
-            _transcript.Update(ch2Msg);
 
             shMsg = await NextHandshakeAsync(HandshakeType.ServerHello, ct).ConfigureAwait(false);
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
@@ -2986,6 +3410,8 @@ public sealed class TlsConnection : IDisposable
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
         ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
+        // ECH reject: the server returned a fresh ECHConfigList (retry_configs) for the next attempt.
+        if (_echContext != null && !EchAccepted) _echRetryConfigs = ee.EchRetryConfigs;
         EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
 
         // 9. PSK resumption: skip to Finished
@@ -3041,6 +3467,7 @@ public sealed class TlsConnection : IDisposable
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
             var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
             certReqContext = ctx;
+            _serverCertReqCompAlgs = HandshakeMessages.ParseCertReqCertCompression(crBody);
             (nextMsg, nextType) = await NextHandshakeAnyAsync(ct).ConfigureAwait(false);
         }
         else if (nextType != HandshakeType.Certificate && nextType != HandshakeType.CompressedCertificate)
@@ -3116,6 +3543,9 @@ public sealed class TlsConnection : IDisposable
             {
                 byte[] clientCertMsg = HandshakeMessages.BuildCertificateMsg(
                     _certificate.DerData, certReqContext, _certificate.ChainCertificates);
+                ushort clientCompAlg = SelectClientCertCompression();
+                if (clientCompAlg != 0)
+                    clientCertMsg = HandshakeMessages.BuildCompressedCertificate(clientCertMsg, clientCompAlg);
                 await _record.WriteRecordAsync(ContentType.Handshake, clientCertMsg, ct).ConfigureAwait(false);
                 _transcript.Update(clientCertMsg);
 
@@ -3162,9 +3592,12 @@ public sealed class TlsConnection : IDisposable
 
         // 1. Receive ClientHello
         byte[] chMsg = await NextHandshakeAsync(HandshakeType.ClientHello, ct).ConfigureAwait(false);
-        _transcript.Update(chMsg);
         var (_, chBody) = HandshakeMessages.Unframe(chMsg);
         var ch = HandshakeMessages.ParseClientHello(chBody);
+
+        // ECH: decrypt the inner CH and drive the transcript off it (see the sync server for rationale).
+        byte[] transcriptCh = ServerDecryptEch(chMsg, chBody, ref ch);
+        _transcript.Update(transcriptCh);
 
         // RFC 9149: Store ticket request count
         _ticketRequestCount = ch.TicketRequestCount;
@@ -3176,7 +3609,7 @@ public sealed class TlsConnection : IDisposable
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
 
-        if (ch.PreSharedKeyData != null && _ticketEncryption != null)
+        if (ch.PreSharedKeyData != null && ch.OffersPskDheKe && _ticketEncryption != null)
         {
             var (identities, ages, binders) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
             for (int i = 0; i < identities.Length; i++)
@@ -3236,13 +3669,14 @@ public sealed class TlsConnection : IDisposable
         var selectedKS = SelectKeyShare(ch.KeyShares);
 
         // 6. HRR if needed
-        if (selectedKS == null)
+        if (selectedKS == null || _forceHrr)
         {
             NamedGroup requestedGroup = SelectGroupForHrr(ch.SupportedGroups);
 
             _transcript.ReplaceWithMessageHash();
 
-            byte[] hrrMsg = HandshakeMessages.BuildHelloRetryRequest(ch.SessionId, suite, requestedGroup);
+            byte[] hrrMsg = HandshakeMessages.BuildHelloRetryRequest(ch.SessionId, suite, requestedGroup, withEch: EchAccepted);
+            PatchEchHrrConfirmation(hrrMsg); // ECH §7.2.1 (no-op unless ECH accepted)
             await _record.WriteRecordAsync(ContentType.Handshake, hrrMsg, ct).ConfigureAwait(false);
             _transcript.Update(hrrMsg);
 
@@ -3254,6 +3688,7 @@ public sealed class TlsConnection : IDisposable
             // RFC 8446 §4.2.11.2: re-verify PSK binder in CH2
             var (_, ch2Body) = HandshakeMessages.Unframe(ch2Msg);
             ch = HandshakeMessages.ParseClientHello(ch2Body);
+            byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
 
             if (isPskResumption && ch.PreSharedKeyData != null)
             {
@@ -3291,7 +3726,7 @@ public sealed class TlsConnection : IDisposable
                 accept0Rtt = false;
             }
 
-            _transcript.Update(ch2Msg);
+            _transcript.Update(transcriptCh2);
 
             selectedKS = FindKeyShare(ch.KeyShares, requestedGroup);
             if (selectedKS == null)
@@ -3312,6 +3747,7 @@ public sealed class TlsConnection : IDisposable
             shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
+        PatchEchAcceptConfirmation(shMsg); // ECH §7.2 (no-op unless ECH accepted)
         await _record.WriteRecordAsync(ContentType.Handshake, shMsg, ct).ConfigureAwait(false);
         _transcript.Update(shMsg);
 
@@ -3334,7 +3770,8 @@ public sealed class TlsConnection : IDisposable
         string? negotiatedAlpn = NegotiateAlpn(ch.AlpnProtocols);
         _negotiatedAlpn = negotiatedAlpn;
         ushort certCompAlg = NegotiateCertCompression(ch.CertCompressionAlgorithms);
-        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg);
+        byte[] eeMsg = HandshakeMessages.BuildEncryptedExtensions(accept0Rtt, negotiatedAlpn, certCompAlg,
+            echRetryConfigs: EchServerRetryConfigs());
         await _record.WriteRecordAsync(ContentType.Handshake, eeMsg, ct).ConfigureAwait(false);
         _transcript.Update(eeMsg);
 
@@ -3435,14 +3872,15 @@ public sealed class TlsConnection : IDisposable
             IsHandshakeComplete = true;
             IsResumed = true;
 
-            if (_enableTickets && _ticketRequestCount > 0) await SendNewSessionTicketAsync(_ticketRequestCount, ct).ConfigureAwait(false);
+            { int ticketCount = EffectiveTicketCount(ch); if (ticketCount > 0) await SendNewSessionTicketAsync((ushort)ticketCount, ct).ConfigureAwait(false); }
             return;
         }
 
         // 14. CertificateRequest (if mTLS)
         if (_requireClientCert)
         {
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs);
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs,
+                certCompAlgs: _useCertCompression ? CertCompAdvertise : null);
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
             _transcript.Update(crMsg);
         }
@@ -3490,9 +3928,14 @@ public sealed class TlsConnection : IDisposable
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
         {
-            byte[] clientCertMsg = await NextHandshakeAsync(HandshakeType.Certificate, ct).ConfigureAwait(false);
+            var (clientCertMsg, clientCertType) = await NextHandshakeAnyAsync(ct).ConfigureAwait(false);
+            if (clientCertType != HandshakeType.Certificate && clientCertType != HandshakeType.CompressedCertificate)
+                AlertAndThrow(AlertDescription.UnexpectedMessage, $"Expected client Certificate, got {clientCertType}");
             _transcript.Update(clientCertMsg);
-            var (_, clientCertBody) = HandshakeMessages.Unframe(clientCertMsg);
+            var (_, clientCertRaw) = HandshakeMessages.Unframe(clientCertMsg);
+            byte[] clientCertBody = clientCertType == HandshakeType.CompressedCertificate
+                ? HandshakeMessages.ParseCompressedCertificate(clientCertRaw)
+                : clientCertRaw;
             var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
 
             if (clientCertEntries.Count > 0)
@@ -3553,6 +3996,6 @@ public sealed class TlsConnection : IDisposable
         InstallAppKeys();
         IsHandshakeComplete = true;
 
-        if (_enableTickets && _ticketRequestCount > 0) await SendNewSessionTicketAsync(_ticketRequestCount, ct).ConfigureAwait(false);
+        { int ticketCount = EffectiveTicketCount(ch); if (ticketCount > 0) await SendNewSessionTicketAsync((ushort)ticketCount, ct).ConfigureAwait(false); }
     }
 }

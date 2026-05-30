@@ -78,7 +78,8 @@ public enum ExtensionType : ushort
     QuicTransportParameters = 57,       // RFC 9001 §8.2
     TicketRequest = 58,                 // RFC 9149 §3
     DnsmasqSharedSecret = 59,           // Local use
-    EncryptedClientHello = 65037        // RFC 9849 (for Phase C)
+    EchOuterExtensions = 64768,         // 0xfd00 — ECH encoded-inner outer_extensions compression (draft-esni-18 §5.1)
+    EncryptedClientHello = 65037        // 0xfe0d — draft-ietf-tls-esni-18
 }
 
 public enum CipherSuite : ushort
@@ -133,10 +134,10 @@ public enum NamedGroup : ushort
     GC512B = 0x0027,                           // RFC 9367 id-tc26-gost-3410-12-512-paramSetB
     GC512C = 0x0028,                           // RFC 9367 id-tc26-gost-3410-2012-512-paramSetC
 
-    // Post-Quantum (Hybrid)
-    X25519MLKEM768 = 0x11EC,                   // IANA assigned
-    P256MLKEM768 = 0x11ED,                     // IANA assigned
-    X448MLKEM1024 = 0x11EE                     // IANA assigned
+    // Post-Quantum (Hybrid) — draft-ietf-tls-ecdhe-mlkem §7 (IANA-registered)
+    X25519MLKEM768 = 0x11EC,                   // 4588 — ML-KEM-768 ‖ X25519        (ML-KEM share first)
+    SecP256r1MLKEM768 = 0x11EB,                // 4587 — secp256r1 ‖ ML-KEM-768      (ECDH share first)
+    SecP384r1MLKEM1024 = 0x11ED                // 4589 — secp384r1 ‖ ML-KEM-1024     (ECDH first; not yet wired — needs ML-KEM-1024)
 }
 
 public enum SignatureScheme : ushort

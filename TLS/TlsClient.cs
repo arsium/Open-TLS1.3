@@ -26,6 +26,14 @@ public sealed class TlsClient
     /// <summary>Override the key-share groups offered in ClientHello (in preference order). Null = stack default.</summary>
     public NamedGroup[]? NamedGroups { get; set; }
 
+    /// <summary>ECHConfigList (wire bytes, e.g. from a DNS HTTPS/SVCB record) to enable Encrypted
+    /// Client Hello. The real SNI is then HPKE-sealed; observers see only the config's public_name.</summary>
+    public byte[]? EchConfigList { get; set; }
+
+    /// <summary>Send a GREASE ECH extension (draft §6.2) when <see cref="EchConfigList"/> is not set,
+    /// so a non-ECH client looks like an ECH one (anti-ossification). Ignored when ECH is configured.</summary>
+    public bool GreaseEch { get; set; }
+
     /// <summary>
     /// Connect to a TLS 1.3 server.
     /// Performs the full handshake and returns an encrypted stream.
@@ -150,6 +158,12 @@ public sealed class TlsClient
 
         if (NamedGroups != null)
             conn.SetOfferedGroups(NamedGroups);
+
+        if (EchConfigList != null)
+            conn.SetEchConfigs(EncryptedClientHello.ParseEchConfigList(EchConfigList));
+
+        if (GreaseEch)
+            conn.SetGreaseEch();
 
         if (TicketStore == null) return;
 

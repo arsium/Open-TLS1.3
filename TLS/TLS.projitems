@@ -50,6 +50,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Pkcs7.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)SessionTicket.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)MlKem768.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)MlKem1024.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)EcdhP384.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)X448.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)KeyLogger.cs" />

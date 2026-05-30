@@ -24,6 +24,14 @@ public sealed class TlsStream : IDisposable
     /// <summary>True if this connection was established via PSK session resumption.</summary>
     public bool IsResumed => _conn.IsResumed;
 
+    /// <summary>True if Encrypted Client Hello was accepted (server decrypted the inner CH; client
+    /// verified the §7.2 accept-confirmation).</summary>
+    public bool EchAccepted => _conn.EchAccepted;
+
+    /// <summary>If the server rejected our ECH, the ECHConfigList it returned in retry_configs (the
+    /// app should reconnect with these and treat this connection as authenticated to the public_name).</summary>
+    public byte[]? EchRetryConfigs => _conn.EchRetryConfigs;
+
     /// <summary>True if 0-RTT early data was accepted by the server.</summary>
     public bool EarlyDataAccepted => _conn.EarlyDataAccepted;
 

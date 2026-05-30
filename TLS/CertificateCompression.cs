@@ -5,17 +5,21 @@ using ZstdSharp;
 
 /// <summary>
 /// Certificate compression/decompression for RFC 8879.
-/// Supports Brotli (0x0002) via BrotliSharpLib (pure managed C# port of google/brotli)
-/// and Zstandard (0x0003) via ZstdSharp (pure managed C# port).
+/// Supports zlib (0x0001) via ZLibDotNet, Brotli (0x0002) via BrotliSharpLib, and
+/// Zstandard (0x0003) via ZstdSharp — all pure managed C# ports.
 ///
-/// Both backends are pure-managed: no System.IO.Compression.BrotliStream, no native
-/// dependency, no platform-specific code path. This keeps RFC 8879 cert compression
-/// working uniformly on every platform .NET runs on.
+/// Every backend is pure-managed: no System.IO.Compression.{ZLib,Brotli}Stream (those
+/// P/Invoke native zlib/brotli), no native dependency, no platform-specific code path.
+/// This keeps RFC 8879 cert compression working uniformly on every platform .NET runs on.
 /// </summary>
 public static class CertificateCompression
 {
+    public const ushort AlgorithmZlib = 0x0001;
     public const ushort AlgorithmBrotli = 0x0002;
     public const ushort AlgorithmZstd = 0x0003;
+
+    // zlib compression level (RFC 1950). 6 = zlib's default speed/ratio balance.
+    private const int ZlibLevel = 6;
 
     // RFC 8879 caps the certificate_list at 2^24-1, but in practice a TLS cert chain
     // is at most a few tens of KB. Reject anything above this to avoid a decompression
@@ -32,6 +36,16 @@ public static class CertificateCompression
     {
         switch (algorithm)
         {
+            case AlgorithmZlib:
+            {
+                // zlib format (RFC 1950) via BouncyCastle's JZlib port. nowrap=false ⇒ zlib wrapper
+                // (2-byte header + Adler-32), which is what RFC 8879 algorithm 1 mandates.
+                using var outMs = new System.IO.MemoryStream();
+                using (var z = new Org.BouncyCastle.Utilities.Zlib.ZOutputStreamLeaveOpen(outMs, ZlibLevel, false))
+                    z.Write(data, 0, data.Length); // Dispose flushes (Finish) + ends, leaves outMs open
+                return outMs.ToArray();
+            }
+
             case AlgorithmBrotli:
                 return Brotli.CompressBuffer(data, 0, data.Length, BrotliQuality, BrotliWindow);
 
@@ -53,6 +67,29 @@ public static class CertificateCompression
 
         switch (algorithm)
         {
+            case AlgorithmZlib:
+            {
+                // Inflate exactly uncompressedLength bytes (already range-checked above as a
+                // decompression-bomb guard), then confirm the stream ends there.
+                using var inMs = new System.IO.MemoryStream(compressed);
+                using var z = new Org.BouncyCastle.Utilities.Zlib.ZInputStream(inMs, false);
+                byte[] result = new byte[uncompressedLength];
+                int total = 0;
+                while (total < uncompressedLength)
+                {
+                    int n = z.Read(result, total, uncompressedLength - total);
+                    if (n <= 0) break;
+                    total += n;
+                }
+                if (total != uncompressedLength)
+                    throw new TlsException(AlertDescription.DecodeError,
+                        $"zlib decompression length mismatch: got {total}, expected {uncompressedLength}");
+                if (z.Read(new byte[1], 0, 1) > 0)
+                    throw new TlsException(AlertDescription.DecodeError,
+                        "zlib stream longer than declared uncompressed_length");
+                return result;
+            }
+
             case AlgorithmBrotli:
             {
                 byte[] result = Brotli.DecompressBuffer(compressed, 0, compressed.Length);
@@ -81,5 +118,5 @@ public static class CertificateCompression
 
     /// <summary>Check if the given algorithm is supported.</summary>
     public static bool IsSupported(ushort algorithm) =>
-        algorithm == AlgorithmBrotli || algorithm == AlgorithmZstd;
+        algorithm == AlgorithmZlib || algorithm == AlgorithmBrotli || algorithm == AlgorithmZstd;
 }
