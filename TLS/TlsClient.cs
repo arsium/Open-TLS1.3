@@ -26,6 +26,19 @@ public sealed class TlsClient
     /// <summary>Override the key-share groups offered in ClientHello (in preference order). Null = stack default.</summary>
     public NamedGroup[]? NamedGroups { get; set; }
 
+    /// <summary>Trust anchor for verifying the server certificate. When set (or
+    /// <see cref="ServerCertificateValidationCallback"/> is set), the handshake fails closed if the
+    /// server certificate is not signed by this CA, is outside its validity window, or does not match
+    /// the connection host. When neither is set the server is NOT authenticated — the handshake still
+    /// succeeds against any certificate and the application must inspect <see cref="TlsStream.PeerCertificate"/>
+    /// itself (see the README security note).</summary>
+    public TlsCertificate? CaCertificate { get; set; }
+
+    /// <summary>Custom server-certificate validation. Receives the leaf certificate DER and the advisory
+    /// <see cref="TlsStream.CertificateWarnings"/>; return true to accept or false to abort the handshake.
+    /// Authoritative when set (takes precedence over <see cref="CaCertificate"/>).</summary>
+    public Func<byte[], IReadOnlyList<string>, bool>? ServerCertificateValidationCallback { get; set; }
+
     /// <summary>ECHConfigList (wire bytes, e.g. from a DNS HTTPS/SVCB record) to enable Encrypted
     /// Client Hello. The real SNI is then HPKE-sealed; observers see only the config's public_name.</summary>
     public byte[]? EchConfigList { get; set; }
@@ -144,6 +157,9 @@ public sealed class TlsClient
 
     private void ConfigureConnection(TlsConnection conn, string host)
     {
+        // Server-certificate trust policy (no-op unless the consumer set one of these).
+        conn.SetServerCertificateValidation(CaCertificate, ServerCertificateValidationCallback);
+
         if (AlpnProtocols != null)
             conn.SetAlpnProtocols(AlpnProtocols);
 

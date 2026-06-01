@@ -235,6 +235,19 @@ server.Listen(8443);
 using var s = server.Accept();          // TlsStream — Read/Write encrypted app data
 ```
 
+Client, authenticating the server certificate (opt-in — see the security note under *Limitations*):
+
+```csharp
+using TLS;
+var client = new TlsClient
+{
+    CaCertificate = trustAnchor,        // verify the chain, validity window, and hostname; fail closed otherwise
+    // — or — supply your own policy:
+    // ServerCertificateValidationCallback = (leafDer, warnings) => /* return true to accept */ true,
+};
+using var s = client.Connect("localhost", 8443);   // throws if the server cert isn't trusted
+```
+
 > **AGPL note:** AGPL-3.0 is strong copyleft — network use of a derivative obliges source
 > disclosure. The vendored crypto stays under its original permissive MIT / Bouncy Castle
 > terms (see `OpenTls13/THIRD-PARTY-NOTICES.txt`); only the OpenTls13 code as a whole is AGPL.
@@ -268,6 +281,14 @@ Core TLS 1.3 (RFC 8446) is compliant — handshake, HelloRetryRequest + cookie, 
 
 ## Limitations
 
+- **The client does not authenticate the server certificate by default.** `TlsClient` performs the
+  TLS 1.3 handshake and the `CertificateVerify` check (proving the peer holds the presented
+  certificate's private key), but it does **not** build or validate a chain to a trust anchor, and
+  hostname matching is surfaced only as advisory `TlsStream.CertificateWarnings` — it is not enforced.
+  An application using a bare `TlsClient.Connect(host, port)` is therefore **not** protected against an
+  active (MITM) network attacker unless it supplies a trust anchor / validation callback (see
+  `TlsClient.CaCertificate` / `ServerCertificateValidationCallback`) or inspects
+  `TlsStream.PeerCertificate` itself and applies its own trust policy.
 - **External interop is unverified.** This stack passes its own loopback matrix end-to-end (and 120 k+ fuzz inputs across all message parsers without unhandled exceptions), but has not been cross-tested against OpenSSL, BoringSSL, nginx, curl, GmSSL, or OpenSSL-GOST. Production use should validate against the target peer first. In particular, this stack emits Streebog digests in the reverse byte order of RFC 6986's textual presentation, and the GOST/SM CertificateVerify hashing is internally self-consistent — byte-order conventions should be validated before relying on external national-suite interop.
 - **National AEAD throughput is bound by the managed implementation.** Hardware-accelerated AES-GCM does ~100 MB/s end-to-end through TLS framing; managed Kuznyechik / Magma / SM4 are an order of magnitude slower (tens of MB/s) and dominated by their per-block cost. GOST and SM2 scalar-mult is on Jacobian coordinates (one modular inverse per scalar mult, ~18% faster than the previous affine implementation).
 - The on-wire ClientHello `signature_algorithms` / `supported_groups` advertise the standard set only; national schemes/curves work in self-interop because the server selects directly.

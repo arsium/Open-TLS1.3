@@ -120,6 +120,9 @@ public static class HandshakeMessages
     {
         int p = 0;
         EnsureRemaining(body, p, 2 + 32 + 1, "ClientHello fixed header");
+        // RFC 8446 §4.1.2: legacy_version MUST be 0x0303; the real version is in supported_versions.
+        if (BinaryHelper.ReadUInt16(body.AsSpan(p)) != TlsConst.LegacyVersion)
+            throw new TlsException(AlertDescription.ProtocolVersion, "ClientHello legacy_version must be 0x0303");
         p += 2; // legacy_version
         byte[] clientRandom = body[p..(p + 32)]; p += 32;
 
@@ -149,6 +152,7 @@ public static class HandshakeMessages
         ushort[]? certCompAlgorithms = null;
         ushort ticketRequestCount = 0;
         ushort recordSizeLimit = 0;
+        SignatureScheme[]? sigAlgs = null;
         SignatureScheme[]? sigAlgsCert = null;
         byte[]? echData = null;
         bool isOuterCH = false;
@@ -160,9 +164,17 @@ public static class HandshakeMessages
             ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
             EnsureRemaining(body, p, extLen, "ClientHello extensions block");
             int extEnd = p + extLen;
+            var seenExts = new HashSet<ExtensionType>();
+            bool sawPsk = false;
             while (p < extEnd)
             {
                 var (et, ed, np) = ReadExtension(body, p); p = np;
+                // RFC 8446 §4.2: duplicate extensions are illegal. §4.2.11: pre_shared_key MUST be last.
+                if (!seenExts.Add(et))
+                    throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate ClientHello extension: {et}");
+                if (sawPsk)
+                    throw new TlsException(AlertDescription.IllegalParameter, "pre_shared_key must be the last ClientHello extension");
+                if (et == ExtensionType.PreSharedKey) sawPsk = true;
                 if (et == ExtensionType.KeyShare)
                 {
                     EnsureRemaining(ed, 0, 2, "key_share list length");
@@ -265,6 +277,19 @@ public static class HandshakeMessages
                             if (ed[1 + m] == 0x01) offersPskDheKe = true; // psk_dhe_ke
                     }
                 }
+                else if (et == ExtensionType.SignatureAlgorithms)
+                {
+                    // RFC 8446 §4.2.3: signature_algorithms — schemes the client accepts in CertificateVerify
+                    if (ed.Length >= 2)
+                    {
+                        ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                        int n = Math.Min(algLen / 2, (ed.Length - 2) / 2);
+                        var algs = new SignatureScheme[n];
+                        for (int i = 0; i < n; i++)
+                            algs[i] = (SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2));
+                        sigAlgs = algs;
+                    }
+                }
                 else if (et == ExtensionType.SignatureAlgorithmsCert)
                 {
                     // RFC 8446 §4.2.3: signature_algorithms_cert extension
@@ -305,6 +330,7 @@ public static class HandshakeMessages
             CertCompressionAlgorithms = certCompAlgorithms,
             TicketRequestCount = ticketRequestCount,
             RecordSizeLimit = recordSizeLimit,
+            SignatureAlgorithms = sigAlgs,
             SignatureAlgorithmsCert = sigAlgsCert,
             EncryptedClientHelloData = echData,
             IsOuterClientHello = isOuterCH,
@@ -384,6 +410,9 @@ public static class HandshakeMessages
     {
         int p = 0;
         EnsureRemaining(body, p, 2 + 32 + 1, "ServerHello fixed header");
+        // RFC 8446 §4.2.1: legacy_version is 0x0303; the real version is in supported_versions.
+        if (BinaryHelper.ReadUInt16(body.AsSpan(p)) != TlsConst.LegacyVersion)
+            throw new TlsException(AlertDescription.ProtocolVersion, "ServerHello legacy_version must be 0x0303");
         p += 2; // legacy_version
         byte[] serverRandom = body[p..(p + 32)]; p += 32;
 
@@ -404,9 +433,13 @@ public static class HandshakeMessages
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
         EnsureRemaining(body, p, extLen, "ServerHello extensions block");
         int extEnd = p + extLen;
+        var seenExts = new HashSet<ExtensionType>();
         while (p < extEnd)
         {
             var (et, ed, np) = ReadExtension(body, p); p = np;
+            // RFC 8446 §4.2: duplicate extensions are illegal.
+            if (!seenExts.Add(et))
+                throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate ServerHello extension: {et}");
             if (et == ExtensionType.KeyShare)
             {
                 EnsureRemaining(ed, 0, 2, "ServerHello key_share group");
@@ -514,9 +547,13 @@ public static class HandshakeMessages
         if (body.Length < 2) return new ParsedEncryptedExtensions();
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
         int extEnd = p + extLen;
+        var seenExts = new HashSet<ExtensionType>();
         while (p < extEnd)
         {
             var (et, ed, np) = ReadExtension(body, p); p = np;
+            // RFC 8446 §4.2: duplicate extensions are illegal.
+            if (!seenExts.Add(et))
+                throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate EncryptedExtensions extension: {et}");
             if (et == ExtensionType.EarlyData)
                 earlyData = true;
             else if (et == ExtensionType.Alpn && ed.Length >= 4)
@@ -876,7 +913,11 @@ public static class HandshakeMessages
 
     public static bool ParseKeyUpdate(byte[] body)
     {
-        return body.Length > 0 && body[0] == 1; // update_requested
+        // RFC 8446 §4.6.3: KeyUpdate.request_update is exactly one byte, value 0 or 1; anything
+        // else MUST be rejected with illegal_parameter rather than silently treated as 0.
+        if (body.Length != 1 || body[0] > 1)
+            throw new TlsException(AlertDescription.IllegalParameter, "Malformed KeyUpdate request_update");
+        return body[0] == 1; // update_requested
     }
 
     // ================================================================
@@ -1428,6 +1469,7 @@ public sealed class ParsedClientHello
     public ushort[]? CertCompressionAlgorithms { get; init; }
     public ushort TicketRequestCount { get; init; }
     public ushort RecordSizeLimit { get; init; } // RFC 8449; 0 = not negotiated
+    public SignatureScheme[]? SignatureAlgorithms { get; init; }       // RFC 8446 §4.2.3 (CertificateVerify schemes)
     public SignatureScheme[]? SignatureAlgorithmsCert { get; init; }
     public byte[]? EncryptedClientHelloData { get; init; }  // ECH extension payload
     public bool IsOuterClientHello { get; init; }           // True if this is an ECH outer ClientHello

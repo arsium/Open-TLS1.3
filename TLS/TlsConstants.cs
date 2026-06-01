@@ -78,8 +78,8 @@ public enum ExtensionType : ushort
     QuicTransportParameters = 57,       // RFC 9001 §8.2
     TicketRequest = 58,                 // RFC 9149 §3
     DnsmasqSharedSecret = 59,           // Local use
-    EchOuterExtensions = 64768,         // 0xfd00 — ECH encoded-inner outer_extensions compression (draft-esni-18 §5.1)
-    EncryptedClientHello = 65037        // 0xfe0d — draft-ietf-tls-esni-18
+    EchOuterExtensions = 64768,         // 0xfd00 — ECH encoded-inner outer_extensions compression (RFC 9849 §5.1)
+    EncryptedClientHello = 65037        // 0xfe0d — RFC 9849 (Encrypted Client Hello)
 }
 
 public enum CipherSuite : ushort
@@ -92,8 +92,8 @@ public enum CipherSuite : ushort
     TLS_AES_128_CCM_8_SHA256 = 0x1305,         // RFC 8446 §B.4
 
     // Additional TLS 1.3 Cipher Suites
-    TLS_AEGIS_128L_SHA256 = 0x1306,            // RFC 9380
-    TLS_AEGIS_256_SHA512 = 0x1307,             // RFC 9380
+    TLS_AEGIS_128L_SHA256 = 0x1306,            // draft-irtf-cfrg-aegis-aead (code points; not implemented)
+    TLS_AEGIS_256_SHA512 = 0x1307,             // draft-irtf-cfrg-aegis-aead (code points; not implemented)
 
     // Chinese National Standard (RFC 8998) - for Phase D
     TLS_SM4_GCM_SM3 = 0x00C6,                  // RFC 8998 §6
@@ -137,7 +137,7 @@ public enum NamedGroup : ushort
     // Post-Quantum (Hybrid) — draft-ietf-tls-ecdhe-mlkem §7 (IANA-registered)
     X25519MLKEM768 = 0x11EC,                   // 4588 — ML-KEM-768 ‖ X25519        (ML-KEM share first)
     SecP256r1MLKEM768 = 0x11EB,                // 4587 — secp256r1 ‖ ML-KEM-768      (ECDH share first)
-    SecP384r1MLKEM1024 = 0x11ED                // 4589 — secp384r1 ‖ ML-KEM-1024     (ECDH first; not yet wired — needs ML-KEM-1024)
+    SecP384r1MLKEM1024 = 0x11ED                // 4589 — secp384r1 ‖ ML-KEM-1024     (ECDH share first)
 }
 
 public enum SignatureScheme : ushort

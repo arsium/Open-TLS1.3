@@ -33,8 +33,12 @@ public static class CertificateUtils
     private const string OidEcPublicKey = "1.2.840.10045.2.1";
     private const string OidSecp256r1 = "1.2.840.10045.3.1.7";
     private const string OidEcdsaSha256 = "1.2.840.10045.4.3.2";
+    private const string OidEcdsaSha384 = "1.2.840.10045.4.3.3";
+    private const string OidEcdsaSha512 = "1.2.840.10045.4.3.4";
     private const string OidRsaEncryption = "1.2.840.113549.1.1.1";
     private const string OidRsaSha256 = "1.2.840.113549.1.1.11";
+    private const string OidRsaSha384 = "1.2.840.113549.1.1.12";
+    private const string OidRsaSha512 = "1.2.840.113549.1.1.13";
     private const string OidCommonName = "2.5.4.3";
     private const string OidSubjectAltName = "2.5.29.17";
     private const string OidBasicConstraints = "2.5.29.19";
@@ -225,6 +229,23 @@ public static class CertificateUtils
     //  Verify chain
     // ================================================================
 
+    // Map a certificate's signatureAlgorithm (the AlgorithmIdentifier SEQUENCE content) to its hash.
+    // Defaults to SHA-256 — what this stack's own CA issuance uses — for unrecognized OIDs.
+    private static HashAlgorithmName HashFromCertSigAlg(byte[] sigAlgSeqValue)
+    {
+        try
+        {
+            var items = Asn1.ReadSequenceItems(sigAlgSeqValue);
+            byte[] oid = Asn1.Wrap(items[0].tag, items[0].value);
+            if (oid.AsSpan().SequenceEqual(Asn1.Oid(OidEcdsaSha384)) || oid.AsSpan().SequenceEqual(Asn1.Oid(OidRsaSha384)))
+                return HashAlgorithmName.SHA384;
+            if (oid.AsSpan().SequenceEqual(Asn1.Oid(OidEcdsaSha512)) || oid.AsSpan().SequenceEqual(Asn1.Oid(OidRsaSha512)))
+                return HashAlgorithmName.SHA512;
+        }
+        catch { /* fall through to the SHA-256 default */ }
+        return HashAlgorithmName.SHA256;
+    }
+
     /// <summary>Verify that a certificate was signed by the given CA certificate.</summary>
     public static bool VerifyChain(TlsCertificate cert, TlsCertificate ca)
     {
@@ -234,17 +255,21 @@ public static class CertificateUtils
         byte[] tbsCertDer = Asn1.Wrap(0x30, certItems[0].value);
         byte[] sigBitString = certItems[2].value;
         byte[] signature = sigBitString[1..]; // skip unused-bits byte
+        // Hash named in the cert's signatureAlgorithm, not a hard-coded SHA-256, so a CA signing with
+        // SHA-384/512 verifies. (RSA here is PKCS#1 v1.5; RSA-PSS certs carry the hash in algorithm
+        // params and are not covered — use a ServerCertificateValidationCallback for those.)
+        HashAlgorithmName hash = HashFromCertSigAlg(certItems[1].value);
 
         if (ca.IsRsa)
         {
             using var rsa = RsaManaged.Create();
             rsa.ImportRSAPublicKey(ca.PublicKey, out _);
-            return rsa.VerifyData(tbsCertDer, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            return rsa.VerifyData(tbsCertDer, signature, hash, RSASignaturePadding.Pkcs1);
         }
         else
         {
             using var caEcdsa = ImportEcdsaPubKey(ca.PublicKey);
-            return caEcdsa.VerifyDataDer(tbsCertDer, signature, HashAlgorithmName.SHA256);
+            return caEcdsa.VerifyDataDer(tbsCertDer, signature, hash);
         }
     }
 

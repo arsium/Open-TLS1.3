@@ -39,6 +39,12 @@ public sealed class TlsConnection : IDisposable
 
     // Handshake message buffer (a single record can carry multiple messages)
     private readonly Queue<byte[]> _hsBuffer = new();
+    // Bytes of a handshake message that arrived split across record boundaries (RFC 8446 §5.1);
+    // held until the remainder arrives in a later record.
+    private byte[] _hsPartial = Array.Empty<byte>();
+    // Upper bound on a single reassembled handshake message — guards against an unbounded
+    // buffering DoS from a peer streaming records that claim an enormous message length.
+    private const int MaxHandshakeMessageLength = 1 << 20; // 1 MiB
 
     // Application-data read buffer
     private byte[] _readBuf = Array.Empty<byte>();
@@ -156,7 +162,6 @@ public sealed class TlsConnection : IDisposable
     private PostHsAuthState _postHsAuthState = PostHsAuthState.None;
     private byte[]? _pendingPostHsContext;
     private byte[]? _serverFinishedHash; // Transcript-Hash(CH..SF), used for DeriveAppSecrets
-    private byte[]? _postHandshakeBaseHash; // Transcript-Hash(CH..CF), used for post-handshake auth context (RFC 8446 §4.4.1)
 
     // OCSP stapling
     private bool _requestOcspStapling;  // client: request status_request extension
@@ -235,6 +240,23 @@ public sealed class TlsConnection : IDisposable
     /// <summary>Client: override the key-share groups offered in ClientHello (in preference order).</summary>
     public void SetOfferedGroups(NamedGroup[] groups) => _offeredGroups = groups;
 
+    // Client-side server-certificate trust (RFC 8446 leaves trust policy to the application).
+    // Permissive by default; enforced only when one of these is configured via TlsClient.
+    private TlsCertificate? _serverCaCertificate;
+    private Func<byte[], IReadOnlyList<string>, bool>? _serverCertValidator;
+
+    /// <summary>Client: configure server-certificate trust enforcement. When <paramref name="ca"/> is
+    /// non-null the server certificate is verified (signed by the trust anchor, in its validity window,
+    /// and — when a host was supplied — matching a SAN) and the handshake fails closed otherwise. When
+    /// <paramref name="validator"/> is non-null it is authoritative (receives the leaf DER + advisory
+    /// warnings). With neither set the client does NOT authenticate the server. Server/mTLS uses the
+    /// constructor's caCertificate instead.</summary>
+    public void SetServerCertificateValidation(TlsCertificate? ca, Func<byte[], IReadOnlyList<string>, bool>? validator)
+    {
+        _serverCaCertificate = ca;
+        _serverCertValidator = validator;
+    }
+
     // Build the ClientHello key_share list, honoring an optional offered-groups override.
     // GOST groups generate a fresh ephemeral (stored for the later shared-secret computation).
     private (NamedGroup, byte[])[] BuildClientKeyShares(
@@ -291,6 +313,15 @@ public sealed class TlsConnection : IDisposable
             CryptographicOperations.FixedTimeEquals(tail, DowngradeSentinel11))
             AlertAndThrow(AlertDescription.IllegalParameter,
                 "TLS version-downgrade sentinel detected (RFC 8446 §4.1.3)");
+    }
+
+    // RFC 8446 §4.1.3: the server MUST echo the client's legacy_session_id in ServerHello/HRR;
+    // a mismatch is fatal (also catches a server that ignored middlebox-compat session_id).
+    private void CheckSessionIdEcho(byte[] sent, byte[] echoed)
+    {
+        if (!sent.AsSpan().SequenceEqual(echoed))
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "ServerHello legacy_session_id_echo does not match the ClientHello session_id");
     }
 
     // RFC 8449: clamp our outgoing record size to the peer's advertised record_size_limit.
@@ -906,7 +937,8 @@ public sealed class TlsConnection : IDisposable
             binderTranscript.Update(truncatedCh);
             byte[] truncatedHash = binderTranscript.GetHash();
 
-            byte[] binderKey = _keySchedule.DeriveBinderKey();
+            // RFC 8446 §4.2.11.2: external (RFC 9258) PSKs use the "ext binder" label.
+            byte[] binderKey = _keySchedule.DeriveBinderKey(external: true);
             byte[] binder = HandshakeMessages.ComputePskBinder(binderKey, truncatedHash, _keySchedule.HashAlgorithm);
             HandshakeMessages.PatchPskBinder(chMsg, binder);
         }
@@ -936,7 +968,7 @@ public sealed class TlsConnection : IDisposable
             // Write actual early data under early traffic keys
             if (_earlyData != null && _earlyData.Length > 0)
             {
-                int maxSize = (int)_pskTicket!.MaxEarlyDataSize;
+                int maxSize = (int)(_pskTicket?.MaxEarlyDataSize ?? _externalPsk?.MaxEarlyDataSize ?? 0);
                 int toSend = Math.Min(_earlyData.Length, maxSize);
                 int pos = 0;
                 while (pos < toSend)
@@ -956,6 +988,7 @@ public sealed class TlsConnection : IDisposable
         byte[] shMsg = NextHandshake(HandshakeType.ServerHello);
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
+        CheckSessionIdEcho(sessionId, sh.SessionId);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
         VerifyEchAcceptConfirmation(shMsg, sh);
         HandshakePhaseHook.Mark("client/after-SH-received");
@@ -1086,6 +1119,7 @@ public sealed class TlsConnection : IDisposable
             shMsg = NextHandshake(HandshakeType.ServerHello);
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
             sh = HandshakeMessages.ParseServerHello(shBody);
+            CheckSessionIdEcho(sessionId, sh.SessionId);
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
@@ -1188,7 +1222,6 @@ public sealed class TlsConnection : IDisposable
 
             byte[] fullHash = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHash);
-            _postHandshakeBaseHash = fullHash;
             InstallAppKeys();
             IsHandshakeComplete = true;
             return;
@@ -1233,6 +1266,7 @@ public sealed class TlsConnection : IDisposable
         if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
             PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
+        EnforceServerCertificateTrust(serverCertDer, serverName);
         HandshakePhaseHook.Mark("client/after-Certificate-parsed");
 
         // 12. CertificateVerify
@@ -1325,7 +1359,6 @@ public sealed class TlsConnection : IDisposable
         // 18. Derive resumption master secret + switch to app keys
         byte[] fullHash2 = _transcript.GetHash();
         _keySchedule.DeriveResumptionMasterSecret(fullHash2);
-        _postHandshakeBaseHash = fullHash2;
         InstallAppKeys();
         IsHandshakeComplete = true;
     }
@@ -1446,9 +1479,9 @@ public sealed class TlsConnection : IDisposable
                     var hashAlg = _externalPsk.Suite == CipherSuite.TLS_AES_256_GCM_SHA384
                         ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
 
-                    // Verify binder
+                    // Verify binder — external PSKs use the "ext binder" label (RFC 8446 §4.2.11.2).
                     var tempKs = new KeySchedule(_externalPsk.Suite, psk);
-                    byte[] binderKey = tempKs.DeriveBinderKey();
+                    byte[] binderKey = tempKs.DeriveBinderKey(external: true);
 
                     // Truncated transcript: CH up to the binders
                     int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
@@ -1644,8 +1677,7 @@ public sealed class TlsConnection : IDisposable
                     }
                     else if (type == ContentType.Handshake)
                     {
-                        foreach (var m in HandshakeMessages.SplitMessages(payload))
-                            _hsBuffer.Enqueue(m);
+                        EnqueueHandshake(payload);
                         gotEndOfEarlyData = true;
                     }
                     else if (type == ContentType.ChangeCipherSpec) continue;
@@ -1679,8 +1711,7 @@ public sealed class TlsConnection : IDisposable
                     if (type == ContentType.ChangeCipherSpec) continue;
                     if (type == ContentType.Handshake)
                     {
-                        foreach (var m in HandshakeMessages.SplitMessages(payload))
-                            _hsBuffer.Enqueue(m);
+                        EnqueueHandshake(payload);
                     }
                     break;
                 }
@@ -1708,7 +1739,6 @@ public sealed class TlsConnection : IDisposable
             _transcript.Update(cfMsg);
             byte[] fullHashPsk = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHashPsk);
-            _postHandshakeBaseHash = fullHashPsk;
             InstallAppKeys();
             IsHandshakeComplete = true;
             IsResumed = true;
@@ -1725,6 +1755,9 @@ public sealed class TlsConnection : IDisposable
             _record.WriteRecord(ContentType.Handshake, crMsg);
             _transcript.Update(crMsg);
         }
+
+        // RFC 8446 §4.2.3: the server's signature scheme must be one the client advertised.
+        ValidateServerCertSigAlg(ch);
 
         // 15. Certificate (with chain, optionally compressed, optionally OCSP-stapled)
         byte[]? stapleResponse = (ch.RequestsOcspStapling && _ocspResponse != null) ? _ocspResponse : null;
@@ -1839,7 +1872,6 @@ public sealed class TlsConnection : IDisposable
         // 22. Derive resumption master secret + switch to app keys
         byte[] fullHashFull = _transcript.GetHash();
         _keySchedule.DeriveResumptionMasterSecret(fullHashFull);
-        _postHandshakeBaseHash = fullHashFull;
         InstallAppKeys();
         IsHandshakeComplete = true;
 
@@ -2161,10 +2193,11 @@ public sealed class TlsConnection : IDisposable
         if (_isServer) return;
         var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(body);
 
-        // Build post-handshake transcript: message_hash(Transcript-Hash(CH..CF)) + CR (RFC 8446 §4.4.1)
-        var phTranscript = new TranscriptHash(_keySchedule!.HashAlgorithm);
-        if (_postHandshakeBaseHash != null)
-            phTranscript.Update(HandshakeMessages.Frame(HandshakeType.MessageHash, _postHandshakeBaseHash));
+        // Post-handshake auth signs over the *continued* handshake transcript (RFC 8446 §4.4):
+        // the full CH..client-Finished transcript, then CertificateRequest, Certificate,
+        // CertificateVerify. The message_hash(254) synthetic is only the HRR CH1 rewrite (§4.4.1),
+        // not this — so clone the live transcript and keep appending to it.
+        var phTranscript = _transcript.Clone();
         byte[] crMsg = HandshakeMessages.Frame(HandshakeType.CertificateRequest, body);
         phTranscript.Update(crMsg);
 
@@ -2183,7 +2216,7 @@ public sealed class TlsConnection : IDisposable
             _record.WriteRecord(ContentType.Handshake, cvMsg);
             phTranscript.Update(cvMsg);
 
-            byte[] finVerify = _keySchedule.ComputeFinishedVerifyData(
+            byte[] finVerify = _keySchedule!.ComputeFinishedVerifyData(
                 _keySchedule.ClientAppTrafficSecret!, phTranscript.GetHash());
             _record.WriteRecord(ContentType.Handshake, HandshakeMessages.BuildFinished(finVerify));
         }
@@ -2193,7 +2226,7 @@ public sealed class TlsConnection : IDisposable
             _record.WriteRecord(ContentType.Handshake, emptyCert);
             phTranscript.Update(emptyCert);
 
-            byte[] finVerify = _keySchedule.ComputeFinishedVerifyData(
+            byte[] finVerify = _keySchedule!.ComputeFinishedVerifyData(
                 _keySchedule.ClientAppTrafficSecret!, phTranscript.GetHash());
             _record.WriteRecord(ContentType.Handshake, HandshakeMessages.BuildFinished(finVerify));
         }
@@ -2210,10 +2243,9 @@ public sealed class TlsConnection : IDisposable
         if (_postHsAuthState != PostHsAuthState.AwaitingCertificate)
             AlertAndThrow(AlertDescription.UnexpectedMessage, "Unexpected post-handshake Certificate");
 
-        // Post-handshake transcript: message_hash(Transcript-Hash(CH..CF)) + CR + Certificate (RFC 8446 §4.4.1)
-        _postHsTranscript = new TranscriptHash(_keySchedule!.HashAlgorithm);
-        if (_postHandshakeBaseHash != null)
-            _postHsTranscript.Update(HandshakeMessages.Frame(HandshakeType.MessageHash, _postHandshakeBaseHash));
+        // Continue the live CH..client-Finished transcript (RFC 8446 §4.4): CertificateRequest then
+        // the peer's Certificate. (message_hash(254) is only the HRR CH1 rewrite, not used here.)
+        _postHsTranscript = _transcript.Clone();
         byte[] crMsg = HandshakeMessages.BuildCertificateRequest(_pendingPostHsContext!, AdvertisedSigAlgs);
         _postHsTranscript.Update(crMsg);
         _postHsTranscript.Update(fullMsg);
@@ -2315,8 +2347,7 @@ public sealed class TlsConnection : IDisposable
             if (type != ContentType.Handshake)
                 throw new TlsException(AlertDescription.UnexpectedMessage, $"Expected Handshake, got {type}");
 
-            foreach (var m in HandshakeMessages.SplitMessages(payload))
-                _hsBuffer.Enqueue(m);
+            EnqueueHandshake(payload);
         }
 
         byte[] msg = _hsBuffer.Dequeue();
@@ -2342,13 +2373,45 @@ public sealed class TlsConnection : IDisposable
             if (type != ContentType.Handshake)
                 throw new TlsException(AlertDescription.UnexpectedMessage, $"Expected Handshake, got {type}");
 
-            foreach (var m in HandshakeMessages.SplitMessages(payload))
-                _hsBuffer.Enqueue(m);
+            EnqueueHandshake(payload);
         }
 
         byte[] msg = _hsBuffer.Dequeue();
         (hsType, _) = HandshakeMessages.Unframe(msg);
         return msg;
+    }
+
+    // Append a Handshake-record payload to the reassembly buffer, then peel off every complete
+    // length-prefixed handshake message into _hsBuffer. RFC 8446 §5.1: a single message may be
+    // fragmented across records, and several messages may be coalesced into one record. Any
+    // incomplete trailing message is retained in _hsPartial until the next record arrives.
+    private void EnqueueHandshake(byte[] payload)
+    {
+        byte[] buf;
+        if (_hsPartial.Length == 0)
+        {
+            buf = payload;
+        }
+        else
+        {
+            buf = new byte[_hsPartial.Length + payload.Length];
+            Buffer.BlockCopy(_hsPartial, 0, buf, 0, _hsPartial.Length);
+            Buffer.BlockCopy(payload, 0, buf, _hsPartial.Length, payload.Length);
+        }
+
+        int p = 0;
+        while (p + 4 <= buf.Length)
+        {
+            uint len = BinaryHelper.ReadUInt24(buf.AsSpan(p + 1));
+            long total = 4L + len;
+            if (total > MaxHandshakeMessageLength)
+                throw new TlsException(AlertDescription.DecodeError,
+                    $"Handshake message length {len} exceeds reassembly limit");
+            if (p + total > buf.Length) break; // incomplete tail — wait for more records
+            _hsBuffer.Enqueue(buf[p..(p + (int)total)]);
+            p += (int)total;
+        }
+        _hsPartial = p == buf.Length ? Array.Empty<byte>() : buf[p..];
     }
 
     private void InstallAppKeys()
@@ -2654,6 +2717,20 @@ public sealed class TlsConnection : IDisposable
         throw new TlsException(AlertDescription.HandshakeFailure, "No common cipher suite");
     }
 
+    /// <summary>RFC 8446 §4.2.3: for the standard TLS 1.3 suites, the server's CertificateVerify
+    /// signature scheme must be one the client offered in signature_algorithms. National suites
+    /// (GOST/SM) negotiate schemes the client selects directly without advertising them on the wire,
+    /// so the check is scoped to the standard suites to preserve that self-interop path.</summary>
+    private void ValidateServerCertSigAlg(ParsedClientHello ch)
+    {
+        bool standard = _keySchedule!.Suite is CipherSuite.TLS_AES_128_GCM_SHA256
+            or CipherSuite.TLS_AES_256_GCM_SHA384 or CipherSuite.TLS_CHACHA20_POLY1305_SHA256;
+        if (!standard || ch.SignatureAlgorithms == null) return;
+        if (Array.IndexOf(ch.SignatureAlgorithms, _certificate!.SignatureAlgorithm) < 0)
+            AlertAndThrow(AlertDescription.HandshakeFailure,
+                "Client's signature_algorithms does not include the server certificate's signature scheme");
+    }
+
     private static (NamedGroup group, byte[] key)? SelectKeyShare(
         (NamedGroup group, byte[] key)[] clientShares)
     {
@@ -2749,6 +2826,61 @@ public sealed class TlsConnection : IDisposable
         return hostname == pattern;
     }
 
+    // Client-side server-certificate trust enforcement. No-op on the server and when nothing is
+    // configured (permissive default). When a validator callback is set it is authoritative;
+    // otherwise, when a trust anchor is set, the leaf must be signed by it, be within its validity
+    // window, and (when a host was supplied) match a SAN — any failure aborts the handshake.
+    private void EnforceServerCertificateTrust(byte[] serverCertDer, string? serverName)
+    {
+        if (_isServer) return;
+
+        if (_serverCertValidator != null)
+        {
+            if (!_serverCertValidator(serverCertDer, CertificateWarnings))
+                AlertAndThrow(AlertDescription.BadCertificate,
+                    "Server certificate rejected by ServerCertificateValidationCallback");
+            return;
+        }
+
+        if (_serverCaCertificate == null) return; // permissive: no trust anchor configured
+
+        // 1. Chain: the leaf must be signed by the configured trust anchor.
+        var leaf = new TlsCertificate
+        {
+            DerData = serverCertDer,
+            PrivateKey = Array.Empty<byte>(),
+            PublicKey = Array.Empty<byte>(),
+            SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
+        };
+        if (!CertificateUtils.VerifyChain(leaf, _serverCaCertificate))
+            AlertAndThrow(AlertDescription.UnknownCa,
+                "Server certificate is not signed by the configured trust anchor");
+
+        // 2. Validity window.
+        try
+        {
+            var (notBefore, notAfter) = CertificateUtils.ParseCertificateValidity(serverCertDer);
+            var now = DateTime.UtcNow;
+            if (now < notBefore || now > notAfter)
+                AlertAndThrow(AlertDescription.CertificateExpired,
+                    "Server certificate is outside its validity period");
+        }
+        catch (TlsException) { throw; }
+        catch { AlertAndThrow(AlertDescription.BadCertificate, "Server certificate validity period could not be parsed"); }
+
+        // 3. Hostname (SAN) match when a host was supplied.
+        if (!string.IsNullOrEmpty(serverName))
+        {
+            var sans = CertificateUtils.ParseCertificateSAN(serverCertDer);
+            bool matched = false;
+            foreach (var san in sans)
+                if (MatchHostname(serverName, san)) { matched = true; break; }
+            if (!matched)
+                AlertAndThrow(AlertDescription.BadCertificate,
+                    $"Server certificate does not match hostname '{serverName}'");
+        }
+    }
+
     // Span input so callers from the new direct-decrypt path don't need to materialise
     // a byte[]. Existing byte[] callers (ReadAppData / ReadAppDataAsync) keep working
     // because byte[] implicitly converts to ReadOnlySpan<byte>.
@@ -2813,8 +2945,7 @@ public sealed class TlsConnection : IDisposable
             if (type != ContentType.Handshake)
                 throw new TlsException(AlertDescription.UnexpectedMessage, $"Expected Handshake, got {type}");
 
-            foreach (var m in HandshakeMessages.SplitMessages(payload))
-                _hsBuffer.Enqueue(m);
+            EnqueueHandshake(payload);
         }
 
         byte[] msg = _hsBuffer.Dequeue();
@@ -2840,8 +2971,7 @@ public sealed class TlsConnection : IDisposable
             if (type != ContentType.Handshake)
                 throw new TlsException(AlertDescription.UnexpectedMessage, $"Expected Handshake, got {type}");
 
-            foreach (var m in HandshakeMessages.SplitMessages(payload))
-                _hsBuffer.Enqueue(m);
+            EnqueueHandshake(payload);
         }
 
         byte[] msg = _hsBuffer.Dequeue();
@@ -3196,6 +3326,36 @@ public sealed class TlsConnection : IDisposable
             byte[] binder = HandshakeMessages.ComputePskBinder(binderKey, truncatedHash, _keySchedule.HashAlgorithm);
             HandshakeMessages.PatchPskBinder(chMsg, binder);
         }
+        else if (_externalPsk != null)
+        {
+            // RFC 9258: imported external PSK (mirrors the sync client so the async path supports it too).
+            psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+
+            _keySchedule = new KeySchedule(_externalPsk.Suite, psk);
+            _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
+
+            int binderLenE = _keySchedule.HashLen;
+            byte[] placeholderE = new byte[binderLenE];
+            offer0Rtt = _externalPsk.MaxEarlyDataSize > 0;
+
+            chMsg = HandshakeMessages.BuildClientHelloWithPsk(
+                clientRandom, sessionId, suites, keyShares,
+                _externalPsk.Identity, 0, placeholderE, // external PSK age is always 0
+                offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
+                requestOcspStapling: _requestOcspStapling);
+
+            int bindersLenE = HandshakeMessages.PskBindersTailLength(binderLenE);
+            byte[] truncatedChE = chMsg[..^bindersLenE];
+
+            var binderTranscriptE = new TranscriptHash(_keySchedule.HashAlgorithm);
+            binderTranscriptE.Update(truncatedChE);
+            byte[] truncatedHashE = binderTranscriptE.GetHash();
+
+            // RFC 8446 §4.2.11.2: external PSKs use the "ext binder" label.
+            byte[] binderKeyE = _keySchedule.DeriveBinderKey(external: true);
+            byte[] binderE = HandshakeMessages.ComputePskBinder(binderKeyE, truncatedHashE, _keySchedule.HashAlgorithm);
+            HandshakeMessages.PatchPskBinder(chMsg, binderE);
+        }
         else
         {
             // ECH (or GREASE-ECH) if configured, else a normal ClientHello.
@@ -3219,7 +3379,7 @@ public sealed class TlsConnection : IDisposable
 
             if (_earlyData != null && _earlyData.Length > 0)
             {
-                int maxSize = (int)_pskTicket!.MaxEarlyDataSize;
+                int maxSize = (int)(_pskTicket?.MaxEarlyDataSize ?? _externalPsk?.MaxEarlyDataSize ?? 0);
                 int toSend = Math.Min(_earlyData.Length, maxSize);
                 int pos = 0;
                 while (pos < toSend)
@@ -3237,6 +3397,7 @@ public sealed class TlsConnection : IDisposable
         byte[] shMsg = await NextHandshakeAsync(HandshakeType.ServerHello, ct).ConfigureAwait(false);
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
+        CheckSessionIdEcho(sessionId, sh.SessionId);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
         VerifyEchAcceptConfirmation(shMsg, sh);
 
@@ -3366,6 +3527,7 @@ public sealed class TlsConnection : IDisposable
             shMsg = await NextHandshakeAsync(HandshakeType.ServerHello, ct).ConfigureAwait(false);
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
             sh = HandshakeMessages.ParseServerHello(shBody);
+            CheckSessionIdEcho(sessionId, sh.SessionId);
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
@@ -3451,7 +3613,6 @@ public sealed class TlsConnection : IDisposable
 
             byte[] fullHash = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHash);
-            _postHandshakeBaseHash = fullHash;
             InstallAppKeys();
             IsHandshakeComplete = true;
             return;
@@ -3496,6 +3657,7 @@ public sealed class TlsConnection : IDisposable
         if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
             PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
+        EnforceServerCertificateTrust(serverCertDer, serverName);
 
         // 12. CertificateVerify
         byte[] preCvHash = _transcript.GetHash();
@@ -3576,7 +3738,6 @@ public sealed class TlsConnection : IDisposable
         // 18. Derive resumption master secret + switch to app keys
         byte[] fullHash2 = _transcript.GetHash();
         _keySchedule.DeriveResumptionMasterSecret(fullHash2);
-        _postHandshakeBaseHash = fullHash2;
         InstallAppKeys();
         IsHandshakeComplete = true;
     }
@@ -3609,51 +3770,89 @@ public sealed class TlsConnection : IDisposable
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
 
-        if (ch.PreSharedKeyData != null && ch.OffersPskDheKe && _ticketEncryption != null)
+        // RFC 8446 §4.2.9 / §4.2.11 + RFC 9258: try ticket resumption first, then external PSK
+        // (mirrors the sync HandshakeAsServer so external PSK works on the async path too).
+        if (ch.PreSharedKeyData != null && ch.OffersPskDheKe && (_ticketEncryption != null || _externalPsk != null))
         {
             var (identities, ages, binders) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
             for (int i = 0; i < identities.Length; i++)
             {
-                byte[]? plaintext = _ticketEncryption.Open(identities[i]);
-                if (plaintext == null) continue;
-
-                var decoded = TicketEncryption.DecodeTicketState(plaintext);
-                if (decoded == null) continue;
-                var (resumptionSecret, ticketSuite, ageAdd, issuedAt, maxEarly) = decoded.Value;
-
-                if (Array.IndexOf(ch.CipherSuites, ticketSuite) < 0) continue;
-                if (!IsSupportedSuite(ticketSuite)) continue;
-                var elapsed = DateTime.UtcNow - issuedAt;
-                if (elapsed.TotalSeconds > 604800) continue;
-
-                uint reportedAgeMs = ages[i] - ageAdd;
-                uint expectedAgeMs = (uint)Math.Min(elapsed.TotalMilliseconds, uint.MaxValue);
-                long ageDelta = (long)reportedAgeMs - (long)expectedAgeMs;
-                if (ageDelta < 0) ageDelta = -ageDelta;
-                if (ageDelta > 10_000) continue;
-
-                psk = resumptionSecret;
-                var hashAlg = ticketSuite == CipherSuite.TLS_AES_256_GCM_SHA384
-                    ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
-
-                var tempKs = new KeySchedule(ticketSuite, psk);
-                byte[] binderKey = tempKs.DeriveBinderKey();
-
-                int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                byte[] truncatedCh = chMsg[..^bindersLen];
-                var binderTranscript = new TranscriptHash(hashAlg);
-                binderTranscript.Update(truncatedCh);
-                byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
-                    binderKey, binderTranscript.GetHash(), hashAlg);
-
-                if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                byte[]? plaintext = _ticketEncryption?.Open(identities[i]);
+                if (plaintext != null)
                 {
-                    isPskResumption = true;
-                    suite = ticketSuite;
-                    pskMaxEarlyData = maxEarly;
-                    accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
-                        && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
-                    break;
+                    var decoded = TicketEncryption.DecodeTicketState(plaintext);
+                    if (decoded == null) continue;
+                    var (resumptionSecret, ticketSuite, ageAdd, issuedAt, maxEarly) = decoded.Value;
+
+                    if (Array.IndexOf(ch.CipherSuites, ticketSuite) < 0) continue;
+                    if (!IsSupportedSuite(ticketSuite)) continue;
+                    var elapsed = DateTime.UtcNow - issuedAt;
+                    if (elapsed.TotalSeconds > 604800) continue;
+
+                    uint reportedAgeMs = ages[i] - ageAdd;
+                    uint expectedAgeMs = (uint)Math.Min(elapsed.TotalMilliseconds, uint.MaxValue);
+                    long ageDelta = (long)reportedAgeMs - (long)expectedAgeMs;
+                    if (ageDelta < 0) ageDelta = -ageDelta;
+                    if (ageDelta > 10_000) continue;
+
+                    psk = resumptionSecret;
+                    var hashAlg = ticketSuite == CipherSuite.TLS_AES_256_GCM_SHA384
+                        ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
+
+                    var tempKs = new KeySchedule(ticketSuite, psk);
+                    byte[] binderKey = tempKs.DeriveBinderKey();
+
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
+                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    var binderTranscript = new TranscriptHash(hashAlg);
+                    binderTranscript.Update(truncatedCh);
+                    byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
+                        binderKey, binderTranscript.GetHash(), hashAlg);
+
+                    if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                    {
+                        isPskResumption = true;
+                        suite = ticketSuite;
+                        pskMaxEarlyData = maxEarly;
+                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
+                            && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
+                        break;
+                    }
+                }
+                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(_externalPsk.Identity.AsSpan()))
+                {
+                    // External PSK (RFC 9258): suite must be offered + supported, age MUST be 0.
+                    if (Array.IndexOf(ch.CipherSuites, _externalPsk.Suite) < 0) continue;
+                    if (!IsSupportedSuite(_externalPsk.Suite)) continue;
+                    if (ages[i] != 0) continue;
+
+                    psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+                    var hashAlg = _externalPsk.Suite == CipherSuite.TLS_AES_256_GCM_SHA384
+                        ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
+
+                    // External PSKs use the "ext binder" label (RFC 8446 §4.2.11.2).
+                    var tempKs = new KeySchedule(_externalPsk.Suite, psk);
+                    byte[] binderKey = tempKs.DeriveBinderKey(external: true);
+
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
+                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    var binderTranscript = new TranscriptHash(hashAlg);
+                    binderTranscript.Update(truncatedCh);
+                    byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
+                        binderKey, binderTranscript.GetHash(), hashAlg);
+
+                    if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
+                    {
+                        isPskResumption = true;
+                        suite = _externalPsk.Suite;
+                        pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
+                        // External-PSK 0-RTT anti-replay: single-use the binder (bound to this exact
+                        // ClientHello), requires a replay store; without one, fall back to 1-RTT.
+                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                            && _ticketEncryption != null
+                            && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
+                        break;
+                    }
                 }
             }
         }
@@ -3810,8 +4009,7 @@ public sealed class TlsConnection : IDisposable
                     }
                     else if (type == ContentType.Handshake)
                     {
-                        foreach (var m in HandshakeMessages.SplitMessages(payload))
-                            _hsBuffer.Enqueue(m);
+                        EnqueueHandshake(payload);
                         gotEndOfEarlyData = true;
                     }
                     else if (type == ContentType.ChangeCipherSpec) continue;
@@ -3841,8 +4039,7 @@ public sealed class TlsConnection : IDisposable
                     if (type == ContentType.ChangeCipherSpec) continue;
                     if (type == ContentType.Handshake)
                     {
-                        foreach (var m in HandshakeMessages.SplitMessages(payload))
-                            _hsBuffer.Enqueue(m);
+                        EnqueueHandshake(payload);
                     }
                     break;
                 }
@@ -3867,7 +4064,6 @@ public sealed class TlsConnection : IDisposable
             _transcript.Update(cfMsg);
             byte[] fullHashPsk = _transcript.GetHash();
             _keySchedule.DeriveResumptionMasterSecret(fullHashPsk);
-            _postHandshakeBaseHash = fullHashPsk;
             InstallAppKeys();
             IsHandshakeComplete = true;
             IsResumed = true;
@@ -3884,6 +4080,9 @@ public sealed class TlsConnection : IDisposable
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
             _transcript.Update(crMsg);
         }
+
+        // RFC 8446 §4.2.3: the server's signature scheme must be one the client advertised.
+        ValidateServerCertSigAlg(ch);
 
         // 15. Certificate (with chain, optionally compressed, optionally OCSP-stapled)
         byte[]? stapleResponse = (ch.RequestsOcspStapling && _ocspResponse != null) ? _ocspResponse : null;
@@ -3992,7 +4191,6 @@ public sealed class TlsConnection : IDisposable
         // 22. Derive resumption master secret + switch to app keys
         byte[] fullHashFull = _transcript.GetHash();
         _keySchedule.DeriveResumptionMasterSecret(fullHashFull);
-        _postHandshakeBaseHash = fullHashFull;
         InstallAppKeys();
         IsHandshakeComplete = true;
 

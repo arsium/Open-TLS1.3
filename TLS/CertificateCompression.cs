@@ -92,10 +92,25 @@ public static class CertificateCompression
 
             case AlgorithmBrotli:
             {
-                byte[] result = Brotli.DecompressBuffer(compressed, 0, compressed.Length);
-                if (result.Length != uncompressedLength)
+                // Decompress through a stream and stop at uncompressedLength (already range-checked
+                // above), then confirm the stream ends there — so a malformed Brotli payload can't
+                // expand without bound before the length check. Mirrors the zlib path.
+                using var inMs = new System.IO.MemoryStream(compressed);
+                using var bs = new BrotliStream(inMs, System.IO.Compression.CompressionMode.Decompress, leaveOpen: true);
+                byte[] result = new byte[uncompressedLength];
+                int total = 0;
+                while (total < uncompressedLength)
+                {
+                    int n = bs.Read(result, total, uncompressedLength - total);
+                    if (n <= 0) break;
+                    total += n;
+                }
+                if (total != uncompressedLength)
                     throw new TlsException(AlertDescription.DecodeError,
-                        $"Brotli decompression length mismatch: got {result.Length}, expected {uncompressedLength}");
+                        $"Brotli decompression length mismatch: got {total}, expected {uncompressedLength}");
+                if (bs.Read(new byte[1], 0, 1) > 0)
+                    throw new TlsException(AlertDescription.DecodeError,
+                        "Brotli stream longer than declared uncompressed_length");
                 return result;
             }
 

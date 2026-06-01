@@ -56,13 +56,11 @@
     <Compile Include="$(MSBuildThisFileDirectory)KeyLogger.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)CertificateCompression.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Keccak.cs" />
-    <Compile Include="$(MSBuildThisFileDirectory)InlineMethodStub.cs" />
   </ItemGroup>
-  <!-- ZstdSharp: pure managed C# zstd port (included as source for RFC 8879 cert compression) -->
-  <ItemGroup>
-    <Compile Include="$(MSBuildThisFileDirectory)Zstd\**\*.cs" />
-  </ItemGroup>
-  <!-- OpenGost: vendored managed GOST crypto (Grasshopper/Magma/Streebog/CMAC) -->
+  <!-- Shared vendored crypto (BouncyCastle + ZstdSharp). These now live in Open-Crypto-Core and
+       are shared with Open-QUIC instead of each project carrying a byte-identical copy. -->
+  <Import Project="..\..\Open-Crypto-Core\Open-Crypto-Core.projitems" Label="Shared" Condition="'$(OpenCryptoCoreImported)' != 'true'" />
+  <!-- OpenGost: vendored managed GOST crypto (Grasshopper/Magma/Streebog/CMAC) — TLS-only -->
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)OpenGost\**\*.cs" />
   </ItemGroup>
@@ -70,11 +68,5 @@
        System.IO.Compression.BrotliStream so RFC 8879 cert compression has no native dep. -->
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)BrotliSharp\**\*.cs" />
-  </ItemGroup>
-  <!-- BouncyCastle: vendored crypto, math, security, util, asn1 subtrees from bc-csharp.
-       Used to replace System.Security.Cryptography for AES-GCM, SHA-2, HMAC, RSA, and
-       NIST-curve ECDH/ECDSA, removing the BCrypt/OpenSSL native dependency on those paths. -->
-  <ItemGroup>
-    <Compile Include="$(MSBuildThisFileDirectory)BouncyCastle\**\*.cs" />
   </ItemGroup>
 </Project>

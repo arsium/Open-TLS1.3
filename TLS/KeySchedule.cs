@@ -83,11 +83,13 @@ public sealed class KeySchedule : IDisposable
         _earlySecret = Hkdf.Extract(_hash, new byte[_hashLen], ikm);
     }
 
-    /// <summary>Derive the binder key for PSK verification (RFC 8446 §4.2.11.2).</summary>
-    public byte[] DeriveBinderKey()
+    /// <summary>Derive the binder key for PSK verification (RFC 8446 §4.2.11.2).
+    /// Resumption PSKs use the "res binder" label; external PSKs (incl. RFC 9258 imported keys)
+    /// use "ext binder". Both peers MUST agree, so the caller passes the PSK's provenance.</summary>
+    public byte[] DeriveBinderKey(bool external = false)
     {
         byte[] emptyHash = HashEmpty();
-        return Hkdf.DeriveSecret(_hash, _earlySecret, "res binder", emptyHash);
+        return Hkdf.DeriveSecret(_hash, _earlySecret, external ? "ext binder" : "res binder", emptyHash);
     }
 
     /// <summary>Derive client early traffic secret for 0-RTT (RFC 8446 §7.1).</summary>

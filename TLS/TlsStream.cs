@@ -15,10 +15,16 @@ public sealed class TlsStream : IDisposable
         _tcp = tcp;
     }
 
-    /// <summary>DER-encoded peer certificate, or null if no peer cert was provided.</summary>
+    /// <summary>DER-encoded peer certificate, or null if no peer cert was provided.
+    /// NOTE: on the client side the library does NOT build or validate a chain to a trust anchor —
+    /// it only proves the peer holds this certificate's private key (TLS 1.3 CertificateVerify).
+    /// The application MUST apply its own trust policy to this certificate, or configure client-side
+    /// validation via <see cref="TlsClient"/>.</summary>
     public byte[]? PeerCertificate => _conn.PeerCertificateData;
 
-    /// <summary>Warnings from optional X.509 validation (expiration, hostname mismatch). Empty = all checks passed.</summary>
+    /// <summary>Advisory warnings from optional X.509 checks (notBefore/notAfter validity window,
+    /// SAN/hostname mismatch). An empty list means those specific checks produced no warning — it does
+    /// NOT mean the certificate chain was built, validated, or trusted. See <see cref="PeerCertificate"/>.</summary>
     public IReadOnlyList<string> CertificateWarnings => _conn.CertificateWarnings;
 
     /// <summary>True if this connection was established via PSK session resumption.</summary>

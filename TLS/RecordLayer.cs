@@ -123,7 +123,7 @@ public sealed class RecordLayer : IDisposable
                         throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                     byte rawType = destination[end];
-                    if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                    if (rawType != (byte)ContentType.Alert
                         && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                         throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType}");
 
@@ -144,7 +144,7 @@ public sealed class RecordLayer : IDisposable
                     throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                 byte rawType2 = ptRented[end2];
-                if (rawType2 != (byte)ContentType.ChangeCipherSpec && rawType2 != (byte)ContentType.Alert
+                if (rawType2 != (byte)ContentType.Alert
                     && rawType2 != (byte)ContentType.Handshake && rawType2 != (byte)ContentType.ApplicationData)
                     throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType2}");
 
@@ -224,7 +224,7 @@ public sealed class RecordLayer : IDisposable
                         throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                     byte rawType = destSpan[end];
-                    if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                    if (rawType != (byte)ContentType.Alert
                         && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                         throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType}");
 
@@ -243,7 +243,7 @@ public sealed class RecordLayer : IDisposable
                     throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                 byte rawType2 = ptRented[end2];
-                if (rawType2 != (byte)ContentType.ChangeCipherSpec && rawType2 != (byte)ContentType.Alert
+                if (rawType2 != (byte)ContentType.Alert
                     && rawType2 != (byte)ContentType.Handshake && rawType2 != (byte)ContentType.ApplicationData)
                     throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType2}");
 
@@ -319,7 +319,7 @@ public sealed class RecordLayer : IDisposable
                     throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                 byte rawType = ptRented[end];
-                if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                if (rawType != (byte)ContentType.Alert
                     && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                     throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType}");
 
@@ -470,7 +470,7 @@ public sealed class RecordLayer : IDisposable
                 if (end < 0) return null;
 
                 byte rawType = ptRented[end];
-                if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                if (rawType != (byte)ContentType.Alert
                     && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                     return null; // invalid inner content type — treat as failed trial decryption
 
@@ -524,7 +524,7 @@ public sealed class RecordLayer : IDisposable
                 if (end < 0) return null;
 
                 byte rawType = ptRented[end];
-                if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                if (rawType != (byte)ContentType.Alert
                     && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                     return null;
 
@@ -582,7 +582,7 @@ public sealed class RecordLayer : IDisposable
                     throw new TlsException(AlertDescription.UnexpectedMessage, "Empty inner plaintext");
 
                 byte rawType = ptRented[end];
-                if (rawType != (byte)ContentType.ChangeCipherSpec && rawType != (byte)ContentType.Alert
+                if (rawType != (byte)ContentType.Alert
                     && rawType != (byte)ContentType.Handshake && rawType != (byte)ContentType.ApplicationData)
                     throw new TlsException(AlertDescription.UnexpectedMessage, $"Invalid inner content type: {rawType}");
 
