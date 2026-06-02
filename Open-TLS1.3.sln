@@ -107,12 +107,19 @@ Global
 		SolutionGuid = {D9C1D0EB-EBA1-4B39-AD47-BD79E2D11CFE}
 	EndGlobalSection
 	GlobalSection(SharedMSBuildProjectFiles) = preSolution
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{03c12519-fb0b-4c22-9179-26bc2ae0f791}*SharedItemsImports = 13
 		TLS\TLS.projitems*{03c12519-fb0b-4c22-9179-26bc2ae0f791}*SharedItemsImports = 13
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{16a39436-d754-426d-b411-104876798508}*SharedItemsImports = 5
 		TLS\TLS.projitems*{16a39436-d754-426d-b411-104876798508}*SharedItemsImports = 5
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{4d2307ac-2124-4a27-9005-e4d924b0846a}*SharedItemsImports = 5
 		TLS\TLS.projitems*{4d2307ac-2124-4a27-9005-e4d924b0846a}*SharedItemsImports = 5
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{71c8122e-248e-4617-b04e-76374316dd44}*SharedItemsImports = 5
 		TLS\TLS.projitems*{71c8122e-248e-4617-b04e-76374316dd44}*SharedItemsImports = 5
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{759ec0b1-0f21-40c0-8129-efe165a6796e}*SharedItemsImports = 5
 		TLS\TLS.projitems*{759ec0b1-0f21-40c0-8129-efe165a6796e}*SharedItemsImports = 5
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{9af297c2-7ffa-4f8d-ad50-eed35936dcef}*SharedItemsImports = 5
 		TLS\TLS.projitems*{9af297c2-7ffa-4f8d-ad50-eed35936dcef}*SharedItemsImports = 5
+		..\Open-Crypto-Core\Open-Crypto-Core.projitems*{e8a78997-b804-4d00-bf46-133d3927f587}*SharedItemsImports = 5
 		TLS\TLS.projitems*{e8a78997-b804-4d00-bf46-133d3927f587}*SharedItemsImports = 5
 	EndGlobalSection
 EndGlobal

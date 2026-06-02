@@ -47,6 +47,12 @@ public sealed class TlsStream : IDisposable
     /// <summary>Negotiated ALPN protocol, or null if ALPN was not used.</summary>
     public string? NegotiatedAlpn => _conn.NegotiatedAlpn;
 
+    /// <summary>The key-exchange group negotiated for this connection (reflecting any HelloRetryRequest).</summary>
+    public NamedGroup NegotiatedGroup => _conn.NegotiatedGroup;
+
+    /// <summary>The cipher suite negotiated for this connection.</summary>
+    public CipherSuite NegotiatedCipherSuite => _conn.NegotiatedCipherSuite;
+
     /// <summary>OCSP response stapled by the server, or null if not provided.</summary>
     public byte[]? PeerOcspResponse => _conn.PeerOcspResponse;
 

@@ -46,10 +46,13 @@ public static class HandshakeMessages
     public static byte[] BuildClientHello(byte[] clientRandom, byte[] sessionId,
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
         string? serverName = null, byte[]? cookie = null, string[]? alpnProtocols = null,
-        bool requestOcspStapling = false, ushort ticketRequestCount = 0)
+        bool requestOcspStapling = false, ushort ticketRequestCount = 0,
+        SignatureScheme[]? offeredSigAlgs = null,
+        NamedGroup[]? offeredGroups = null)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-            serverName, cookie, null, false, alpnProtocols, requestOcspStapling, ticketRequestCount);
+            serverName, cookie, null, false, alpnProtocols, requestOcspStapling, ticketRequestCount,
+            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups);
     }
 
     /// <summary>Build ClientHello with PSK and optional early_data extension.</summary>
@@ -58,11 +61,14 @@ public static class HandshakeMessages
         byte[] pskIdentity, uint obfuscatedAge, byte[] binderPlaceholder,
         bool offerEarlyData, string? serverName = null, byte[]? cookie = null,
         string[]? alpnProtocols = null, bool requestOcspStapling = false,
-        ushort ticketRequestCount = 0)
+        ushort ticketRequestCount = 0, bool certWithExternPsk = false,
+        SignatureScheme[]? offeredSigAlgs = null,
+        NamedGroup[]? offeredGroups = null)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
             serverName, cookie, (pskIdentity, obfuscatedAge, binderPlaceholder), offerEarlyData,
-            alpnProtocols, requestOcspStapling, ticketRequestCount);
+            alpnProtocols, requestOcspStapling, ticketRequestCount, certWithExternPsk: certWithExternPsk,
+            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups);
     }
 
     /// <summary>
@@ -89,7 +95,9 @@ public static class HandshakeMessages
         string? serverName, byte[]? cookie,
         (byte[] identity, uint age, byte[] binder)? psk, bool offerEarlyData,
         string[]? alpnProtocols, bool requestOcspStapling, ushort ticketRequestCount = 0,
-        byte[]? echExtensionData = null)
+        byte[]? echExtensionData = null, bool certWithExternPsk = false,
+        SignatureScheme[]? offeredSigAlgs = null,
+        NamedGroup[]? offeredGroups = null)
     {
         // ClientHello body fits comfortably in 1-2 KB without PSK; pre-size to avoid
         // most internal regrowths inside ArrayBufferWriter.
@@ -109,7 +117,7 @@ public static class HandshakeMessages
         BinaryHelper.WriteByte(bw, 1); BinaryHelper.WriteByte(bw, 0); // compression_methods = {null}
 
         byte[] ext = BuildClientHelloExtensions(keyShares, serverName, cookie,
-            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, echExtensionData);
+            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, echExtensionData, certWithExternPsk, offeredSigAlgs, offeredGroups);
         BinaryHelper.WriteUInt16(bw, (ushort)ext.Length);       // extensions length
         BinaryHelper.WriteBytes(bw, ext);
 
@@ -157,6 +165,7 @@ public static class HandshakeMessages
         byte[]? echData = null;
         bool isOuterCH = false;
         bool offersPskDheKe = false;
+        bool offersCertWithExternPsk = false;
 
         if (p < body.Length)
         {
@@ -223,6 +232,10 @@ public static class HandshakeMessages
                 else if (et == ExtensionType.EarlyData)
                 {
                     offersEarlyData = true;
+                }
+                else if (et == ExtensionType.CertWithExternPsk)
+                {
+                    offersCertWithExternPsk = true; // draft-ietf-tls-8773bis flag (empty body)
                 }
                 else if (et == ExtensionType.StatusRequest)
                 {
@@ -334,7 +347,8 @@ public static class HandshakeMessages
             SignatureAlgorithmsCert = sigAlgsCert,
             EncryptedClientHelloData = echData,
             IsOuterClientHello = isOuterCH,
-            OffersPskDheKe = offersPskDheKe
+            OffersPskDheKe = offersPskDheKe,
+            OffersCertWithExternPsk = offersCertWithExternPsk
         };
     }
 
@@ -429,6 +443,7 @@ public static class HandshakeMessages
         byte[]? keyShare = null;
         byte[]? cookie = null;
         int selectedPsk = -1;
+        bool certWithExternPsk = false;
 
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
         EnsureRemaining(body, p, extLen, "ServerHello extensions block");
@@ -467,6 +482,10 @@ public static class HandshakeMessages
                 EnsureRemaining(ed, 0, 2, "PSK selected_identity");
                 selectedPsk = BinaryHelper.ReadUInt16(ed.AsSpan(0));
             }
+            else if (et == ExtensionType.CertWithExternPsk)
+            {
+                certWithExternPsk = true; // draft-ietf-tls-8773bis: server agreed to cert + external PSK
+            }
         }
 
         if (!isHrr && keyShare == null && selectedPsk < 0)
@@ -481,7 +500,8 @@ public static class HandshakeMessages
             KeyShare = keyShare,
             IsHelloRetryRequest = isHrr,
             Cookie = cookie,
-            SelectedPskIndex = selectedPsk
+            SelectedPskIndex = selectedPsk,
+            CertWithExternPsk = certWithExternPsk
         };
     }
 
@@ -592,7 +612,8 @@ public static class HandshakeMessages
 
     /// <summary>Build ServerHello with pre_shared_key extension (for PSK resumption).</summary>
     public static byte[] BuildServerHelloWithPsk(byte[] serverRandom, byte[] sessionId,
-        CipherSuite suite, NamedGroup group, byte[] pubKey, ushort selectedPskIndex)
+        CipherSuite suite, NamedGroup group, byte[] pubKey, ushort selectedPskIndex,
+        bool certWithExternPsk = false)
     {
         var bw = new ArrayBufferWriter<byte>(256);
 
@@ -618,6 +639,9 @@ public static class HandshakeMessages
         }
         // pre_shared_key (selected index)
         WriteExtension(ebw, ExtensionType.PreSharedKey, BuildPreSharedKeyServerExtension(selectedPskIndex));
+        // tls_cert_with_extern_psk (draft-ietf-tls-8773bis): signal cert + external PSK was accepted.
+        if (certWithExternPsk)
+            WriteExtension(ebw, ExtensionType.CertWithExternPsk, ReadOnlySpan<byte>.Empty);
 
         BinaryHelper.WriteUInt16(bw, (ushort)ebw.WrittenCount);
         BinaryHelper.WriteBytes(bw, ebw.WrittenSpan);
@@ -1124,6 +1148,31 @@ public static class HandshakeMessages
 
     // ----- Extension building -----
 
+    // Default client signature_algorithms advertisement. Includes the draft ML-DSA PQ schemes
+    // (draft-ietf-tls-mldsa, an Internet-Draft) — "we accept these for the peer's signature".
+    // Overridable per-connection via TlsConnection.SetOfferedSignatureSchemes.
+    private static readonly SignatureScheme[] DefaultClientSigAlgs =
+    {
+        SignatureScheme.EcdsaSecp256r1Sha256,
+        SignatureScheme.EcdsaSecp384r1Sha384,
+        SignatureScheme.Ed25519,
+        SignatureScheme.RsaPssRsaeSha256,
+        SignatureScheme.RsaPssRsaeSha384,
+        SignatureScheme.MlDsa44,
+        SignatureScheme.MlDsa65,
+        SignatureScheme.MlDsa87,
+    };
+
+    // Default client supported_groups advertisement — deliberately broader than the default key_shares
+    // (the two extra hybrids cost ~MBs to pre-generate, so we advertise willingness and let the server
+    // HRR to them on demand). Overridable per-connection via TlsConnection.SetOfferedGroups, which then
+    // restricts the advertisement to exactly the offered groups.
+    private static readonly NamedGroup[] DefaultSupportedGroups =
+    {
+        NamedGroup.X25519MLKEM768, NamedGroup.SecP256r1MLKEM768, NamedGroup.SecP384r1MLKEM1024,
+        NamedGroup.X25519, NamedGroup.X448, NamedGroup.Secp256r1, NamedGroup.Secp384r1,
+    };
+
     private static byte[] BuildClientHelloExtensions(
         (NamedGroup group, byte[] pubKey)[] keyShares,
         string? serverName, byte[]? cookie,
@@ -1132,7 +1181,10 @@ public static class HandshakeMessages
         string[]? alpnProtocols = null,
         bool requestOcspStapling = false,
         ushort ticketRequestCount = 0,
-        byte[]? echExtensionData = null)
+        byte[]? echExtensionData = null,
+        bool certWithExternPsk = false,
+        SignatureScheme[]? offeredSigAlgs = null,
+        NamedGroup[]? offeredGroups = null)
     {
         // 768 B fits a typical ClientHello extensions block (a few hundred bytes of
         // groups/sigalgs + key_shares of various sizes). The writer grows if needed.
@@ -1190,42 +1242,36 @@ public static class HandshakeMessages
             WriteExtension(bw, ExtensionType.CertificateCompression, ccBody);
         }
 
-        // Supported Groups
+        // Supported Groups. Defaults to the stack's full set (advertising support for groups we won't
+        // pre-generate a key_share for, so the server may HRR to one); a caller can restrict the
+        // advertisement via SetOfferedGroups, after which it matches the offered key_shares exactly.
         {
-            ReadOnlySpan<NamedGroup> groups = stackalloc NamedGroup[] {
-                NamedGroup.X25519MLKEM768, NamedGroup.SecP256r1MLKEM768, NamedGroup.SecP384r1MLKEM1024,
-                NamedGroup.X25519, NamedGroup.X448, NamedGroup.Secp256r1, NamedGroup.Secp384r1
-            };
+            NamedGroup[] groups = offeredGroups ?? DefaultSupportedGroups;
             int bodyLen = 2 + (groups.Length + 1) * 2; // listLen + GREASE + groups
-            Span<byte> body = stackalloc byte[bodyLen];
+            byte[] body = new byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)((groups.Length + 1) * 2));
-            BinaryHelper.WriteUInt16(body.Slice(2), Grease.Group); // RFC 8701
+            BinaryHelper.WriteUInt16(body.AsSpan(2), Grease.Group); // RFC 8701
             int off = 4;
             foreach (var g in groups)
             {
-                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)g);
+                BinaryHelper.WriteUInt16(body.AsSpan(off), (ushort)g);
                 off += 2;
             }
             WriteExtension(bw, ExtensionType.SupportedGroups, body);
         }
 
-        // Signature Algorithms (for handshake signatures)
+        // Signature Algorithms (for handshake signatures). Defaults to the stack's schemes (incl. the
+        // draft ML-DSA PQ schemes); a caller can override the advertisement via SetOfferedSignatureSchemes.
         {
-            ReadOnlySpan<SignatureScheme> sigAlgs = stackalloc SignatureScheme[] {
-                SignatureScheme.EcdsaSecp256r1Sha256,
-                SignatureScheme.EcdsaSecp384r1Sha384,
-                SignatureScheme.Ed25519,
-                SignatureScheme.RsaPssRsaeSha256,
-                SignatureScheme.RsaPssRsaeSha384
-            };
+            SignatureScheme[] sigAlgs = offeredSigAlgs ?? DefaultClientSigAlgs;
             int bodyLen = 2 + (sigAlgs.Length + 1) * 2;
-            Span<byte> body = stackalloc byte[bodyLen];
+            byte[] body = new byte[bodyLen];
             BinaryHelper.WriteUInt16(body, (ushort)((sigAlgs.Length + 1) * 2));
-            BinaryHelper.WriteUInt16(body.Slice(2), Grease.SignatureAlgorithm); // RFC 8701
+            BinaryHelper.WriteUInt16(body.AsSpan(2), Grease.SignatureAlgorithm); // RFC 8701
             int off = 4;
             foreach (var s in sigAlgs)
             {
-                BinaryHelper.WriteUInt16(body.Slice(off), (ushort)s);
+                BinaryHelper.WriteUInt16(body.AsSpan(off), (ushort)s);
                 off += 2;
             }
             WriteExtension(bw, ExtensionType.SignatureAlgorithms, body);
@@ -1337,6 +1383,12 @@ public static class HandshakeMessages
         {
             WriteExtension(bw, ExtensionType.EncryptedClientHello, echExtensionData);
         }
+
+        // tls_cert_with_extern_psk (draft-ietf-tls-8773bis): empty flag, placed immediately before
+        // pre_shared_key (which must stay last). Signals "use this external PSK in the key schedule
+        // AND still do certificate-based authentication".
+        if (certWithExternPsk)
+            WriteExtension(bw, ExtensionType.CertWithExternPsk, ReadOnlySpan<byte>.Empty);
 
         // Pre-Shared Key (MUST be the last extension — RFC 8446 §4.2.11)
         if (psk != null)
@@ -1474,6 +1526,7 @@ public sealed class ParsedClientHello
     public byte[]? EncryptedClientHelloData { get; init; }  // ECH extension payload
     public bool IsOuterClientHello { get; init; }           // True if this is an ECH outer ClientHello
     public bool OffersPskDheKe { get; init; }               // RFC 8446 §4.2.9: client advertised psk_dhe_ke
+    public bool OffersCertWithExternPsk { get; init; }      // draft-ietf-tls-8773bis: cert + external PSK
 }
 
 /// <summary>A certificate entry from a TLS Certificate message, with optional per-cert extensions.</summary>
@@ -1493,6 +1546,7 @@ public sealed class ParsedServerHello
     public bool IsHelloRetryRequest { get; init; }
     public byte[]? Cookie { get; init; }
     public int SelectedPskIndex { get; init; } = -1; // -1 = no PSK
+    public bool CertWithExternPsk { get; init; }     // draft-ietf-tls-8773bis: server agreed to cert + external PSK
 }
 
 public sealed class ParsedNewSessionTicket

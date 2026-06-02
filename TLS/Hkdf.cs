@@ -178,6 +178,7 @@ public static class Hkdf
     {
         if (hash == HashAlgorithmName.SHA256) return 32;
         if (hash == HashAlgorithmName.SHA384) return 48;
+        if (hash == HashAlgorithmName.SHA512) return 64;
         if (GostKdf.IsStreebog(hash)) return 32;
         if (Sm3Kdf.IsSm3(hash)) return 32;
         throw new ArgumentException($"Unsupported hash algorithm: {hash}");

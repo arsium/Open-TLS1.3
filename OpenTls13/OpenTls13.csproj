@@ -40,11 +40,11 @@
     <!-- ===================== NuGet package metadata ===================== -->
     <IsPackable>true</IsPackable>
     <PackageId>OpenTls13</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.6.0</Version>
     <Authors>arsium</Authors>
     <Product>OpenTls13</Product>
     <Title>OpenTls13 — pure-managed TLS 1.3 for .NET</Title>
-    <Description>Pure-managed TLS 1.3 (RFC 8446) for .NET — client and server, sync and async, with no BCrypt/OpenSSL P/Invoke (a single BCryptGenRandom entropy import remains). Includes X25519MLKEM768 hybrid post-quantum key exchange (FIPS 203 ML-KEM-768), mTLS, PSK resumption, 0-RTT early data, HelloRetryRequest, ALPN, OCSP stapling, Encrypted Client Hello (RFC 9849), certificate compression (RFC 8879), and the GOST (RFC 9367) and Chinese SM (RFC 8998) national cipher suites. NativeAOT-friendly; zero transitive dependencies (all crypto is source-vendored).</Description>
+    <Description>Pure-managed TLS 1.3 (RFC 8446) for .NET — client and server, sync and async, with no BCrypt/OpenSSL P/Invoke (a single BCryptGenRandom entropy import remains). Includes X25519MLKEM768 hybrid post-quantum key exchange (FIPS 203 ML-KEM-768), mTLS, PSK resumption, 0-RTT early data, HelloRetryRequest, ALPN, OCSP stapling, Encrypted Client Hello (RFC 9849), certificate compression (RFC 8879), and the GOST (RFC 9367) and Chinese SM (RFC 8998) national cipher suites. Also ships several IETF Internet-Drafts (not finalized RFCs, may change): ML-DSA post-quantum certificates (FIPS 204 / draft-ietf-tls-mldsa), the AEGIS AEAD cipher suites (draft-denis-tls-aegis), and certificate authentication combined with an external PSK (draft-ietf-tls-8773bis). NativeAOT-friendly; zero transitive dependencies (all crypto is source-vendored).</Description>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>tls;tls1.3;tls13;rfc8446;cryptography;security;mtls;ml-kem;post-quantum;gost;sm2;sm4;chacha20;aes-gcm;aot;managed</PackageTags>
@@ -69,6 +69,7 @@
        satisfies the MIT / Bouncy Castle copyright-retention requirement for the vendored code. -->
   <ItemGroup>
     <None Include="..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\API.md" Pack="true" PackagePath="\" />
     <None Include="THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="\" />
   </ItemGroup>
 

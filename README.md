@@ -1,4 +1,4 @@
-# TLSServer
+# OpenTLS1.3
 
 A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptographic primitive runs through managed code — **no BCrypt / OpenSSL P/Invoke**. The published binary has a single bcrypt.dll import (`BCryptGenRandom`) which serves as the OS entropy source; everything else — hashes, HMACs, AEADs, EC point arithmetic, signatures — is pure C#. AES-NI is used via JIT-emitted CPU intrinsics (not a P/Invoke, gated by `Aes.IsSupported`), so the workhorse cipher stays hardware-fast while remaining portable to non-x86 CPUs.
 
@@ -11,6 +11,8 @@ A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptogra
 > **Note 2 :** a packable library project lives in `OpenTls13/` — `dotnet pack -c Release OpenTls13/OpenTls13.csproj` produces the `.nupkg` (multi-targets net8.0 / net9.0 / net10.0, AGPL-3.0-or-later, zero transitive dependencies). See *NuGet package* below.
 
 > **Note 3 :** national-crypto suites (GOST, Chinese SM) are KAT-verified against published standard vectors and pass self-interop (this client ↔ this server), but have **not** yet been cross-validated against external stacks (GmSSL / OpenSSL-GOST). See *Limitations*.
+
+> 📖 **Public API reference:** see [`API.md`](API.md) for the full consumer-facing surface (`TlsClient`, `TlsServer`, `TlsStream`, `TlsConnection`, certificates, PSK/resumption, ECH, and the enumerations).
 
 ## Features
 
@@ -37,10 +39,10 @@ A complete TLS 1.3 implementation in pure C# targeting .NET 9.0. Every cryptogra
 | Category | Algorithms |
 |---|---|
 | Key Exchange | X25519, X448, ECDH P-256, ECDH P-384, **X25519MLKEM768** (hybrid post-quantum), GOST curves (GC256A–D / GC512A–C), curveSM2 |
-| Signatures | ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, Ed25519, RSA-PSS, RSA-PKCS#1 (legacy), GOST R 34.10-2012 (256/512), SM2 |
-| AEAD Ciphers | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305, Kuznyechik-MGM, Magma-MGM, SM4-GCM, SM4-CCM |
+| Signatures | ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, Ed25519, RSA-PSS, RSA-PKCS#1 (legacy), **ML-DSA-44/65/87** (FIPS 204, post-quantum), GOST R 34.10-2012 (256/512), SM2 |
+| AEAD Ciphers | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305, AEGIS-128L, AEGIS-256, Kuznyechik-MGM, Magma-MGM, SM4-GCM, SM4-CCM |
 | Hash / KDF | SHA-256/384/512, HKDF (RFC 5869), Streebog-256/512, SM3, HMAC variants |
-| Post-Quantum | ML-KEM-768 (FIPS 203) with NTT-based polynomial arithmetic |
+| Post-Quantum | ML-KEM-768/1024 (FIPS 203) key encapsulation · ML-DSA-44/65/87 (FIPS 204) signatures |
 | Keccak Sponge | SHA3-256, SHA3-512, SHAKE-128, SHAKE-256 (pure managed) |
 | National | GOST R 34.11/34.12/34.13-2015 (RFC 9367), Chinese SM2/SM3/SM4 (RFC 8998) |
 | Certificates | X.509 v3 generation (incl. GOST / SM2 certs), CA chaining, PKCS#12/PFX, PKCS#7 |
@@ -53,6 +55,7 @@ Symmetric primitives (AES-GCM, SHA-2 family, HMAC) and the asymmetric handshake 
 | Suite | Spec |
 |---|---|
 | TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 | RFC 8446 |
+| TLS_AEGIS_128L_SHA256, TLS_AEGIS_256_SHA512 | draft-denis-tls-aegis / draft-irtf-cfrg-aegis-aead (KAT-verified; offer via `CipherSuites`) |
 | TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L / _S | RFC 9367 |
 | TLS_GOSTR341112_256_WITH_MAGMA_MGM_L / _S | RFC 9367 |
 | TLS_SM4_GCM_SM3, TLS_SM4_CCM_SM3 | RFC 8998 |
@@ -146,6 +149,36 @@ var client = new TlsClient
 // server side: var cert = CertificateUtils.IssueGostCertificate("host", ca, CertificateProfile.Server, SignatureScheme.Gostr34102012_256a);
 //              or            CertificateUtils.IssueSm2Certificate("host", ca, CertificateProfile.Server);
 ```
+
+### Restricting what gets negotiated
+
+Defaults are permissive — the server accepts any suite/group it supports, and the client advertises all
+its signature schemes (including the draft PQ ones). Each of those is an opt-in restriction you can tighten:
+
+```csharp
+var server = new TlsServer(cert)
+{
+    // Only ever select from these suites / groups, even if the client offers others we support.
+    AllowedCipherSuites = new[] { CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256 },
+    AllowedGroups       = new[] { NamedGroup.X25519MLKEM768, NamedGroup.X25519 },
+    // mTLS: which schemes we'll accept for the client's CertificateVerify.
+    AcceptedClientSignatureSchemes = new[] { SignatureScheme.EcdsaSecp256r1Sha256 },
+};
+
+var client = new TlsClient
+{
+    // Drop the draft ML-DSA schemes from the advertisement, for example.
+    SignatureSchemes = new[] { SignatureScheme.EcdsaSecp256r1Sha256, SignatureScheme.Ed25519, SignatureScheme.RsaPssRsaeSha256 },
+};
+```
+
+Leave any of these unset (null) to keep the permissive default for that dimension. The same knobs exist on
+the lower-level `TlsConnection` (`SetAllowedCipherSuites`, `SetAllowedGroups`, `SetOfferedSignatureSchemes`).
+Restricting the client's `NamedGroups` is a *true* restriction — the advertised `supported_groups` follows it,
+so the server can't HelloRetryRequest you onto a group you didn't intend to offer.
+
+After the handshake, `TlsStream.NegotiatedGroup` and `TlsStream.NegotiatedCipherSuite` report what was
+actually selected (the group reflects any HelloRetryRequest).
 
 ### Wireshark Decryption
 
@@ -278,6 +311,21 @@ Core TLS 1.3 (RFC 8446) is compliant — handshake, HelloRetryRequest + cookie, 
 | RFC 8998 | Chinese SM cipher suites (SM4-GCM/CCM, SM3, SM2, curveSM2) |
 | FIPS 203 | ML-KEM-768 (Module-Lattice Key Encapsulation) |
 | draft-ietf-tls-ecdhe-mlkem | X25519MLKEM768 hybrid key exchange |
+| draft-irtf-cfrg-aegis-aead / draft-denis-tls-aegis | AEGIS-128L / AEGIS-256 AEAD cipher suites (KAT-verified vs the spec test vectors) |
+| FIPS 204 / draft-ietf-tls-mldsa | ML-DSA-44/65/87 post-quantum signatures — certificates + CertificateVerify |
+| draft-ietf-tls-8773bis | Certificate authentication combined with an external PSK (`tls_cert_with_extern_psk`) |
+
+> **RFC vs Internet-Draft.** Rows that name a `draft-…` are **Internet-Drafts — work in progress, not
+> finalized RFCs** — so their TLS code points and on-wire details may change before publication, and
+> interop here is validated only against this stack's own test vectors. That currently applies to:
+> **AEGIS** cipher suites (`draft-denis-tls-aegis` + the `draft-irtf-cfrg-aegis-aead` AEAD),
+> **ML-DSA *in TLS*** (`draft-ietf-tls-mldsa`; the ML-DSA *algorithm* is final in FIPS 204 and its
+> *certificate* encoding in RFC 9881 — only the TLS signature-scheme code points are draft), the
+> hybrid PQ groups (`draft-ietf-tls-ecdhe-mlkem`), and **certificate + external PSK**
+> (`draft-ietf-tls-8773bis`; a full cert handshake whose key schedule also mixes in an external PSK,
+> so the session survives a future break of the cert's signature algorithm). Treat these as
+> experimental and pin both peers to the same draft revision. ECH (RFC 9849), HPKE (RFC 9180),
+> record_size_limit (RFC 8449), GOST (RFC 9367) and SM (RFC 8998) are published RFCs.
 
 ## Limitations
 

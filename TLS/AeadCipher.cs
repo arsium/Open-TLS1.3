@@ -10,7 +10,9 @@ public enum AeadAlgorithm
     MgmKuznyechik, // RFC 9367 / RFC 9058: tag 16, nonce 16
     MgmMagma,      // RFC 9367 / RFC 9058: tag 8,  nonce 8
     Sm4Gcm,        // RFC 8998: tag 16, nonce 12
-    Sm4Ccm         // RFC 8998: tag 16, nonce 12
+    Sm4Ccm,        // RFC 8998: tag 16, nonce 12
+    Aegis128L,     // draft-denis-tls-aegis: tag 16, nonce 16
+    Aegis256       // draft-denis-tls-aegis: tag 16, nonce 32
 }
 
 /// <summary>AEAD cipher with per-record nonce management for TLS 1.3.
@@ -27,6 +29,9 @@ public sealed class AeadCipher : IDisposable
     private const ulong MgmHardLimit         = 1UL << 39;                 // one doubling above watermark
     // SM4-GCM/CCM share the AES-GCM structural family; reuse the AES-GCM limits.
     private const ulong Sm4HardLimit         = (1UL << 24) + (1UL << 23);
+    // AEGIS (draft-denis-tls-aegis §4): a KeyUpdate MUST happen before 2^48 records; fail closed below that.
+    private const ulong AegisRekeyWatermark  = 1UL << 40;
+    private const ulong AegisHardLimit       = 1UL << 47;
 
     private readonly byte[] _key;
     private readonly byte[] _iv; // nonce length: 12 (AES/ChaCha), 16 (Kuznyechik), 8 (Magma)
@@ -34,6 +39,7 @@ public sealed class AeadCipher : IDisposable
     private readonly int _tagLen;
     private readonly Mgm? _mgm;
     private readonly Sm4Aead? _sm4;
+    private readonly AegisAead? _aegis;
     private readonly ChaCha20Poly1305Managed? _chachaManaged;
     private readonly AesGcmManaged? _aesManaged;
     private ulong _seqNum;
@@ -57,6 +63,12 @@ public sealed class AeadCipher : IDisposable
             AeadAlgorithm.Sm4Ccm => new Sm4Aead(_key, ccm: true, tagLen: 16),
             _ => null
         };
+        _aegis = alg switch
+        {
+            AeadAlgorithm.Aegis128L => new AegisAead(_key, is256: false),
+            AeadAlgorithm.Aegis256 => new AegisAead(_key, is256: true),
+            _ => null
+        };
         // Always route ChaCha20-Poly1305 and AES-GCM through the managed wrappers —
         // no BCrypt / OpenSSL P/Invoke. BC's AesEngine still uses AES-NI when the CPU has it.
         _chachaManaged = alg == AeadAlgorithm.ChaCha20Poly1305
@@ -68,7 +80,7 @@ public sealed class AeadCipher : IDisposable
 
         // Defence-in-depth: exactly one of the four backends must be wired. An unknown
         // AeadAlgorithm enum value would otherwise produce a silent NRE on Encrypt/Decrypt.
-        if (_mgm == null && _sm4 == null && _chachaManaged == null && _aesManaged == null)
+        if (_mgm == null && _sm4 == null && _chachaManaged == null && _aesManaged == null && _aegis == null)
             throw new ArgumentException($"Unsupported AEAD algorithm: {alg}", nameof(alg));
     }
 
@@ -83,6 +95,7 @@ public sealed class AeadCipher : IDisposable
     {
         AeadAlgorithm.ChaCha20Poly1305 => ChachaRekeyWatermark,
         AeadAlgorithm.MgmKuznyechik or AeadAlgorithm.MgmMagma => MgmRekeyWatermark,
+        AeadAlgorithm.Aegis128L or AeadAlgorithm.Aegis256 => AegisRekeyWatermark,
         _ => AesGcmRekeyWatermark
     };
 
@@ -121,6 +134,13 @@ public sealed class AeadCipher : IDisposable
             byte[] nonce = BuildNonce();
             _seqNum++;
             _sm4.EncryptInto(nonce, plaintext, output, aad);
+            return;
+        }
+        if (_aegis != null)
+        {
+            byte[] nonce = BuildNonce();
+            _seqNum++;
+            _aegis.EncryptInto(nonce, plaintext, output, aad);
             return;
         }
 
@@ -189,6 +209,14 @@ public sealed class AeadCipher : IDisposable
             { throw new TlsException(AlertDescription.BadRecordMac, e.Message); }
             return;
         }
+        if (_aegis != null)
+        {
+            byte[] nonce = BuildNonce();
+            _seqNum++;
+            if (!_aegis.TryDecryptInto(nonce, encrypted, plaintext, aad))
+                throw new TlsException(AlertDescription.BadRecordMac, "AEGIS authentication tag mismatch");
+            return;
+        }
 
         Span<byte> nonceSpan = stackalloc byte[_iv.Length];
         BuildNonceInto(nonceSpan);
@@ -236,6 +264,12 @@ public sealed class AeadCipher : IDisposable
             if (_sm4.TryDecryptInto(nonce, encrypted, plaintext, aad)) { _seqNum++; return true; }
             return false;
         }
+        if (_aegis != null)
+        {
+            byte[] nonce = BuildNonce();
+            if (_aegis.TryDecryptInto(nonce, encrypted, plaintext, aad)) { _seqNum++; return true; }
+            return false;
+        }
 
         Span<byte> nonceSpan = stackalloc byte[_iv.Length];
         BuildNonceInto(nonceSpan);
@@ -267,6 +301,7 @@ public sealed class AeadCipher : IDisposable
             AeadAlgorithm.ChaCha20Poly1305 => ChachaHardLimit,
             AeadAlgorithm.MgmKuznyechik or AeadAlgorithm.MgmMagma => MgmHardLimit,
             AeadAlgorithm.Sm4Gcm or AeadAlgorithm.Sm4Ccm          => Sm4HardLimit,
+            AeadAlgorithm.Aegis128L or AeadAlgorithm.Aegis256     => AegisHardLimit,
             _ => ulong.MaxValue
         };
         if (_seqNum >= limit)
@@ -296,6 +331,7 @@ public sealed class AeadCipher : IDisposable
         _mgm?.Dispose();
         _chachaManaged?.Dispose();
         _aesManaged?.Dispose();
+        _aegis?.Dispose();
         CryptographicOperations.ZeroMemory(_key);
         CryptographicOperations.ZeroMemory(_iv);
     }

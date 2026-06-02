@@ -39,6 +39,10 @@ public static class CertificateUtils
     private const string OidRsaSha256 = "1.2.840.113549.1.1.11";
     private const string OidRsaSha384 = "1.2.840.113549.1.1.12";
     private const string OidRsaSha512 = "1.2.840.113549.1.1.13";
+    // ML-DSA OIDs (FIPS 204, NIST sigAlgs branch); used in X.509 certificates per RFC 9881.
+    private const string OidMlDsa44 = "2.16.840.1.101.3.4.3.17";
+    private const string OidMlDsa65 = "2.16.840.1.101.3.4.3.18";
+    private const string OidMlDsa87 = "2.16.840.1.101.3.4.3.19";
     private const string OidCommonName = "2.5.4.3";
     private const string OidSubjectAltName = "2.5.29.17";
     private const string OidBasicConstraints = "2.5.29.19";
@@ -577,6 +581,8 @@ public static class CertificateUtils
                 }
 
             default:
+                if (MlDsaManaged.IsMlDsa(scheme))
+                    return MlDsaManaged.Sign(data, privateKey, scheme);
                 if (IsGostScheme(scheme))
                 {
                     var (_, _, is512) = GostParams(scheme);
@@ -645,6 +651,8 @@ public static class CertificateUtils
                     }
 
                 default:
+                    if (MlDsaManaged.IsMlDsa(scheme))
+                        return MlDsaManaged.Verify(data, signature, publicKey, scheme);
                     if (IsGostScheme(scheme))
                     {
                         var (_, _, is512) = GostParams(scheme);
@@ -827,6 +835,41 @@ public static class CertificateUtils
             Asn1.BitString(uncompressed));
     }
 
+    /// <summary>Generate an ML-DSA (FIPS 204) keypair + X.509 certificate signed by an (ECDSA/RSA) CA.</summary>
+    public static TlsCertificate IssueMlDsaCertificate(string commonName, TlsCertificate ca,
+        CertificateProfile profile, SignatureScheme scheme = SignatureScheme.MlDsa65, int validDays = 365)
+    {
+        var (priv, pub) = MlDsaManaged.GenerateKeyPair(scheme);
+        string caCommonName = ExtractCommonName(ca.DerData);
+        var extensions = BuildIssuedExtensions(commonName, ca.PublicKey, profile);
+        byte[] spki = BuildMlDsaSpki(pub, scheme);
+        byte[] cert = SignCertWithCa(caCommonName, commonName, spki, extensions, ca, validDays);
+
+        return new TlsCertificate
+        {
+            DerData = cert,
+            PrivateKey = priv,
+            PublicKey = pub,
+            SignatureAlgorithm = scheme,
+            ChainCertificates = new[] { ca.DerData }
+        };
+    }
+
+    // RFC 9881 (ML-DSA in X.509, final): AlgorithmIdentifier is the bare id-ml-dsa-* OID (parameters
+    // ABSENT); subjectPublicKey BIT STRING carries the raw FIPS 204 public key (rho‖t1).
+    private static byte[] BuildMlDsaSpki(byte[] pub, SignatureScheme scheme) =>
+        Asn1.Sequence(
+            Asn1.Sequence(Asn1.Oid(MlDsaOid(scheme))),
+            Asn1.BitString(pub));
+
+    private static string MlDsaOid(SignatureScheme scheme) => scheme switch
+    {
+        SignatureScheme.MlDsa44 => OidMlDsa44,
+        SignatureScheme.MlDsa65 => OidMlDsa65,
+        SignatureScheme.MlDsa87 => OidMlDsa87,
+        _ => throw new ArgumentException($"Not an ML-DSA scheme: {scheme}", nameof(scheme))
+    };
+
     public static (byte[] publicKey, SignatureScheme sigAlg) ParseCertificatePublicKey(byte[] certDer)
     {
         var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
@@ -869,6 +912,13 @@ public static class CertificateUtils
             var (_, keyOctets, _) = Asn1.ReadTlv(octetTlv);
             return (keyOctets, scheme);
         }
+
+        if (algOidTlv.AsSpan().SequenceEqual(Asn1.Oid(OidMlDsa44)))
+            return (spkiItems[1].value[1..], SignatureScheme.MlDsa44); // BIT STRING → skip unused-bits → raw pk
+        if (algOidTlv.AsSpan().SequenceEqual(Asn1.Oid(OidMlDsa65)))
+            return (spkiItems[1].value[1..], SignatureScheme.MlDsa65);
+        if (algOidTlv.AsSpan().SequenceEqual(Asn1.Oid(OidMlDsa87)))
+            return (spkiItems[1].value[1..], SignatureScheme.MlDsa87);
 
         throw new TlsException(AlertDescription.HandshakeFailure, "Unsupported certificate key algorithm");
     }

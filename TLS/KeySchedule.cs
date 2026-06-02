@@ -75,6 +75,9 @@ public sealed class KeySchedule : IDisposable
                 => (GostKdf.Streebog256Name, 32, 32, 8, AeadAlgorithm.MgmMagma),
             CipherSuite.TLS_SM4_GCM_SM3 => (Sm3Kdf.Sm3Name, 32, 16, 12, AeadAlgorithm.Sm4Gcm),
             CipherSuite.TLS_SM4_CCM_SM3 => (Sm3Kdf.Sm3Name, 32, 16, 12, AeadAlgorithm.Sm4Ccm),
+            // draft-denis-tls-aegis: AEGIS-128L (key 16, nonce 16) + SHA-256; AEGIS-256 (key 32, nonce 32) + SHA-512. Tag 16.
+            CipherSuite.TLS_AEGIS_128L_SHA256 => (HashAlgorithmName.SHA256, 32, 16, 16, AeadAlgorithm.Aegis128L),
+            CipherSuite.TLS_AEGIS_256_SHA512 => (HashAlgorithmName.SHA512, 64, 32, 32, AeadAlgorithm.Aegis256),
             _ => throw new TlsException(AlertDescription.HandshakeFailure, $"Unsupported suite: {suite}")
         };
 
@@ -205,6 +208,7 @@ public sealed class KeySchedule : IDisposable
     {
         if (_hash == HashAlgorithmName.SHA256) return Sha2Managed.Sha256(data);
         if (_hash == HashAlgorithmName.SHA384) return Sha2Managed.Sha384(data);
+        if (_hash == HashAlgorithmName.SHA512) return Sha2Managed.Sha512(data);
         if (GostKdf.IsStreebog(_hash)) return GostKdf.Hash(data);
         if (Sm3Kdf.IsSm3(_hash)) return Sm3Kdf.Hash(data);
         throw new ArgumentException($"Unsupported hash: {_hash}");

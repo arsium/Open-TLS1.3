@@ -1,5 +1,6 @@
 namespace Tests;
 
+using System.Net.Sockets;
 using System.Text;
 using TLS;
 using static Tests.T;
@@ -15,6 +16,7 @@ public static class LoopbackTests
         var ecCert = CertificateUtils.IssueCertificate("localhost", ca, CertificateProfile.Server);
         var gostCert = CertificateUtils.IssueGostCertificate("localhost", ca, CertificateProfile.Server, SignatureScheme.Gostr34102012_256a);
         var sm2Cert = CertificateUtils.IssueSm2Certificate("localhost", ca, CertificateProfile.Server);
+        var mldsaCert = CertificateUtils.IssueMlDsaCertificate("localhost", ca, CertificateProfile.Server, SignatureScheme.MlDsa65);
 
         Section("Loopback: default TLS 1.3 (X25519 + AES-GCM)");
         Handshake("AES-256-GCM small", ecCert, null, null, 30);
@@ -36,6 +38,31 @@ public static class LoopbackTests
             new[] { CipherSuite.TLS_SM4_GCM_SM3 }, new[] { NamedGroup.Curvesm2 }, 40000);
         Handshake("SM4-CCM-SM3 + curveSM2 + SM2 cert", sm2Cert,
             new[] { CipherSuite.TLS_SM4_CCM_SM3 }, new[] { NamedGroup.Curvesm2 }, 1024);
+
+        Section("Loopback: AEGIS (draft-denis-tls-aegis-06)");
+        Handshake("AEGIS-128L-SHA256 small", ecCert, new[] { CipherSuite.TLS_AEGIS_128L_SHA256 }, null, 256);
+        Handshake("AEGIS-128L-SHA256 large (40KB)", ecCert, new[] { CipherSuite.TLS_AEGIS_128L_SHA256 }, null, 40000);
+        Handshake("AEGIS-256-SHA512 small", ecCert, new[] { CipherSuite.TLS_AEGIS_256_SHA512 }, null, 256);
+        Handshake("AEGIS-256-SHA512 large (40KB)", ecCert, new[] { CipherSuite.TLS_AEGIS_256_SHA512 }, null, 40000);
+
+        Section("Loopback: ML-DSA post-quantum certificate (FIPS 204 / draft-ietf-tls-mldsa)");
+        Handshake("ML-DSA-65 cert + AES-256-GCM", mldsaCert, null, null, 1024);
+        Handshake("ML-DSA-44 cert + ChaCha20", CertificateUtils.IssueMlDsaCertificate("localhost", ca, CertificateProfile.Server, SignatureScheme.MlDsa44),
+            new[] { CipherSuite.TLS_CHACHA20_POLY1305_SHA256 }, null, 256);
+        Handshake("ML-DSA-87 cert (largest) + AES-256-GCM", CertificateUtils.IssueMlDsaCertificate("localhost", ca, CertificateProfile.Server, SignatureScheme.MlDsa87),
+            null, null, 4096);
+        Handshake("ML-DSA-65 + X25519MLKEM768 (fully post-quantum handshake)", mldsaCert, null, new[] { NamedGroup.X25519MLKEM768 }, 1024);
+
+        Section("Loopback: certificate + external PSK (draft-ietf-tls-8773bis, Internet-Draft)");
+        CertWithExternalPsk("cert + extern PSK (EC cert)", ca, ecCert, useAsync: false);
+        CertWithExternalPsk("cert + extern PSK (EC cert, async)", ca, ecCert, useAsync: true);
+        CertWithExternalPsk("cert + extern PSK (ML-DSA-65 cert — PQ cert + PSK)", ca, mldsaCert, useAsync: false);
+
+        Section("Loopback: configurable negotiation (server allow-lists + client sig-alg override)");
+        ConfigurableNegotiation(ca, ecCert);
+
+        Section("Loopback: opt-in features (ALPN, OCSP, padding, KeyUpdate, exporter, channel binding, RFC 9261, post-handshake auth)");
+        OptInFeatures(ca, ecCert);
 
         Section("Loopback: mTLS (client certificate)");
         MutualTls(ca, ecCert);
@@ -320,6 +347,350 @@ public static class LoopbackTests
         }
         catch (Exception e) { Check($"{name} [{e.GetType().Name}: {e.Message}]", false); }
         finally { srv.Wait(6000); server.Stop(); }
+    }
+
+    // draft-ietf-tls-8773bis (Internet-Draft): certificate authentication combined with an external PSK.
+    // A FULL certificate handshake runs (Certificate + CertificateVerify), but the external PSK is also
+    // folded into the key schedule — so the session resists a future break of the certificate's signature
+    // algorithm. Exercised over a raw TlsConnection because the high-level TlsClient/TlsServer wrappers do
+    // not surface external PSKs. Validates client + server on both the sync and async handshake paths.
+    private static void CertWithExternalPsk(string name, TlsCertificate ca, TlsCertificate serverCert, bool useAsync)
+    {
+        var psk = new ExternalPsk
+        {
+            Identity = Encoding.ASCII.GetBytes("8773bis-test-identity"),
+            Key = new byte[32],
+            Suite = CipherSuite.TLS_AES_256_GCM_SHA384,
+            MaxEarlyDataSize = 0, // early_data is forbidden alongside tls_cert_with_extern_psk
+        };
+        for (int i = 0; i < psk.Key.Length; i++) psk.Key[i] = (byte)(i + 1);
+
+        const int msgLen = 96;
+        int port = ++_port;
+        var listener = new TcpListener(System.Net.IPAddress.Loopback, port);
+        listener.Start();
+
+        bool serverMode = false;
+        string? serverErr = null;
+        var srv = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                var stream = tcp.GetStream();
+                var conn = new TlsConnection(stream, isServer: true, serverCert);
+                conn.ImportExternalPsk(psk);
+                if (useAsync) await conn.HandshakeAsServerAsync(default);
+                else conn.HandshakeAsServer();
+                serverMode = conn.UsedCertWithExternalPsk;
+
+                using var st = new TlsStream(conn, tcp);
+                var b = new byte[msgLen + 256];
+                int got = 0;
+                while (got < msgLen) { int n = st.Read(b, got, b.Length - got); if (n <= 0) break; got += n; }
+                st.Write(b, 0, got);
+                Thread.Sleep(50);
+            }
+            catch (Exception e) { serverErr = e.Message; }
+        });
+
+        try
+        {
+            using var tcp = new TcpClient { NoDelay = true };
+            tcp.Connect("localhost", port);
+            var stream = tcp.GetStream();
+            stream.ReadTimeout = 12000;
+            var conn = new TlsConnection(stream, isServer: false);
+            conn.SetOfferedCipherSuites(new[]
+            {
+                CipherSuite.TLS_AES_256_GCM_SHA384,
+                CipherSuite.TLS_AES_128_GCM_SHA256,
+                CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+            });
+            conn.EnableCertWithExternalPsk(psk);
+            bool gotCert = false;
+            conn.SetServerCertificateValidation(null, (cert, warnings) => { gotCert = cert != null && cert.Length > 0; return true; });
+            if (useAsync) conn.HandshakeAsClientAsync("localhost", default).GetAwaiter().GetResult();
+            else conn.HandshakeAsClient("localhost");
+            stream.ReadTimeout = System.Threading.Timeout.Infinite;
+
+            using var st = new TlsStream(conn, tcp);
+            byte[] msg = Encoding.ASCII.GetBytes(new string('P', msgLen));
+            st.Write(msg, 0, msg.Length);
+            var buf = new byte[msgLen + 256];
+            int got = 0;
+            while (got < msgLen) { int n = st.Read(buf, got, buf.Length - got); if (n <= 0) break; got += n; }
+            srv.Wait(8000);
+
+            bool dataOk = got == msgLen && buf.AsSpan(0, msgLen).SequenceEqual(msg);
+            Check($"{name}: encrypted data echo", dataOk);
+            Check($"{name}: client negotiated cert+extern-PSK", conn.UsedCertWithExternalPsk);
+            Check($"{name}: server negotiated cert+extern-PSK", serverMode);
+            Check($"{name}: full cert handshake ran (not a resumption skip)", !conn.IsResumed && gotCert);
+            if (serverErr != null) Check($"{name}: server error [{serverErr}]", false);
+        }
+        catch (Exception e) { Check($"{name} [{e.GetType().Name}: {e.Message}]", false); }
+        finally { listener.Stop(); }
+    }
+
+    // Every experimental/optional negotiation knob must be configurable: a server allow-list that can
+    // REFUSE a suite/group it actually supports, and a client signature_algorithms override that the
+    // server honours. Each knob is checked both ways — the restriction blocks the handshake, and the
+    // matching configuration completes it — so we know the option is wired, not inert.
+    private static void ConfigurableNegotiation(TlsCertificate ca, TlsCertificate ecCert)
+    {
+        // Run one handshake with the given config; report success plus the negotiated group/suite.
+        (bool ok, NamedGroup group, CipherSuite suite) Try(Action<TlsClient> configureClient, Action<TlsServer> configureServer)
+        {
+            int port = ++_port;
+            var server = new TlsServer(ecCert) { HandshakeTimeoutMs = 8000 };
+            configureServer(server);
+            server.Listen(port);
+            var srv = Task.Run(() =>
+            {
+                try
+                {
+                    using var s = server.Accept();
+                    var b = new byte[64];
+                    int n = s.Read(b, 0, b.Length);
+                    if (n > 0) s.Write(b, 0, n);
+                }
+                catch { /* expected on the negative cases */ }
+            });
+            try
+            {
+                var c = new TlsClient { HandshakeTimeoutMs = 8000, CaCertificate = ca };
+                configureClient(c);
+                using var st = c.Connect("localhost", port);
+                st.Write(new byte[] { 1, 2, 3, 4 }, 0, 4);
+                var buf = new byte[64];
+                bool ok = st.Read(buf, 0, buf.Length) == 4;
+                return (ok, st.NegotiatedGroup, st.NegotiatedCipherSuite);
+            }
+            catch { return (false, default, default); }
+            finally { srv.Wait(4000); server.Stop(); }
+        }
+
+        // 1) Server cipher-suite allow-list — refuses a suite it supports but the operator excluded.
+        Check("server allow-list refuses a disallowed (AEGIS) suite",
+            !Try(c => c.CipherSuites = new[] { CipherSuite.TLS_AEGIS_128L_SHA256 },
+                 s => s.AllowedCipherSuites = new[] { CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_AES_128_GCM_SHA256 }).ok);
+        var aes = Try(c => c.CipherSuites = new[] { CipherSuite.TLS_AES_256_GCM_SHA384 },
+                      s => s.AllowedCipherSuites = new[] { CipherSuite.TLS_AES_256_GCM_SHA384 });
+        Check("server allow-list admits an allowed suite", aes.ok);
+        Check("negotiated cipher suite is observable + correct", aes.suite == CipherSuite.TLS_AES_256_GCM_SHA384);
+
+        // 2) Client supported_groups now follows NamedGroups, so a server allow-list that excludes the only
+        //    group the client offers leaves no overlap → the handshake fails (no HRR fallback sneaks in).
+        Check("server allow-list with no group in common fails the handshake",
+            !Try(c => c.NamedGroups = new[] { NamedGroup.X25519MLKEM768 },
+                 s => s.AllowedGroups = new[] { NamedGroup.X25519, NamedGroup.Secp256r1 }).ok);
+        // Offer both; the server allow-list forces the classical group over the hybrid — and we can see it.
+        var grp = Try(c => c.NamedGroups = new[] { NamedGroup.X25519MLKEM768, NamedGroup.X25519 },
+                      s => s.AllowedGroups = new[] { NamedGroup.X25519 });
+        Check("server allow-list admits an allowed group", grp.ok);
+        Check("negotiated group is the allowed classical one, not the hybrid", grp.group == NamedGroup.X25519);
+
+        // 3) Client signature_algorithms override reaches the server: advertising ONLY Ed25519 makes the
+        //    server reject its own ECDSA-P256 leaf (its scheme wasn't offered); including it succeeds.
+        Check("client sig-alg override (Ed25519-only) makes the server reject its ECDSA cert",
+            !Try(c => c.SignatureSchemes = new[] { SignatureScheme.Ed25519 },
+                 s => { }).ok);
+        Check("client sig-alg override that includes the cert's scheme succeeds",
+            Try(c => c.SignatureSchemes = new[] { SignatureScheme.EcdsaSecp256r1Sha256 },
+                s => { }).ok);
+    }
+
+    // Establish a raw-TlsConnection loopback pair (the wrappers don't expose every knob), returning both
+    // live connections so a test can drive post-handshake operations on each end. Handshake runs concurrently.
+    private static (TlsConnection client, TlsConnection server, Action cleanup) RawPair(
+        TlsCertificate ca, TlsCertificate serverCert, TlsCertificate? clientCert,
+        Action<TlsConnection>? cfgClient = null, Action<TlsConnection>? cfgServer = null)
+    {
+        int port = ++_port;
+        var listener = new TcpListener(System.Net.IPAddress.Loopback, port);
+        listener.Start();
+        TlsConnection? serverConn = null;
+        TcpClient? serverTcp = null;
+        Exception? serverErr = null;
+        var srv = Task.Run(() =>
+        {
+            try
+            {
+                serverTcp = listener.AcceptTcpClient();
+                var conn = new TlsConnection(serverTcp.GetStream(), isServer: true, serverCert, caCertificate: ca);
+                cfgServer?.Invoke(conn);
+                conn.HandshakeAsServer();
+                serverConn = conn;
+            }
+            catch (Exception e) { serverErr = e; }
+        });
+
+        var clientTcp = new TcpClient { NoDelay = true };
+        clientTcp.Connect("localhost", port);
+        var clientConn = new TlsConnection(clientTcp.GetStream(), isServer: false, certificate: clientCert);
+        clientConn.SetServerCertificateValidation(null, (_, _) => true);
+        cfgClient?.Invoke(clientConn);
+        clientConn.HandshakeAsClient("localhost");
+        srv.Wait(8000);
+        if (serverErr != null) throw serverErr;
+
+        return (clientConn, serverConn!, () =>
+        {
+            try { clientTcp.Dispose(); } catch { }
+            try { serverTcp?.Dispose(); } catch { }
+            listener.Stop();
+        });
+    }
+
+    // Exercises the opt-in features that previously had no dedicated end-to-end coverage.
+    private static void OptInFeatures(TlsCertificate ca, TlsCertificate ecCert)
+    {
+        // --- ALPN (RFC 7301): overlap is "http/1.1"; both ends must agree. ---
+        {
+            var (c, s, cleanup) = RawPair(ca, ecCert, null,
+                cfgClient: x => x.SetAlpnProtocols(new[] { "h2", "http/1.1" }),
+                cfgServer: x => x.SetAlpnProtocols(new[] { "http/1.1" }));
+            try
+            {
+                Check("ALPN: client + server agree on the protocol",
+                    c.NegotiatedAlpn == "http/1.1" && s.NegotiatedAlpn == "http/1.1");
+            }
+            finally { cleanup(); }
+        }
+
+        // --- OCSP stapling (RFC 6066): server staples a response, client surfaces it verbatim. ---
+        {
+            byte[] ocsp = { 0x30, 0x05, 0x0A, 0x01, 0x00, 0x42 };
+            var (c, s, cleanup) = RawPair(ca, ecCert, null,
+                cfgClient: x => x.RequestOcspStapling(),
+                cfgServer: x => x.SetOcspResponse(ocsp));
+            try
+            {
+                Check("OCSP stapling: client receives the server's stapled response",
+                    c.PeerOcspResponse != null && c.PeerOcspResponse.AsSpan().SequenceEqual(ocsp));
+            }
+            finally { cleanup(); }
+        }
+
+        // --- Exporter, channel binding, exported authenticator, KeyUpdate, post-handshake auth ---
+        {
+            var (c, s, cleanup) = RawPair(ca, ecCert, clientCert: ecCert);
+            try
+            {
+                // Key exporter (RFC 5705 / RFC 8446 §7.5): both ends derive the same bytes.
+                byte[] ctx = Encoding.ASCII.GetBytes("ctx-opentls13");
+                byte[] ce = c.ExportKeyingMaterial("EXPERIMENTAL-opentls13", ctx, 32);
+                byte[] se = s.ExportKeyingMaterial("EXPERIMENTAL-opentls13", ctx, 32);
+                Check("exporter (RFC 5705/8446): client + server derive identical keying material",
+                    ce.Length == 32 && ce.AsSpan().SequenceEqual(se));
+
+                // Channel binding (RFC 9266) tls-exporter: identical on both ends.
+                byte[] cb = c.GetChannelBinding(ChannelBindingType.TlsExporter);
+                byte[] sb = s.GetChannelBinding(ChannelBindingType.TlsExporter);
+                Check("channel binding (RFC 9266, tls-exporter): client + server agree",
+                    cb.Length == 32 && cb.AsSpan().SequenceEqual(sb));
+
+                // Exported authenticator (RFC 9261): server authenticates with its cert; client verifies.
+                byte[] authCtx = Encoding.ASCII.GetBytes("rfc9261-context");
+                byte[] auth = s.ExportAuthenticator(ecCert, authCtx, isServer: true);
+                Check("exported authenticator (RFC 9261): a valid one verifies",
+                    c.VerifyExportedAuthenticator(auth, authCtx, isServer: true, ca));
+                auth[^1] ^= 0xFF;
+                Check("exported authenticator (RFC 9261): a tampered one is rejected",
+                    !c.VerifyExportedAuthenticator(auth, authCtx, isServer: true, ca));
+
+                // KeyUpdate (RFC 8446 §4.6.3): client rotates its write key, then keeps sending under it.
+                c.SendKeyUpdate(requestUpdate: false);
+                byte[] ku = Encoding.ASCII.GetBytes("after-keyupdate");
+                c.Write(ku, 0, ku.Length);
+                var kb = new byte[64]; int kn = s.Read(kb, 0, kb.Length);
+                Check("KeyUpdate: application data flows under the rotated keys",
+                    kn == ku.Length && Encoding.ASCII.GetString(kb, 0, kn) == "after-keyupdate");
+
+                // Post-handshake client auth (RFC 8446 §4.6.2): server requests, client presents its cert.
+                // Sequenced single-threaded: each Write is flushed before the peer's Read drains it.
+                s.RequestPostHandshakeAuth();
+                byte[] pong = Encoding.ASCII.GetBytes("pong");
+                s.Write(pong, 0, pong.Length);                 // unblocks the client Read once it answers the CR
+                var pb = new byte[64]; c.Read(pb, 0, pb.Length); // processes CR (sends cert+CV+Fin), returns "pong"
+                byte[] ping = Encoding.ASCII.GetBytes("ping");
+                c.Write(ping, 0, ping.Length);
+                var qb = new byte[64]; int qn = s.Read(qb, 0, qb.Length); // processes client cert, returns "ping"
+                Check("post-handshake auth (RFC 8446 §4.6.2): server obtained the client certificate",
+                    qn == ping.Length && Encoding.ASCII.GetString(qb, 0, qn) == "ping" && s.PeerCertificateData != null);
+            }
+            finally { cleanup(); }
+        }
+
+        // --- Record padding (RFC 8446 §5.4): a padded connection puts more bytes on the wire. ---
+        RecordPadding(ecCert);
+    }
+
+    // Measures bytes the client writes for the same exchange with padding off vs on. Padding is applied
+    // by the sender, so client-side counting suffices; the server strips it transparently on read.
+    private static void RecordPadding(TlsCertificate ecCert)
+    {
+        long Run(int pad)
+        {
+            int port = ++_port;
+            var listener = new TcpListener(System.Net.IPAddress.Loopback, port);
+            listener.Start();
+            var srv = Task.Run(() =>
+            {
+                try
+                {
+                    using var tcp = listener.AcceptTcpClient();
+                    var conn = new TlsConnection(tcp.GetStream(), isServer: true, ecCert);
+                    conn.HandshakeAsServer();
+                    var b = new byte[64];
+                    int n = conn.Read(b, 0, b.Length);
+                    if (n > 0) conn.Write(b, 0, n);
+                    Thread.Sleep(30);
+                }
+                catch { }
+            });
+            try
+            {
+                using var tcp = new TcpClient { NoDelay = true };
+                tcp.Connect("localhost", port);
+                var counter = new CountingStream(tcp.GetStream());
+                var conn = new TlsConnection(counter, isServer: false);
+                conn.SetServerCertificateValidation(null, (_, _) => true);
+                conn.PaddingBlockSize = pad;
+                conn.HandshakeAsClient("localhost");
+                byte[] msg = Encoding.ASCII.GetBytes("0123456789");
+                conn.Write(msg, 0, msg.Length);
+                var buf = new byte[64];
+                conn.Read(buf, 0, buf.Length);
+                srv.Wait(6000);
+                return counter.BytesWritten;
+            }
+            finally { listener.Stop(); }
+        }
+
+        long noPad = Run(0);
+        long padded = Run(256);
+        Check($"record padding: a padded connection writes more bytes ({padded} > {noPad})", padded > noPad);
+    }
+
+    // Counts bytes written to the wrapped stream (used to observe record padding).
+    private sealed class CountingStream : Stream
+    {
+        private readonly Stream _inner;
+        public long BytesWritten;
+        public CountingStream(Stream inner) => _inner = inner;
+        public override void Write(byte[] buffer, int offset, int count) { BytesWritten += count; _inner.Write(buffer, offset, count); }
+        public override void Write(ReadOnlySpan<byte> buffer) { BytesWritten += buffer.Length; _inner.Write(buffer); }
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+        public override void Flush() => _inner.Flush();
+        public override bool CanRead => true;
+        public override bool CanWrite => true;
+        public override bool CanSeek => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 
     // ML-KEM-768 (FIPS 203) primitive round-trip + implicit-rejection check. The hybrid TLS group

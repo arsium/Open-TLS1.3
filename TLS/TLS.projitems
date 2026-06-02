@@ -30,8 +30,10 @@
     <Compile Include="$(MSBuildThisFileDirectory)Sha2Managed.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)RsaManaged.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)EcdsaManaged.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)MlDsaManaged.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)EcdhManaged.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)AeadCipher.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)AegisAead.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)X25519.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Ed25519.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)EcdhP256.cs" />

@@ -1,5 +1,6 @@
 namespace Tests;
 
+using System.Runtime.Intrinsics;
 using System.Text;
 using TLS;
 using static Tests.T;
@@ -22,6 +23,36 @@ public static class CryptoVectorTests
         CertificateCompressionRoundtrip();
         MlKem768DeterministicKat();
         HpkeRoundTrip();
+        AegisKat();
+        MlDsaRoundTrip();
+    }
+
+    // ML-DSA (FIPS 204) via the BouncyCastle-backed wrapper: fixed key/signature sizes per parameter
+    // set, sign/verify round-trip, and rejection of tampered signature + tampered message. The BC
+    // engine itself is ACVP-tested; this validates our wrapper + encoding round-trips.
+    private static void MlDsaRoundTrip()
+    {
+        Section("ML-DSA (FIPS 204 / draft-ietf-tls-mldsa)");
+        var sets = new[]
+        {
+            (SignatureScheme.MlDsa44, "ML-DSA-44", 1312, 2420),
+            (SignatureScheme.MlDsa65, "ML-DSA-65", 1952, 3309),
+            (SignatureScheme.MlDsa87, "ML-DSA-87", 2592, 4627),
+        };
+        byte[] msg = Encoding.ASCII.GetBytes("TLS 1.3, server CertificateVerify\0...ML-DSA handshake test");
+        foreach (var (scheme, name, pkLen, sigLen) in sets)
+        {
+            var (priv, pub) = MlDsaManaged.GenerateKeyPair(scheme);
+            Check($"{name} public-key size = {pkLen}", pub.Length == pkLen);
+            byte[] sig = MlDsaManaged.Sign(msg, priv, scheme);
+            Check($"{name} signature size = {sigLen}", sig.Length == sigLen);
+            Check($"{name} verify", MlDsaManaged.Verify(msg, sig, pub, scheme));
+
+            byte[] badSig = (byte[])sig.Clone(); badSig[sig.Length / 2] ^= 0xFF;
+            Check($"{name} reject tampered signature", !MlDsaManaged.Verify(msg, badSig, pub, scheme));
+            byte[] badMsg = (byte[])msg.Clone(); badMsg[0] ^= 0xFF;
+            Check($"{name} reject tampered message", !MlDsaManaged.Verify(badMsg, sig, pub, scheme));
+        }
     }
 
     // RFC 9058 Appendix — MGM over Kuznyechik.
@@ -44,6 +75,70 @@ public static class CryptoVectorTests
         var n2 = H("1122334455667700");
         var ct2 = mag.Encrypt(n2, pt, aad);
         Check("MGM-Magma roundtrip", Eqb(mag.Decrypt(n2, ct2, aad), pt));
+    }
+
+    // AEGIS-128L / AEGIS-256 (draft-irtf-cfrg-aegis-aead-18 Appendix A), plus the A.1 AESRound vector.
+    // Each AEAD vector runs twice — once on the AES-NI/ARM hardware round, once forced through the
+    // software FIPS-197 round — so the portable fallback is KAT-validated even on AES-NI hardware.
+    private static void AegisKat()
+    {
+        Section("AEGIS (draft-irtf-cfrg-aegis-aead-18)");
+
+        byte[] inB = H("000102030405060708090a0b0c0d0e0f");
+        byte[] rkB = H("101112131415161718191a1b1c1d1e1f");
+        var outV = AegisAead.AesRound(Vector128.LoadUnsafe(ref inB[0]), Vector128.LoadUnsafe(ref rkB[0]));
+        byte[] ob = new byte[16]; outV.StoreUnsafe(ref ob[0]);
+        Eq("AESRound (A.1)", X(ob), "7a7b4e5638782546a8c0477a3b813f43");
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+            AegisAead.ForceSoftwareAes = pass == 1;
+            string sfx = pass == 1 ? " [soft]" : " [hw]";
+
+            AegisVec(sfx, "128L TV1", false, "10010000000000000000000000000000", "10000200000000000000000000000000",
+                "", "00000000000000000000000000000000", "c1c0e58bd913006feba00f4b3cc3594e", "abe0ece80c24868a226a35d16bdae37a");
+            AegisVec(sfx, "128L TV2 empty", false, "10010000000000000000000000000000", "10000200000000000000000000000000",
+                "", "", "", "c2b879a67def9d74e6c14f708bbcc9b4");
+            AegisVec(sfx, "128L TV3", false, "10010000000000000000000000000000", "10000200000000000000000000000000",
+                "0001020304050607", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "79d94593d8c2119d7e8fd9b8fc77845c5c077a05b2528b6ac54b563aed8efe84", "cc6f3372f6aa1bb82388d695c3962d9a");
+            AegisVec(sfx, "128L TV4 partial", false, "10010000000000000000000000000000", "10000200000000000000000000000000",
+                "0001020304050607", "000102030405060708090a0b0c0d", "79d94593d8c2119d7e8fd9b8fc77", "5c04b3dba849b2701effbe32c7f0fab7");
+            AegisVec(sfx, "128L TV5", false, "10010000000000000000000000000000", "10000200000000000000000000000000",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+                "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637",
+                "b31052ad1cca4e291abcf2df3502e6bdb1bfd6db36798be3607b1f94d34478aa7ede7f7a990fec10", "7542a745733014f9474417b337399507");
+
+            const string k256 = "1001000000000000000000000000000000000000000000000000000000000000";
+            const string n256 = "1000020000000000000000000000000000000000000000000000000000000000";
+            AegisVec(sfx, "256 TV1", true, k256, n256, "", "00000000000000000000000000000000",
+                "754fc3d8c973246dcc6d741412a4b236", "3fe91994768b332ed7f570a19ec5896e");
+            AegisVec(sfx, "256 TV3", true, k256, n256, "0001020304050607",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "f373079ed84b2709faee373584585d60accd191db310ef5d8b11833df9dec711", "8d86f91ee606e9ff26a01b64ccbdd91d");
+            AegisVec(sfx, "256 TV4 partial", true, k256, n256, "0001020304050607",
+                "000102030405060708090a0b0c0d", "f373079ed84b2709faee37358458", "c60b9c2d33ceb058f96e6dd03c215652");
+        }
+        AegisAead.ForceSoftwareAes = false;
+    }
+
+    private static void AegisVec(string sfx, string label, bool is256, string keyH, string nonceH,
+        string adH, string msgH, string ctH, string tagH)
+    {
+        byte[] key = H(keyH), nonce = H(nonceH), ad = H(adH), msg = H(msgH);
+        string name = $"AEGIS-{(is256 ? "256" : "128L")} {label}";
+        using var a = new AegisAead(key, is256);
+
+        byte[] outp = new byte[msg.Length + 16];
+        a.EncryptInto(nonce, msg, outp, ad);
+        Eq($"{name} ct{sfx}", X(outp[..msg.Length]), ctH);
+        Eq($"{name} tag{sfx}", X(outp[msg.Length..]), tagH);
+
+        byte[] dec = new byte[msg.Length];
+        Check($"{name} decrypt{sfx}", a.TryDecryptInto(nonce, outp, dec, ad) && Eqb(dec, msg));
+
+        byte[] bad = (byte[])outp.Clone(); bad[^1] ^= 0xFF;
+        Check($"{name} reject-tamper{sfx}", !a.TryDecryptInto(nonce, bad, new byte[msg.Length], ad));
     }
 
     // GB/T 32907-2016 (SM4) and GB/T 32905-2016 (SM3).

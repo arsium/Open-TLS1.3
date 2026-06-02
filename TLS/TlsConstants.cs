@@ -61,6 +61,7 @@ public enum ExtensionType : ushort
     PwdProtect = 29,                    // RFC 8492
     PwdClear = 30,                      // RFC 8492
     PasswordSalt = 31,                  // RFC 8492
+    CertWithExternPsk = 33,             // RFC 8773 (Experimental); draft-ietf-tls-8773bis (Standards Track, in progress)
     SessionTicket = 35,                 // RFC 5077/8447
     PreSharedKey = 41,                  // RFC 8446 §4.2.11
     EarlyData = 42,                     // RFC 8446 §4.2.10
@@ -92,8 +93,10 @@ public enum CipherSuite : ushort
     TLS_AES_128_CCM_8_SHA256 = 0x1305,         // RFC 8446 §B.4
 
     // Additional TLS 1.3 Cipher Suites
-    TLS_AEGIS_128L_SHA256 = 0x1306,            // draft-irtf-cfrg-aegis-aead (code points; not implemented)
-    TLS_AEGIS_256_SHA512 = 0x1307,             // draft-irtf-cfrg-aegis-aead (code points; not implemented)
+    // Internet-Drafts (NOT RFCs): draft-denis-tls-aegis §6 + draft-irtf-cfrg-aegis-aead. These code
+    // points are draft-assigned and may change before publication — treat as experimental.
+    TLS_AEGIS_256_SHA512 = 0x1306,
+    TLS_AEGIS_128L_SHA256 = 0x1307,
 
     // Chinese National Standard (RFC 8998) - for Phase D
     TLS_SM4_GCM_SM3 = 0x00C6,                  // RFC 8998 §6
@@ -165,6 +168,13 @@ public enum SignatureScheme : ushort
     RsaPssPssSha256 = 0x0809,                  // RFC 8446 §4.2.3
     RsaPssPssSha384 = 0x080a,                  // RFC 8446 §4.2.3
     RsaPssPssSha512 = 0x080b,                  // RFC 8446 §4.2.3
+
+    // Post-Quantum signatures. ML-DSA is FIPS 204 (final) and its X.509 form is RFC 9881 (final),
+    // but its TLS use — these code points — is an Internet-Draft (draft-ietf-tls-mldsa §3, NOT an RFC)
+    // and may change before publication.
+    MlDsa44 = 0x0904,                         // id-ML-DSA-44
+    MlDsa65 = 0x0905,                         // id-ML-DSA-65
+    MlDsa87 = 0x0906,                         // id-ML-DSA-87
 
     // Chinese National Standard (RFC 8998) - for Phase D
     Sm2Sm3 = 0x0708,                          // RFC 8998 §4.2.2

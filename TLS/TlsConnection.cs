@@ -68,6 +68,18 @@ public sealed class TlsConnection : IDisposable
     /// <summary>True if the connection was resumed via PSK.</summary>
     public bool IsResumed { get; private set; }
 
+    /// <summary>True if this connection authenticated with a certificate AND mixed an external PSK
+    /// into the key schedule (draft-ietf-tls-8773bis, Internet-Draft). Distinct from <see cref="IsResumed"/>:
+    /// a full certificate handshake ran; the PSK only hardened the key schedule.</summary>
+    public bool UsedCertWithExternalPsk { get; private set; }
+
+    /// <summary>The key-exchange group negotiated for this connection (e.g. X25519MLKEM768, X25519),
+    /// reflecting any HelloRetryRequest. Valid once the handshake has completed.</summary>
+    public NamedGroup NegotiatedGroup => _negotiatedGroup;
+
+    /// <summary>The cipher suite negotiated for this connection. Valid once the handshake has completed.</summary>
+    public CipherSuite NegotiatedCipherSuite => _keySchedule?.Suite ?? default;
+
     /// <summary>True if 0-RTT early data was accepted by the server.</summary>
     public bool EarlyDataAccepted { get; private set; }
 
@@ -82,6 +94,10 @@ public sealed class TlsConnection : IDisposable
         SignatureScheme.Ed25519,
         SignatureScheme.RsaPssRsaeSha256,
         SignatureScheme.RsaPssRsaeSha384,
+        // FIPS 204 ML-DSA post-quantum signatures (draft-ietf-tls-mldsa)
+        SignatureScheme.MlDsa44,
+        SignatureScheme.MlDsa65,
+        SignatureScheme.MlDsa87,
         // RFC 9367 GOST R 34.10-2012 signature schemes
         SignatureScheme.Gostr34102012_256a,
         SignatureScheme.Gostr34102012_256b,
@@ -120,6 +136,10 @@ public sealed class TlsConnection : IDisposable
     private string[]? _alpnProtocols;      // offered protocols (client) or accepted protocols (server)
     private CipherSuite[]? _offeredSuites;  // client: override the default offered cipher suite list
     private NamedGroup[]? _offeredGroups;   // client: override the default offered key-share groups
+    private SignatureScheme[]? _offeredSigAlgs; // override advertised signature_algorithms (CH / CertificateRequest)
+    private CipherSuite[]? _allowedSuites;  // server: allow-list restricting which offered suites may be selected
+    private NamedGroup[]? _allowedGroups;   // server: allow-list restricting which offered groups may be selected
+    private NamedGroup _negotiatedGroup;    // the key-exchange group selected for this connection
     private byte[]? _gostKexPriv;           // client: ephemeral GOST ECDH private key (if a GOST group offered)
     private string? _gostKexCurveOid;       // client: curve OID for _gostKexPriv
     private byte[]? _sm2KexPriv;            // client: ephemeral SM2 ECDH private key (if curveSM2 offered)
@@ -150,6 +170,7 @@ public sealed class TlsConnection : IDisposable
     // PSK / Resumption
     private SessionTicket? _pskTicket;       // client: ticket to offer
     private ExternalPsk? _externalPsk;       // RFC 9258: external PSK for import
+    private bool _certWithExternPsk;         // client: cert + external PSK mode (draft-ietf-tls-8773bis)
     private byte[]? _earlyData;              // client: data to send as 0-RTT
     private TicketEncryption? _ticketEncryption; // server: ticket sealing key
     private bool _enableTickets;
@@ -203,6 +224,17 @@ public sealed class TlsConnection : IDisposable
     /// <summary>Import external PSK for client/server use (RFC 9258).</summary>
     public void ImportExternalPsk(ExternalPsk psk) => _externalPsk = psk;
 
+    /// <summary>Client: combine an external PSK with certificate authentication
+    /// (draft-ietf-tls-8773bis, Internet-Draft). A full certificate handshake runs, but the external
+    /// PSK is also mixed into the key schedule, so the session stays confidential even if the
+    /// certificate's signature algorithm is later broken. Must be set before the handshake; not
+    /// compatible with 0-RTT.</summary>
+    public void EnableCertWithExternalPsk(ExternalPsk psk)
+    {
+        _externalPsk = psk;
+        _certWithExternPsk = true;
+    }
+
     /// <summary>Set early data to send as 0-RTT (client only). Must be called before handshake.</summary>
     public void SetEarlyData(byte[] data) => _earlyData = data;
 
@@ -239,6 +271,22 @@ public sealed class TlsConnection : IDisposable
 
     /// <summary>Client: override the key-share groups offered in ClientHello (in preference order).</summary>
     public void SetOfferedGroups(NamedGroup[] groups) => _offeredGroups = groups;
+
+    /// <summary>Override the signature schemes this endpoint accepts from its peer — advertised in the
+    /// ClientHello signature_algorithms (client) and in CertificateRequest (server, mTLS), and enforced
+    /// against the peer's CertificateVerify. Null = stack default. Use this to, e.g., drop the ML-DSA
+    /// (draft-ietf-tls-mldsa) schemes from the advertisement.</summary>
+    public void SetOfferedSignatureSchemes(SignatureScheme[] schemes) => _offeredSigAlgs = schemes;
+
+    /// <summary>Server: restrict which cipher suites may be selected, even if the client offers others the
+    /// stack supports (an allow-list, intersected with the client's offer in the server's preference order).
+    /// Null = accept any supported suite (default). Use this to refuse, e.g., the AEGIS (draft) or the
+    /// GOST/SM national suites.</summary>
+    public void SetAllowedCipherSuites(CipherSuite[] suites) => _allowedSuites = suites;
+
+    /// <summary>Server: restrict which key-exchange groups may be selected (an allow-list). Null = accept any
+    /// supported group the client offers (default). Use this to require — or forbid — the hybrid PQ groups.</summary>
+    public void SetAllowedGroups(NamedGroup[] groups) => _allowedGroups = groups;
 
     // Client-side server-certificate trust (RFC 8446 leaves trust policy to the application).
     // Permissive by default; enforced only when one of these is configured via TlsClient.
@@ -443,11 +491,11 @@ public sealed class TlsConnection : IDisposable
         CipherSuite[] suites, (NamedGroup, byte[])[] keyShares, string? serverName, byte[]? cookie)
     {
         byte[] inner2 = HandshakeMessages.BuildClientHello(_echInnerRandom!, sessionId, suites, keyShares,
-            serverName, cookie, _alpnProtocols, _requestOcspStapling);
+            serverName, cookie, _alpnProtocols, _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
         var cfg = _echConfigs![0];
         var (outer2, _) = EncryptedClientHello.EncryptClientHello(inner2, _echInnerRandom!, cfg,
             echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-                cfg.PublicNameString, cookie, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody));
+                cfg.PublicNameString, cookie, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups));
         _echOuterChMsg = outer2;
         return (outer2, EchAccepted ? inner2 : outer2);
     }
@@ -479,11 +527,11 @@ public sealed class TlsConnection : IDisposable
         var echConfig = _echConfigs[0];
         byte[] innerRandom = RandomnessWrapper.GetHandshakeBytes(32);
         byte[] innerCh = HandshakeMessages.BuildClientHello(innerRandom, sessionId, suites, keyShares,
-            serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+            serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
         string publicName = echConfig.PublicNameString;
         var (outerCh, echContext) = EncryptedClientHello.EncryptClientHello(innerCh, innerRandom, echConfig,
             echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-                publicName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody));
+                publicName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups));
         _echContext = echContext;
         _echInnerRandom = innerRandom;
         _echTranscriptOverride = innerCh;
@@ -505,7 +553,7 @@ public sealed class TlsConnection : IDisposable
         byte[] echExt = EncryptedClientHello.BuildOuterEchExtBody(configId,
             Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM, enc, payload);
         return HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-            serverName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExt);
+            serverName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExt, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
     }
 
     /// <summary>Server: the ECHConfigList to return as retry_configs after an ECH reject (its own
@@ -739,12 +787,13 @@ public sealed class TlsConnection : IDisposable
                     return false;
             }
 
-            // Verify signature
-            var tempCert = new TlsCertificate { DerData = certDer };
+            // Verify signature against the public key parsed from the certificate DER (the TlsCertificate
+            // built above carries only DerData — its PublicKey field is not populated from the bytes).
+            var (pubKey, _) = CertificateUtils.ParseCertificatePublicKey(certDer);
             string signContext = isServer ? "TLS 1.3, server authenticator" : "TLS 1.3, client authenticator";
             byte[] signContent = HandshakeMessages.BuildCertVerifyContent(signContext, context);
 
-            return CertificateUtils.Verify(signContent, signature, tempCert.PublicKey, sigAlg);
+            return CertificateUtils.Verify(signContent, signature, pubKey, sigAlg);
         }
         catch
         {
@@ -895,7 +944,7 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling);
+                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -921,13 +970,14 @@ public sealed class TlsConnection : IDisposable
             // Build CH with placeholder binder
             int binderLen = _keySchedule.HashLen;
             byte[] placeholder = new byte[binderLen];
-            offer0Rtt = _externalPsk.MaxEarlyDataSize > 0;
+            // draft-ietf-tls-8773bis forbids early_data alongside tls_cert_with_extern_psk.
+            offer0Rtt = !_certWithExternPsk && _externalPsk.MaxEarlyDataSize > 0;
 
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
                 _externalPsk.Identity, 0, placeholder, // External PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling);
+                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
             // Compute and patch the real binder
             int bindersLen = HandshakeMessages.PskBindersTailLength(binderLen);
@@ -948,7 +998,8 @@ public sealed class TlsConnection : IDisposable
             chMsg = TryBuildEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling,
+                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
         }
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
@@ -1088,7 +1139,7 @@ public sealed class TlsConnection : IDisposable
                     clientRandom, sessionId, suites, keyShares,
                     _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
                     false, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling); // no 0-RTT after HRR
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -1111,7 +1162,7 @@ public sealed class TlsConnection : IDisposable
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling);
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
                 _record.WriteRecord(ContentType.Handshake, ch2Msg);
                 _transcript.Update(ch2Msg);
             }
@@ -1129,19 +1180,23 @@ public sealed class TlsConnection : IDisposable
         }
 
         // 5. Set up key schedule (if not already from PSK/HRR)
-        bool isPskResumption = sh.SelectedPskIndex >= 0 && psk != null;
-        if (_keySchedule == null || (!isPskResumption && psk != null))
+        // draft-ietf-tls-8773bis: a server that echoes tls_cert_with_extern_psk mixes the PSK into the
+        // key schedule but still runs a FULL certificate handshake (not a resumption skip).
+        bool certWithPsk = sh.CertWithExternPsk && psk != null;
+        bool isPskResumption = !certWithPsk && sh.SelectedPskIndex >= 0 && psk != null;
+        if (_keySchedule == null || (!isPskResumption && !certWithPsk && psk != null))
         {
-            // Recreate key schedule when:
-            // - First time (no HRR), OR
-            // - PSK was offered but server rejected it (early secret has wrong PSK baked in)
-            _keySchedule = isPskResumption ? new KeySchedule(sh.CipherSuite, psk) : new KeySchedule(sh.CipherSuite);
+            // Recreate the key schedule when first time (no HRR), or the server rejected our PSK
+            // (the early secret would otherwise have the wrong PSK baked in).
+            _keySchedule = (isPskResumption || certWithPsk) ? new KeySchedule(sh.CipherSuite, psk) : new KeySchedule(sh.CipherSuite);
             _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
         }
         _transcript.Update(shMsg);
         IsResumed = isPskResumption;
+        UsedCertWithExternalPsk = certWithPsk;
 
         // 6. Compute shared secret based on selected group
+        _negotiatedGroup = sh.KeyShareGroup;
         if (sh.KeyShare == null || sh.KeyShare.Length == 0)
             AlertAndThrow(AlertDescription.DecodeError, "ServerHello has empty KeyShare");
         byte[] shared = ComputeClientSharedSecret(
@@ -1405,8 +1460,14 @@ public sealed class TlsConnection : IDisposable
         CipherSuite suite = default;
         byte[]? psk = null;
         bool isPskResumption = false;
+        bool certWithPsk = false;   // draft-ietf-tls-8773bis: cert + external PSK (full cert handshake)
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
+
+        // draft-ietf-tls-8773bis §4: tls_cert_with_extern_psk MUST NOT be combined with early_data.
+        if (ch.OffersCertWithExternPsk && ch.OffersEarlyData)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "tls_cert_with_extern_psk MUST NOT be offered with early_data (draft-ietf-tls-8773bis)");
 
         // RFC 8446 §4.2.9: a server MUST NOT select a PSK unless the client offered a compatible
         // psk_key_exchange_mode. We only support psk_dhe_ke, so absent that the PSK is ignored and we
@@ -1493,18 +1554,28 @@ public sealed class TlsConnection : IDisposable
 
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
-                        isPskResumption = true;
                         suite = _externalPsk.Suite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
-                        pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
-                        // 0-RTT anti-replay for external PSKs (RFC 8446 §8): an external PSK identity is
-                        // long-lived, so we can't single-use the identity itself. Instead single-use the
-                        // binder, which is bound to this exact ClientHello (it covers client_random) — a
-                        // verbatim replay reuses the binder and is rejected, while a fresh ClientHello with
-                        // the same PSK still gets 0-RTT. Requires a replay store; without one we refuse
-                        // 0-RTT (fall back to 1-RTT resumption) rather than accept un-tracked early data.
-                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
-                            && _ticketEncryption != null
-                            && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
+                        if (ch.OffersCertWithExternPsk)
+                        {
+                            // draft-ietf-tls-8773bis: the client asked to combine this external PSK with a
+                            // certificate. Mix the PSK into the key schedule but run a FULL cert handshake
+                            // (no resumption skip, and no 0-RTT — early_data is forbidden with this ext).
+                            certWithPsk = true;
+                        }
+                        else
+                        {
+                            isPskResumption = true;
+                            pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
+                            // 0-RTT anti-replay for external PSKs (RFC 8446 §8): an external PSK identity is
+                            // long-lived, so we can't single-use the identity itself. Instead single-use the
+                            // binder, which is bound to this exact ClientHello (it covers client_random) — a
+                            // verbatim replay reuses the binder and is rejected, while a fresh ClientHello with
+                            // the same PSK still gets 0-RTT. Requires a replay store; without one we refuse
+                            // 0-RTT (fall back to 1-RTT resumption) rather than accept un-tracked early data.
+                            accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                                && _ticketEncryption != null
+                                && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
+                        }
                         break;
                     }
                 }
@@ -1512,11 +1583,12 @@ public sealed class TlsConnection : IDisposable
         }
 
         // Select cipher suite (if PSK didn't determine it)
-        if (!isPskResumption)
+        if (!isPskResumption && !certWithPsk)
             suite = SelectCipherSuite(ch.CipherSuites);
 
         // 4. Initialize key schedule
-        _keySchedule = isPskResumption ? new KeySchedule(suite, psk) : new KeySchedule(suite);
+        _keySchedule = (isPskResumption || certWithPsk) ? new KeySchedule(suite, psk) : new KeySchedule(suite);
+        UsedCertWithExternalPsk = certWithPsk;
         _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
 
         // 5. Select key share from client's offerings
@@ -1591,6 +1663,7 @@ public sealed class TlsConnection : IDisposable
         }
 
         var (group, clientKey) = selectedKS.Value;
+        _negotiatedGroup = group;
 
         // 7. Generate server key share and compute shared secret
         byte[] shared = ComputeServerSharedSecret(group, clientKey, out byte[] sPub);
@@ -1600,7 +1673,10 @@ public sealed class TlsConnection : IDisposable
 
         // 8. Send ServerHello (with PSK extension if resuming)
         byte[] shMsg;
-        if (isPskResumption)
+        if (certWithPsk)
+            // draft-ietf-tls-8773bis: echo tls_cert_with_extern_psk + the selected PSK; a full cert handshake follows.
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0, certWithExternPsk: true);
+        else if (isPskResumption)
             shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
@@ -1750,7 +1826,7 @@ public sealed class TlsConnection : IDisposable
         // 14. CertificateRequest (if mTLS)
         if (_requireClientCert)
         {
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs,
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), _offeredSigAlgs ?? AdvertisedSigAlgs,
                 certCompAlgs: _useCertCompression ? CertCompAdvertise : null);
             _record.WriteRecord(ContentType.Handshake, crMsg);
             _transcript.Update(crMsg);
@@ -1895,7 +1971,7 @@ public sealed class TlsConnection : IDisposable
         {
             byte[] context = RandomnessWrapper.GetBytes(16);
             _pendingPostHsContext = context;
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, _offeredSigAlgs ?? AdvertisedSigAlgs);
             _record.WriteRecord(ContentType.Handshake, crMsg);
             _postHsAuthState = PostHsAuthState.AwaitingCertificate;
         }
@@ -2246,7 +2322,7 @@ public sealed class TlsConnection : IDisposable
         // Continue the live CH..client-Finished transcript (RFC 8446 §4.4): CertificateRequest then
         // the peer's Certificate. (message_hash(254) is only the HRR CH1 rewrite, not used here.)
         _postHsTranscript = _transcript.Clone();
-        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(_pendingPostHsContext!, AdvertisedSigAlgs);
+        byte[] crMsg = HandshakeMessages.BuildCertificateRequest(_pendingPostHsContext!, _offeredSigAlgs ?? AdvertisedSigAlgs);
         _postHsTranscript.Update(crMsg);
         _postHsTranscript.Update(fullMsg);
 
@@ -2696,15 +2772,19 @@ public sealed class TlsConnection : IDisposable
             or CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S
             or CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_S
             or CipherSuite.TLS_SM4_GCM_SM3
-            or CipherSuite.TLS_SM4_CCM_SM3;
+            or CipherSuite.TLS_SM4_CCM_SM3
+            or CipherSuite.TLS_AEGIS_128L_SHA256
+            or CipherSuite.TLS_AEGIS_256_SHA512;
 
-    private static CipherSuite SelectCipherSuite(CipherSuite[] clientSuites)
+    private CipherSuite SelectCipherSuite(CipherSuite[] clientSuites)
     {
         CipherSuite[] pref =
         {
             CipherSuite.TLS_AES_256_GCM_SHA384,
             CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
             CipherSuite.TLS_AES_128_GCM_SHA256,
+            CipherSuite.TLS_AEGIS_256_SHA512,
+            CipherSuite.TLS_AEGIS_128L_SHA256,
             CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L,
             CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_L,
             CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S,
@@ -2713,7 +2793,11 @@ public sealed class TlsConnection : IDisposable
             CipherSuite.TLS_SM4_CCM_SM3
         };
         foreach (var s in pref)
+        {
+            // Server allow-list (SetAllowedCipherSuites): skip any suite the operator excluded.
+            if (_allowedSuites != null && Array.IndexOf(_allowedSuites, s) < 0) continue;
             if (Array.IndexOf(clientSuites, s) >= 0) return s;
+        }
         throw new TlsException(AlertDescription.HandshakeFailure, "No common cipher suite");
     }
 
@@ -2731,12 +2815,16 @@ public sealed class TlsConnection : IDisposable
                 "Client's signature_algorithms does not include the server certificate's signature scheme");
     }
 
-    private static (NamedGroup group, byte[] key)? SelectKeyShare(
+    private (NamedGroup group, byte[] key)? SelectKeyShare(
         (NamedGroup group, byte[] key)[] clientShares)
     {
         foreach (var sg in ServerGroupPreference)
+        {
+            // Server allow-list (SetAllowedGroups): skip any group the operator excluded.
+            if (_allowedGroups != null && Array.IndexOf(_allowedGroups, sg) < 0) continue;
             foreach (var cs in clientShares)
                 if (cs.group == sg) return cs;
+        }
         return null;
     }
 
@@ -2748,19 +2836,22 @@ public sealed class TlsConnection : IDisposable
         return null;
     }
 
-    private static NamedGroup SelectGroupForHrr(NamedGroup[]? clientGroups)
+    private NamedGroup SelectGroupForHrr(NamedGroup[]? clientGroups)
     {
         if (clientGroups != null)
         {
             foreach (var sg in ServerGroupPreference)
+            {
+                if (_allowedGroups != null && Array.IndexOf(_allowedGroups, sg) < 0) continue;
                 if (Array.IndexOf(clientGroups, sg) >= 0) return sg;
+            }
         }
         throw new TlsException(AlertDescription.HandshakeFailure, "No common supported group for HRR");
     }
 
     private void ValidateSignatureScheme(SignatureScheme scheme)
     {
-        if (Array.IndexOf(AdvertisedSigAlgs, scheme) < 0)
+        if (Array.IndexOf(_offeredSigAlgs ?? AdvertisedSigAlgs, scheme) < 0)
             AlertAndThrow(AlertDescription.IllegalParameter,
                 $"CertificateVerify uses unadvertised scheme: {scheme}");
     }
@@ -3188,7 +3279,7 @@ public sealed class TlsConnection : IDisposable
         {
             byte[] context = RandomnessWrapper.GetBytes(16);
             _pendingPostHsContext = context;
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, AdvertisedSigAlgs);
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(context, _offeredSigAlgs ?? AdvertisedSigAlgs);
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
             _postHsAuthState = PostHsAuthState.AwaitingCertificate;
         }
@@ -3311,7 +3402,7 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling);
+                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -3336,13 +3427,14 @@ public sealed class TlsConnection : IDisposable
 
             int binderLenE = _keySchedule.HashLen;
             byte[] placeholderE = new byte[binderLenE];
-            offer0Rtt = _externalPsk.MaxEarlyDataSize > 0;
+            // draft-ietf-tls-8773bis forbids early_data alongside tls_cert_with_extern_psk.
+            offer0Rtt = !_certWithExternPsk && _externalPsk.MaxEarlyDataSize > 0;
 
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
                 _externalPsk.Identity, 0, placeholderE, // external PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling);
+                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
             int bindersLenE = HandshakeMessages.PskBindersTailLength(binderLenE);
             byte[] truncatedChE = chMsg[..^bindersLenE];
@@ -3362,7 +3454,8 @@ public sealed class TlsConnection : IDisposable
             chMsg = TryBuildEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
-                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling);
+                    serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling,
+                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
         }
 
         await _record.WriteRecordAsync(ContentType.Handshake, chMsg, ct).ConfigureAwait(false);
@@ -3496,7 +3589,7 @@ public sealed class TlsConnection : IDisposable
                     clientRandom, sessionId, suites, keyShares,
                     _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
                     false, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling); // no 0-RTT after HRR
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -3519,7 +3612,7 @@ public sealed class TlsConnection : IDisposable
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling);
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
                 await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
                 _transcript.Update(ch2Msg);
             }
@@ -3537,16 +3630,20 @@ public sealed class TlsConnection : IDisposable
         }
 
         // 5. Set up key schedule
-        bool isPskResumption = sh.SelectedPskIndex >= 0 && psk != null;
-        if (_keySchedule == null || (!isPskResumption && psk != null))
+        // draft-ietf-tls-8773bis: cert + external PSK uses the PSK-seeded schedule + full cert handshake.
+        bool certWithPsk = sh.CertWithExternPsk && psk != null;
+        bool isPskResumption = !certWithPsk && sh.SelectedPskIndex >= 0 && psk != null;
+        if (_keySchedule == null || (!isPskResumption && !certWithPsk && psk != null))
         {
-            _keySchedule = isPskResumption ? new KeySchedule(sh.CipherSuite, psk) : new KeySchedule(sh.CipherSuite);
+            _keySchedule = (isPskResumption || certWithPsk) ? new KeySchedule(sh.CipherSuite, psk) : new KeySchedule(sh.CipherSuite);
             _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
         }
         _transcript.Update(shMsg);
         IsResumed = isPskResumption;
+        UsedCertWithExternalPsk = certWithPsk;
 
         // 6. Compute shared secret based on selected group
+        _negotiatedGroup = sh.KeyShareGroup;
         if (sh.KeyShare == null || sh.KeyShare.Length == 0)
             AlertAndThrow(AlertDescription.DecodeError, "ServerHello has empty KeyShare");
         byte[] shared = ComputeClientSharedSecret(
@@ -3767,8 +3864,14 @@ public sealed class TlsConnection : IDisposable
         CipherSuite suite = default;
         byte[]? psk = null;
         bool isPskResumption = false;
+        bool certWithPsk = false;   // draft-ietf-tls-8773bis: cert + external PSK (full cert handshake)
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
+
+        // draft-ietf-tls-8773bis §4: tls_cert_with_extern_psk MUST NOT be combined with early_data.
+        if (ch.OffersCertWithExternPsk && ch.OffersEarlyData)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "tls_cert_with_extern_psk MUST NOT be offered with early_data (draft-ietf-tls-8773bis)");
 
         // RFC 8446 §4.2.9 / §4.2.11 + RFC 9258: try ticket resumption first, then external PSK
         // (mirrors the sync HandshakeAsServer so external PSK works on the async path too).
@@ -3843,25 +3946,34 @@ public sealed class TlsConnection : IDisposable
 
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
-                        isPskResumption = true;
                         suite = _externalPsk.Suite;
-                        pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
-                        // External-PSK 0-RTT anti-replay: single-use the binder (bound to this exact
-                        // ClientHello), requires a replay store; without one, fall back to 1-RTT.
-                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
-                            && _ticketEncryption != null
-                            && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
+                        if (ch.OffersCertWithExternPsk)
+                        {
+                            // draft-ietf-tls-8773bis: combine this external PSK with a full cert handshake.
+                            certWithPsk = true;
+                        }
+                        else
+                        {
+                            isPskResumption = true;
+                            pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
+                            // External-PSK 0-RTT anti-replay: single-use the binder (bound to this exact
+                            // ClientHello), requires a replay store; without one, fall back to 1-RTT.
+                            accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                                && _ticketEncryption != null
+                                && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
+                        }
                         break;
                     }
                 }
             }
         }
 
-        if (!isPskResumption)
+        if (!isPskResumption && !certWithPsk)
             suite = SelectCipherSuite(ch.CipherSuites);
 
         // 4. Initialize key schedule
-        _keySchedule = isPskResumption ? new KeySchedule(suite, psk) : new KeySchedule(suite);
+        _keySchedule = (isPskResumption || certWithPsk) ? new KeySchedule(suite, psk) : new KeySchedule(suite);
+        UsedCertWithExternalPsk = certWithPsk;
         _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
 
         // 5. Select key share
@@ -3933,6 +4045,7 @@ public sealed class TlsConnection : IDisposable
         }
 
         var (group, clientKey) = selectedKS.Value;
+        _negotiatedGroup = group;
 
         // 7. Generate server key share and compute shared secret
         byte[] shared = ComputeServerSharedSecret(group, clientKey, out byte[] sPub);
@@ -3942,7 +4055,10 @@ public sealed class TlsConnection : IDisposable
 
         // 8. Send ServerHello (with PSK extension if resuming)
         byte[] shMsg;
-        if (isPskResumption)
+        if (certWithPsk)
+            // draft-ietf-tls-8773bis: echo tls_cert_with_extern_psk + the selected PSK; a full cert handshake follows.
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0, certWithExternPsk: true);
+        else if (isPskResumption)
             shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
@@ -4075,7 +4191,7 @@ public sealed class TlsConnection : IDisposable
         // 14. CertificateRequest (if mTLS)
         if (_requireClientCert)
         {
-            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), AdvertisedSigAlgs,
+            byte[] crMsg = HandshakeMessages.BuildCertificateRequest(Array.Empty<byte>(), _offeredSigAlgs ?? AdvertisedSigAlgs,
                 certCompAlgs: _useCertCompression ? CertCompAdvertise : null);
             await _record.WriteRecordAsync(ContentType.Handshake, crMsg, ct).ConfigureAwait(false);
             _transcript.Update(crMsg);

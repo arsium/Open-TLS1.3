@@ -26,6 +26,11 @@ public sealed class TlsClient
     /// <summary>Override the key-share groups offered in ClientHello (in preference order). Null = stack default.</summary>
     public NamedGroup[]? NamedGroups { get; set; }
 
+    /// <summary>Override the signature schemes offered in ClientHello's signature_algorithms — what the client
+    /// accepts for the server's CertificateVerify. Null = stack default. Set a list without the ML-DSA schemes
+    /// (draft-ietf-tls-mldsa) to stop advertising post-quantum signature support, for example.</summary>
+    public SignatureScheme[]? SignatureSchemes { get; set; }
+
     /// <summary>Trust anchor for verifying the server certificate. When set (or
     /// <see cref="ServerCertificateValidationCallback"/> is set), the handshake fails closed if the
     /// server certificate is not signed by this CA, is outside its validity window, or does not match
@@ -174,6 +179,9 @@ public sealed class TlsClient
 
         if (NamedGroups != null)
             conn.SetOfferedGroups(NamedGroups);
+
+        if (SignatureSchemes != null)
+            conn.SetOfferedSignatureSchemes(SignatureSchemes);
 
         if (EchConfigList != null)
             conn.SetEchConfigs(EncryptedClientHello.ParseEchConfigList(EchConfigList));

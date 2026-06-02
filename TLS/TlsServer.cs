@@ -35,6 +35,19 @@ public sealed class TlsServer : IDisposable
     /// <summary>ALPN protocols the server accepts, in preference order.</summary>
     public string[]? AlpnProtocols { get; set; }
 
+    /// <summary>Restrict which cipher suites the server will select — an allow-list, intersected with the
+    /// client's offer in the server's preference order. Null = accept any suite the stack supports (default).
+    /// Use this to refuse, e.g., the AEGIS (draft) or the GOST/SM national suites.</summary>
+    public CipherSuite[]? AllowedCipherSuites { get; set; }
+
+    /// <summary>Restrict which key-exchange groups the server will select — an allow-list. Null = accept any
+    /// supported group the client offers (default). Use this to require — or forbid — the hybrid PQ groups.</summary>
+    public NamedGroup[]? AllowedGroups { get; set; }
+
+    /// <summary>mTLS: override the signature schemes advertised in CertificateRequest — what the server accepts
+    /// for the client's CertificateVerify. Null = stack default.</summary>
+    public SignatureScheme[]? AcceptedClientSignatureSchemes { get; set; }
+
     /// <summary>Enable certificate compression (RFC 8879, brotli).</summary>
     public bool UseCertificateCompression { get; set; }
 
@@ -104,6 +117,12 @@ public sealed class TlsServer : IDisposable
                 conn.SetEchPrivateKey(EchPrivateKey);
                 conn.SetEchConfigs(EncryptedClientHello.ParseEchConfigList(EchConfigList));
             }
+            if (AllowedCipherSuites != null)
+                conn.SetAllowedCipherSuites(AllowedCipherSuites);
+            if (AllowedGroups != null)
+                conn.SetAllowedGroups(AllowedGroups);
+            if (AcceptedClientSignatureSchemes != null)
+                conn.SetOfferedSignatureSchemes(AcceptedClientSignatureSchemes);
             if (ForceHelloRetryRequest)
                 conn.ForceHelloRetryRequest();
 
@@ -147,6 +166,12 @@ public sealed class TlsServer : IDisposable
                 conn.SetEchPrivateKey(EchPrivateKey);
                 conn.SetEchConfigs(EncryptedClientHello.ParseEchConfigList(EchConfigList));
             }
+            if (AllowedCipherSuites != null)
+                conn.SetAllowedCipherSuites(AllowedCipherSuites);
+            if (AllowedGroups != null)
+                conn.SetAllowedGroups(AllowedGroups);
+            if (AcceptedClientSignatureSchemes != null)
+                conn.SetOfferedSignatureSchemes(AcceptedClientSignatureSchemes);
             if (ForceHelloRetryRequest)
                 conn.ForceHelloRetryRequest();
 
