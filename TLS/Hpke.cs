@@ -15,6 +15,10 @@ public static class Hpke
     public const ushort AEAD_AES_128_GCM = 0x0001;
     public const ushort AEAD_CHACHA20_POLY1305 = 0x0003;
 
+    /// <summary>Nn (AEAD nonce length, 12 for both supported AEADs) and Nh (HKDF-SHA256 output) — RFC 9180 §7.</summary>
+    public const int NonceLength = 12;
+    public const int KdfHashLength = 32;
+
     // Algorithm parameters
     private const int Nn = 12;  // AEAD nonce size (12 for both AES-GCM and ChaCha20Poly1305)
     private const int Nh = 32;  // SHA-256 hash size
@@ -22,12 +26,37 @@ public static class Hpke
     private const int Nenc = 32;   // X25519 encoded public key size
 
     /// <summary>AEAD key length Nk for the given HPKE AEAD id (RFC 9180 §7.3).</summary>
-    internal static int AeadKeyLength(ushort aeadId) => aeadId switch
+    public static int AeadKeyLength(ushort aeadId) => aeadId switch
     {
         AEAD_AES_128_GCM => 16,
         AEAD_CHACHA20_POLY1305 => 32,
         _ => throw new NotSupportedException($"HPKE AEAD 0x{aeadId:x4} not supported")
     };
+
+    /// <summary>One-shot AEAD seal with an explicit key and nonce (no HPKE context / sequence). Used by
+    /// Oblivious DoH response encryption (RFC 9230 §6.2), where the response is sealed under a freshly
+    /// derived key/nonce rather than the HPKE context. Output is ciphertext||tag.</summary>
+    public static byte[] AeadSeal(ushort aeadId, byte[] key, byte[] nonce, byte[] aad, byte[] plaintext)
+    {
+        byte[] result = new byte[plaintext.Length + 16];
+        if (aeadId == AEAD_CHACHA20_POLY1305) { using var c = new ChaCha20Poly1305Managed(key); c.Encrypt(nonce, plaintext, result, aad); }
+        else { using var a = new AesGcmManaged(key, 16); a.Encrypt(nonce, plaintext, result, aad); }
+        return result;
+    }
+
+    /// <summary>One-shot AEAD open matching <see cref="AeadSeal"/>. Returns null on authentication failure.</summary>
+    public static byte[]? AeadOpen(ushort aeadId, byte[] key, byte[] nonce, byte[] aad, byte[] ciphertext)
+    {
+        if (ciphertext.Length < 16) return null;
+        byte[] pt = new byte[ciphertext.Length - 16];
+        try
+        {
+            if (aeadId == AEAD_CHACHA20_POLY1305) { using var c = new ChaCha20Poly1305Managed(key); c.Decrypt(nonce, ciphertext, pt, aad); }
+            else { using var a = new AesGcmManaged(key, 16); a.Decrypt(nonce, ciphertext, pt, aad); }
+            return pt;
+        }
+        catch (CryptographicException) { return null; }
+    }
 
     // HPKE labels for HKDF-Expand-Label
     private const string HPKE_V1_LABEL = "HPKE-v1";
@@ -37,17 +66,26 @@ public static class Hpke
     {
         private readonly byte[] _key;
         private readonly byte[] _baseNonce;
+        private readonly byte[] _exporterSecret;
+        private readonly byte[] _suiteId;
         private readonly ushort _aeadId;
         private ulong _sequenceNumber;
         private readonly object _lock = new();
 
-        internal HpkeContext(byte[] key, byte[] baseNonce, ushort aeadId)
+        internal HpkeContext(byte[] key, byte[] baseNonce, byte[] exporterSecret, byte[] suiteId, ushort aeadId)
         {
             _key = key;
             _baseNonce = baseNonce;
+            _exporterSecret = exporterSecret;
+            _suiteId = suiteId;
             _aeadId = aeadId;
             _sequenceNumber = 0;
         }
+
+        /// <summary>RFC 9180 §5.4 secret export: derive an application secret of <paramref name="length"/>
+        /// bytes bound to this context. Used by Oblivious DoH response encryption (RFC 9230 §6.2).</summary>
+        public byte[] Export(byte[] exporterContext, int length)
+            => LabeledExpand(_exporterSecret, "sec", exporterContext, length, _suiteId);
 
         /// <summary>Seal (encrypt) plaintext with associated data. Output is ciphertext||tag.</summary>
         public byte[] Seal(byte[] aad, byte[] plaintext)
@@ -120,6 +158,7 @@ public static class Hpke
         {
             CryptographicOperations.ZeroMemory(_key);
             CryptographicOperations.ZeroMemory(_baseNonce);
+            CryptographicOperations.ZeroMemory(_exporterSecret);
         }
     }
 
@@ -220,9 +259,10 @@ public static class Hpke
 
             byte[] key = LabeledExpand(secret, "key", keyScheduleContext, AeadKeyLength(aeadId), suiteIdBytes);
             byte[] baseNonce = LabeledExpand(secret, "base_nonce", keyScheduleContext, Nn, suiteIdBytes);
+            byte[] exporterSecret = LabeledExpand(secret, "exp", keyScheduleContext, Nh, suiteIdBytes);
 
             CryptographicOperations.ZeroMemory(secret);
-            return new HpkeContext(key, baseNonce, aeadId);
+            return new HpkeContext(key, baseNonce, exporterSecret, suiteIdBytes, aeadId);
         }
 
         private static string BuildSuiteId(ushort aeadId)

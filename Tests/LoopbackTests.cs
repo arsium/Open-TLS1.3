@@ -52,6 +52,7 @@ public static class LoopbackTests
         Handshake("ML-DSA-87 cert (largest) + AES-256-GCM", CertificateUtils.IssueMlDsaCertificate("localhost", ca, CertificateProfile.Server, SignatureScheme.MlDsa87),
             null, null, 4096);
         Handshake("ML-DSA-65 + X25519MLKEM768 (fully post-quantum handshake)", mldsaCert, null, new[] { NamedGroup.X25519MLKEM768 }, 1024);
+        MlDsaChain();
 
         Section("Loopback: certificate + external PSK (draft-ietf-tls-8773bis, Internet-Draft)");
         CertWithExternalPsk("cert + extern PSK (EC cert)", ca, ecCert, useAsync: false);
@@ -346,6 +347,35 @@ public static class LoopbackTests
             Check(name, got == msgLen && buf.AsSpan(0, got).SequenceEqual(msg));
         }
         catch (Exception e) { Check($"{name} [{e.GetType().Name}: {e.Message}]", false); }
+        finally { srv.Wait(6000); server.Stop(); }
+    }
+
+    // Fully post-quantum certificate CHAIN: an ML-DSA root CA signs an ML-DSA leaf, and the client
+    // validates the chain against the ML-DSA root — so both the chain signature (VerifyChain) and the
+    // leaf authentication (CertificateVerify) are ML-DSA, with no classical signature in the cert path.
+    private static void MlDsaChain()
+    {
+        var pqRoot = CertificateUtils.GenerateMlDsaCA("Open-TLS1.3 PQ Root CA", SignatureScheme.MlDsa65);
+        var leaf = CertificateUtils.IssueMlDsaCertificate("localhost", pqRoot, CertificateProfile.Server, SignatureScheme.MlDsa65);
+        Check("ML-DSA chain: leaf verifies against ML-DSA root", CertificateUtils.VerifyChain(leaf, pqRoot));
+
+        int port = ++_port;
+        var server = new TlsServer(leaf);
+        server.Listen(port);
+        var srv = Task.Run(() =>
+        {
+            try { using var s = server.Accept(); var b = new byte[64]; int n = s.Read(b, 0, b.Length); if (n > 0) s.Write(b, 0, n); }
+            catch { /* surfaced via client failure */ }
+        });
+        try
+        {
+            var c = new TlsClient { HandshakeTimeoutMs = 12000, CaCertificate = pqRoot };
+            using var st = c.Connect("localhost", port);
+            st.Write(new byte[] { 1, 2, 3, 4 }, 0, 4);
+            var buf = new byte[64];
+            Check("ML-DSA chain: handshake + echo (client trusts ML-DSA root)", st.Read(buf, 0, buf.Length) == 4);
+        }
+        catch (Exception e) { Check($"ML-DSA chain [{e.GetType().Name}: {e.Message}]", false); }
         finally { srv.Wait(6000); server.Stop(); }
     }
 

@@ -166,6 +166,7 @@ public static class HandshakeMessages
         bool isOuterCH = false;
         bool offersPskDheKe = false;
         bool offersCertWithExternPsk = false;
+        bool offersTls13 = false;
 
         if (p < body.Length)
         {
@@ -325,8 +326,28 @@ public static class HandshakeMessages
                 {
                     recordSizeLimit = BinaryHelper.ReadUInt16(ed.AsSpan()); // RFC 8449
                 }
+                else if (et == ExtensionType.SupportedVersions)
+                {
+                    // RFC 8446 §4.2.1: ClientHello supported_versions = ProtocolVersion versions<2..254>
+                    // (1-byte length prefix). The server negotiates the version from this list, not
+                    // from legacy_version.
+                    EnsureRemaining(ed, 0, 1, "supported_versions length");
+                    int svLen = ed[0];
+                    if ((svLen & 1) != 0)
+                        throw new TlsException(AlertDescription.DecodeError, "supported_versions list length must be even");
+                    EnsureRemaining(ed, 1, svLen, "supported_versions list");
+                    for (int sp = 1; sp < 1 + svLen; sp += 2)
+                        if (BinaryHelper.ReadUInt16(ed.AsSpan(sp)) == TlsConst.Tls13Version)
+                            offersTls13 = true;
+                }
             }
         }
+
+        // RFC 8446 §4.2.1: a TLS 1.3 server MUST negotiate the version from supported_versions. This
+        // 1.3-only server rejects any ClientHello that doesn't offer 0x0304 there.
+        if (!offersTls13)
+            throw new TlsException(AlertDescription.ProtocolVersion,
+                "ClientHello does not offer TLS 1.3 in supported_versions (RFC 8446 §4.2.1)");
 
         return new ParsedClientHello
         {
@@ -444,6 +465,7 @@ public static class HandshakeMessages
         byte[]? cookie = null;
         int selectedPsk = -1;
         bool certWithExternPsk = false;
+        ushort selectedVersion = 0;
 
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
         EnsureRemaining(body, p, extLen, "ServerHello extensions block");
@@ -486,7 +508,21 @@ public static class HandshakeMessages
             {
                 certWithExternPsk = true; // draft-ietf-tls-8773bis: server agreed to cert + external PSK
             }
+            else if (et == ExtensionType.SupportedVersions)
+            {
+                // RFC 8446 §4.2.1: ServerHello supported_versions carries a single selected_version
+                // (2 bytes, no list prefix). This is the authoritative negotiated version.
+                EnsureRemaining(ed, 0, 2, "ServerHello supported_versions selected_version");
+                selectedVersion = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+            }
         }
+
+        // RFC 8446 §4.2.1: a TLS 1.3 client MUST check the server selected 0x0304 via
+        // supported_versions (legacy_version is pinned at 0x0303 and is not authoritative). A
+        // missing/old selected_version means the peer isn't speaking 1.3 — this 1.3-only client aborts.
+        if (selectedVersion != TlsConst.Tls13Version)
+            throw new TlsException(AlertDescription.ProtocolVersion,
+                "ServerHello did not select TLS 1.3 via supported_versions (RFC 8446 §4.2.1)");
 
         if (!isHrr && keyShare == null && selectedPsk < 0)
             throw new TlsException(AlertDescription.MissingExtension, "ServerHello missing KeyShare extension");

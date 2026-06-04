@@ -661,26 +661,44 @@ public sealed class TlsConnection : IDisposable
     //  External PSK Importer (RFC 9258)
     // ================================================================
 
-    /// <summary>Derive PSK from external key material (RFC 9258).</summary>
-    private static byte[] DeriveExternalPskKey(byte[] externalKey, CipherSuite suite)
+    private static (HashAlgorithmName hash, int len, ushort kdfId) ExternalPskKdf(CipherSuite suite) => suite switch
     {
-        // RFC 9258 §3: PSK = HKDF-Extract(salt=0, IKM=external_key)
-        var hashAlg = suite switch
-        {
-            CipherSuite.TLS_AES_128_GCM_SHA256 or CipherSuite.TLS_CHACHA20_POLY1305_SHA256 => HashAlgorithmName.SHA256,
-            CipherSuite.TLS_AES_256_GCM_SHA384 => HashAlgorithmName.SHA384,
-            _ => throw new ArgumentException($"Unsupported cipher suite for external PSK: {suite}")
-        };
+        CipherSuite.TLS_AES_128_GCM_SHA256 or CipherSuite.TLS_CHACHA20_POLY1305_SHA256 => (HashAlgorithmName.SHA256, 32, (ushort)1),
+        CipherSuite.TLS_AES_256_GCM_SHA384 => (HashAlgorithmName.SHA384, 48, (ushort)2),
+        _ => throw new ArgumentException($"Unsupported cipher suite for external PSK: {suite}")
+    };
 
-        int hashLen = hashAlg.Name switch
-        {
-            "SHA256" => 32,
-            "SHA384" => 48,
-            _ => throw new ArgumentException($"Unsupported hash algorithm: {hashAlg.Name}")
-        };
+    /// <summary>RFC 9258 §3 ImportedIdentity, serialized — this is the on-wire PSK identity used for
+    /// an imported external PSK and the value hashed into the derivation:
+    /// opaque external_identity&lt;1..2^16-1&gt; ‖ opaque context&lt;0..2^16-1&gt; ‖
+    /// uint16 target_protocol (0x0304) ‖ uint16 target_kdf.</summary>
+    private static byte[] BuildImportedIdentity(ExternalPsk psk)
+    {
+        ushort targetKdf = ExternalPskKdf(psk.Suite).kdfId;
+        var w = new System.Buffers.ArrayBufferWriter<byte>(psk.Identity.Length + 8);
+        BinaryHelper.WriteUInt16(w, (ushort)psk.Identity.Length);
+        w.Write(psk.Identity);                                  // external_identity
+        BinaryHelper.WriteUInt16(w, 0);                         // context (empty)
+        BinaryHelper.WriteUInt16(w, TlsConst.Tls13Version);     // target_protocol = TLS 1.3
+        BinaryHelper.WriteUInt16(w, targetKdf);                 // target_kdf
+        return w.WrittenSpan.ToArray();
+    }
 
-        byte[] salt = new byte[hashLen]; // salt = 0^hash_len
-        return Hkdf.Extract(hashAlg, externalKey, salt);
+    /// <summary>RFC 9258 §4.1: derive the imported PSK from external key material.
+    /// epskx = HKDF-Extract(0, epsk); ipskx = HKDF-Expand-Label(epskx, "derived psk",
+    /// Hash(ImportedIdentity), L). The ImportedIdentity is also what we advertise on the wire.</summary>
+    private static byte[] DeriveExternalPskKey(ExternalPsk psk)
+    {
+        var (hashAlg, hashLen, _) = ExternalPskKdf(psk.Suite);
+
+        byte[] salt = new byte[hashLen];                          // salt = 0^hash_len
+        byte[] epskx = Hkdf.Extract(hashAlg, salt, psk.Key);      // HKDF-Extract(0, epsk)
+
+        byte[] importedIdentity = BuildImportedIdentity(psk);
+        byte[] idHash = hashAlg == HashAlgorithmName.SHA384
+            ? Sha2Managed.Sha384(importedIdentity)
+            : Sha2Managed.Sha256(importedIdentity);
+        return Hkdf.ExpandLabel(hashAlg, epskx, "derived psk", idHash, hashLen); // ipskx
     }
 
     // ================================================================
@@ -962,7 +980,7 @@ public sealed class TlsConnection : IDisposable
         else if (_externalPsk != null)
         {
             // RFC 9258: Use imported external PSK
-            psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+            psk = DeriveExternalPskKey(_externalPsk);
 
             _keySchedule = new KeySchedule(_externalPsk.Suite, psk);
             _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
@@ -975,7 +993,7 @@ public sealed class TlsConnection : IDisposable
 
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
-                _externalPsk.Identity, 0, placeholder, // External PSK age is always 0
+                BuildImportedIdentity(_externalPsk), 0, placeholder, // External PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
                 requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
@@ -1527,7 +1545,7 @@ public sealed class TlsConnection : IDisposable
                     }
                 }
                 // Try external PSK if ticket didn't match (RFC 9258)
-                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(_externalPsk.Identity.AsSpan()))
+                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(BuildImportedIdentity(_externalPsk).AsSpan()))
                 {
                     // External PSK suite must be offered by client and supported by us
                     if (Array.IndexOf(ch.CipherSuites, _externalPsk.Suite) < 0) continue;
@@ -1536,7 +1554,7 @@ public sealed class TlsConnection : IDisposable
                     // External PSK age must be 0 (RFC 9258)
                     if (ages[i] != 0) continue;
 
-                    psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+                    psk = DeriveExternalPskKey(_externalPsk);
                     var hashAlg = _externalPsk.Suite == CipherSuite.TLS_AES_256_GCM_SHA384
                         ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
 
@@ -3420,7 +3438,7 @@ public sealed class TlsConnection : IDisposable
         else if (_externalPsk != null)
         {
             // RFC 9258: imported external PSK (mirrors the sync client so the async path supports it too).
-            psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+            psk = DeriveExternalPskKey(_externalPsk);
 
             _keySchedule = new KeySchedule(_externalPsk.Suite, psk);
             _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
@@ -3432,7 +3450,7 @@ public sealed class TlsConnection : IDisposable
 
             chMsg = HandshakeMessages.BuildClientHelloWithPsk(
                 clientRandom, sessionId, suites, keyShares,
-                _externalPsk.Identity, 0, placeholderE, // external PSK age is always 0
+                BuildImportedIdentity(_externalPsk), 0, placeholderE, // external PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
                 requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
 
@@ -3922,14 +3940,14 @@ public sealed class TlsConnection : IDisposable
                         break;
                     }
                 }
-                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(_externalPsk.Identity.AsSpan()))
+                else if (_externalPsk != null && identities[i].AsSpan().SequenceEqual(BuildImportedIdentity(_externalPsk).AsSpan()))
                 {
                     // External PSK (RFC 9258): suite must be offered + supported, age MUST be 0.
                     if (Array.IndexOf(ch.CipherSuites, _externalPsk.Suite) < 0) continue;
                     if (!IsSupportedSuite(_externalPsk.Suite)) continue;
                     if (ages[i] != 0) continue;
 
-                    psk = DeriveExternalPskKey(_externalPsk.Key, _externalPsk.Suite);
+                    psk = DeriveExternalPskKey(_externalPsk);
                     var hashAlg = _externalPsk.Suite == CipherSuite.TLS_AES_256_GCM_SHA384
                         ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
 

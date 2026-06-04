@@ -259,6 +259,12 @@ public static class CertificateUtils
         byte[] tbsCertDer = Asn1.Wrap(0x30, certItems[0].value);
         byte[] sigBitString = certItems[2].value;
         byte[] signature = sigBitString[1..]; // skip unused-bits byte
+
+        if (MlDsaManaged.IsMlDsa(ca.SignatureAlgorithm))
+            // ML-DSA CA (fully-PQ chain): verify the leaf's TBS signature with the CA's ML-DSA key
+            // (no hash — pure ML-DSA, FIPS 204 / RFC 9881).
+            return MlDsaManaged.Verify(tbsCertDer, signature, ca.PublicKey, ca.SignatureAlgorithm);
+
         // Hash named in the cert's signatureAlgorithm, not a hard-coded SHA-256, so a CA signing with
         // SHA-384/512 verifies. (RSA here is PKCS#1 v1.5; RSA-PSS certs carry the hash in algorithm
         // params and are not covered — use a ServerCertificateValidationCallback for those.)
@@ -672,9 +678,13 @@ public static class CertificateUtils
                     throw new TlsException(AlertDescription.HandshakeFailure, $"Unsupported verify scheme: {scheme}");
             }
         }
-        catch (CryptographicException)
+        catch (Exception e) when (e is CryptographicException or ArgumentException or FormatException)
         {
-            return false; // key/scheme mismatch or corrupt signature
+            // Malformed key / signature / encoding from the peer → verification fails cleanly.
+            // (e.g. ML-DSA MLDsaPublicKeyParameters.FromEncoding throws ArgumentException on a
+            // wrong-length key; ECDSA/RSA importers throw on bad SPKI.) TlsException (unsupported
+            // scheme) is deliberately NOT caught — that is a configuration error, not a bad sig.
+            return false;
         }
     }
 
@@ -835,7 +845,38 @@ public static class CertificateUtils
             Asn1.BitString(uncompressed));
     }
 
-    /// <summary>Generate an ML-DSA (FIPS 204) keypair + X.509 certificate signed by an (ECDSA/RSA) CA.</summary>
+    /// <summary>Generate a self-signed ML-DSA (FIPS 204) Certificate Authority (CA:TRUE). Combined
+    /// with <see cref="IssueMlDsaCertificate"/> this yields a fully post-quantum certificate chain
+    /// (ML-DSA root signing an ML-DSA leaf) — no classical signature anywhere in the cert path.</summary>
+    public static TlsCertificate GenerateMlDsaCA(string commonName,
+        SignatureScheme scheme = SignatureScheme.MlDsa65, int validDays = 3650)
+    {
+        var (priv, pub) = MlDsaManaged.GenerateKeyPair(scheme);
+
+        var extensions = new List<byte[]>
+        {
+            BuildExtension(OidBasicConstraints, true,
+                Asn1.Sequence(Asn1.Wrap(0x01, new byte[] { 0xFF }))), // CA:TRUE
+            BuildKeyUsageExtension(CertificateProfile.CA),
+            BuildSkiExtension(pub)
+        };
+
+        byte[] spki = BuildMlDsaSpki(pub, scheme);
+        byte[] sigAlgSeq = MlDsaSigAlg(scheme);
+        byte[] cert = BuildAndSignCertificateCore(commonName, commonName, spki, extensions, sigAlgSeq,
+            tbs => MlDsaManaged.Sign(tbs, priv, scheme), validDays);
+
+        return new TlsCertificate
+        {
+            DerData = cert,
+            PrivateKey = priv,
+            PublicKey = pub,
+            SignatureAlgorithm = scheme
+        };
+    }
+
+    /// <summary>Generate an ML-DSA (FIPS 204) keypair + X.509 certificate signed by a CA (ECDSA/RSA,
+    /// or ML-DSA for a fully-PQ chain). The leaf key is always post-quantum.</summary>
     public static TlsCertificate IssueMlDsaCertificate(string commonName, TlsCertificate ca,
         CertificateProfile profile, SignatureScheme scheme = SignatureScheme.MlDsa65, int validDays = 365)
     {
@@ -869,6 +910,10 @@ public static class CertificateUtils
         SignatureScheme.MlDsa87 => OidMlDsa87,
         _ => throw new ArgumentException($"Not an ML-DSA scheme: {scheme}", nameof(scheme))
     };
+
+    // RFC 9881: a certificate signed with ML-DSA carries the bare id-ml-dsa-* OID as its
+    // signatureAlgorithm, with the parameters field ABSENT.
+    private static byte[] MlDsaSigAlg(SignatureScheme scheme) => Asn1.Sequence(Asn1.Oid(MlDsaOid(scheme)));
 
     public static (byte[] publicKey, SignatureScheme sigAlg) ParseCertificatePublicKey(byte[] certDer)
     {
@@ -1039,6 +1084,14 @@ public static class CertificateUtils
     private static byte[] SignCertWithCa(string issuerCn, string subjectCn,
         byte[] spki, List<byte[]> extensions, TlsCertificate ca, int validDays)
     {
+        if (MlDsaManaged.IsMlDsa(ca.SignatureAlgorithm))
+        {
+            // ML-DSA-signed issuer (fully-PQ chain): the cert's signatureAlgorithm is the bare
+            // id-ml-dsa-* OID and the TBS is signed with ML-DSA (FIPS 204 / RFC 9881).
+            byte[] sigAlgSeq = MlDsaSigAlg(ca.SignatureAlgorithm);
+            return BuildAndSignCertificateCore(issuerCn, subjectCn, spki, extensions, sigAlgSeq,
+                tbs => MlDsaManaged.Sign(tbs, ca.PrivateKey, ca.SignatureAlgorithm), validDays);
+        }
         if (ca.IsRsa)
         {
             using var rsa = RsaManaged.Create();

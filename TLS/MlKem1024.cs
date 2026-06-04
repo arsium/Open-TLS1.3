@@ -61,6 +61,8 @@ public static class MlKem1024
             throw new TlsException(AlertDescription.IllegalParameter,
                 $"ML-KEM-1024 encapsulation key must be {EkSize} bytes");
 
+        ValidateEncapsulationKey(encapsulationKey);   // FIPS 203 §7.2 modulus check
+
         byte[] m = RandomnessWrapper.GetKeyBytes(32);
         return EncapsInternal(encapsulationKey, m);
     }
@@ -711,6 +713,24 @@ public static class MlKem1024
     /// <summary>
     /// ByteDecode_12: Unpack 12-bit coefficients from bytes.
     /// </summary>
+    /// <summary>FIPS 203 §7.2 encapsulation-key input check (the "modulus check"): every encoded
+    /// coefficient of t_hat MUST be a valid Z_q element (&lt; q). Equivalent to
+    /// ByteEncode_12(ByteDecode_12(ek)) == ek, since ByteDecode_12 reduces mod q. Rejects malformed
+    /// keys (coefficients in [q, 2^12-1]) before they enter the NTT math.</summary>
+    private static void ValidateEncapsulationKey(byte[] ek)
+    {
+        int offset = 0;
+        for (int i = 0; i < K; i++)
+        {
+            short[] poly = ByteDecode12(ek, offset);   // 12-bit values 0..4095, NOT reduced
+            for (int j = 0; j < N; j++)
+                if (poly[j] >= Q)
+                    throw new TlsException(AlertDescription.IllegalParameter,
+                        "ML-KEM-1024 encapsulation key has an out-of-range coefficient (FIPS 203 §7.2 modulus check)");
+            offset += PolyBytes;
+        }
+    }
+
     private static short[] ByteDecode12(byte[] input, int offset)
     {
         short[] poly = new short[N];
