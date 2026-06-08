@@ -23,6 +23,7 @@ public static class CryptoVectorTests
         CertificateCompressionRoundtrip();
         MlKem768DeterministicKat();
         HpkeRoundTrip();
+        HpkeKnownAnswer();
         AegisKat();
         MlDsaRoundTrip();
     }
@@ -440,6 +441,60 @@ public static class CryptoVectorTests
             byte[]? bad = Hpke.KeySchedule.SetupBaseReceiver(enc, skR, info, aead).Open(Encoding.ASCII.GetBytes("wrong-aad"), ct);
             Check($"HPKE {name} rejects tampered AAD", bad == null);
         }
+    }
+
+    // RFC 9180 Appendix A.1 known-answer vectors — DHKEM(X25519,HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM,
+    // base mode. A self seal/open round-trip can't detect a non-conformant labeled KDF (both ends share the
+    // bug); these vectors come from the RFC reference implementation, so reproducing them proves byte-level
+    // interoperability with any compliant HPKE peer (real-browser ECH, ODoH, etc.).
+    private static void HpkeKnownAnswer()
+    {
+        Section("HPKE (RFC 9180) — Appendix A.1 known-answer vectors (interop conformance)");
+        static byte[] H(string s) => Convert.FromHexString(s);
+
+        byte[] info = H("4f6465206f6e2061204772656369616e2055726e");
+        byte[] skRm = H("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8");
+        byte[] enc  = H("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431");
+
+        // DHKEM Decap → shared_secret (validates the KEM suite_id + ExtractAndExpand).
+        byte[] ss = Hpke.DhKem.Decap(enc, skRm);
+        Check("A.1 DHKEM shared_secret matches RFC vector",
+            Eqb(ss, H("fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc")));
+
+        // Base key schedule → Open the RFC's seq-0 ciphertext (validates key + base_nonce + AEAD path).
+        var ctx = Hpke.KeySchedule.SetupBaseReceiver(enc, skRm, info, Hpke.AEAD_AES_128_GCM);
+        byte[]? pt0 = ctx.Open(H("436f756e742d30"),
+            H("f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a"));
+        Check("A.1 base-mode seq-0 Open recovers RFC plaintext",
+            pt0 != null && Eqb(pt0, H("4265617574792069732074727574682c20747275746820626561757479")));
+
+        // Secret export (validates exporter_secret + LabeledExpand "sec"); this exercises the same
+        // LabeledExpand path that key/base_nonce use, so matching these locks the whole key schedule.
+        var ctxE = Hpke.KeySchedule.SetupBaseReceiver(enc, skRm, info, Hpke.AEAD_AES_128_GCM);
+        Check("A.1 export(empty, 32) matches RFC vector",
+            Eqb(ctxE.Export(Array.Empty<byte>(), 32), H("3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee")));
+        Check("A.1 export(0x00, 32) matches RFC vector",
+            Eqb(ctxE.Export(H("00"), 32), H("2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5")));
+        Check("A.1 export(\"TestContext\", 32) matches RFC vector",
+            Eqb(ctxE.Export(H("54657374436f6e74657874"), 32), H("e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931")));
+
+        // Sender side with the RFC's fixed ephemeral (skEm) so enc + the ciphertext are reproducible:
+        // pin enc, key, base_nonce, exporter_secret directly, and re-derive the seq-0 ciphertext by
+        // *sealing* (the most literal "first ciphertext matches the published vector").
+        byte[] skEm = H("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736");
+        byte[] pkRm = H("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d");
+        var (encS, sctx) = Hpke.KeySchedule.SetupBaseSenderDeterministic(pkRm, info, Hpke.AEAD_AES_128_GCM, skEm);
+        Check("A.1 enc (ephemeral public key) matches RFC vector", Eqb(encS, enc));
+        Check("A.1 key matches RFC vector",
+            Eqb(sctx.KeyForTest, H("4531685d41d65f03dc48f6b8302c05b0")));
+        Check("A.1 base_nonce matches RFC vector",
+            Eqb(sctx.BaseNonceForTest, H("56d890e5accaaf011cff4b7d")));
+        Check("A.1 exporter_secret matches RFC vector",
+            Eqb(sctx.ExporterSecretForTest, H("45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8")));
+        byte[] ctS = sctx.Seal(H("436f756e742d30"),
+            H("4265617574792069732074727574682c20747275746820626561757479"));
+        Check("A.1 seq-0 Seal reproduces RFC ciphertext",
+            Eqb(ctS, H("f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a")));
     }
 
     private static void CertificateCompressionRoundtrip()

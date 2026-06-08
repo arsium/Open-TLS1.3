@@ -65,6 +65,13 @@ public sealed class TlsServer : IDisposable
     /// public_key must correspond to <see cref="EchPrivateKey"/>.</summary>
     public byte[]? EchConfigList { get; set; }
 
+    /// <summary>Enforce RFC 8446 §4.1.4: the client's second ClientHello (after a HelloRetryRequest)
+    /// must be identical to the first except for the permitted changes (key_share, early_data, cookie,
+    /// pre_shared_key, padding). A mismatch aborts the handshake with <c>illegal_parameter</c>. Default
+    /// <c>true</c> (recommended); set <c>false</c> only to interoperate with a non-conformant client
+    /// that mutates other ClientHello fields across the retry.</summary>
+    public bool EnforceHelloRetryConsistency { get; set; } = true;
+
     /// <summary>Testing: force a single HelloRetryRequest on every connection (exercises the HRR path,
     /// including the ECH HRR accept-confirmation, in a loopback where it otherwise never triggers).</summary>
     internal bool ForceHelloRetryRequest { get; set; }
@@ -123,6 +130,7 @@ public sealed class TlsServer : IDisposable
                 conn.SetAllowedGroups(AllowedGroups);
             if (AcceptedClientSignatureSchemes != null)
                 conn.SetOfferedSignatureSchemes(AcceptedClientSignatureSchemes);
+            conn.SetEnforceHelloRetryConsistency(EnforceHelloRetryConsistency);
             if (ForceHelloRetryRequest)
                 conn.ForceHelloRetryRequest();
 
@@ -172,6 +180,7 @@ public sealed class TlsServer : IDisposable
                 conn.SetAllowedGroups(AllowedGroups);
             if (AcceptedClientSignatureSchemes != null)
                 conn.SetOfferedSignatureSchemes(AcceptedClientSignatureSchemes);
+            conn.SetEnforceHelloRetryConsistency(EnforceHelloRetryConsistency);
             if (ForceHelloRetryRequest)
                 conn.ForceHelloRetryRequest();
 

@@ -39,6 +39,7 @@ public static class CertificateUtils
     private const string OidRsaSha256 = "1.2.840.113549.1.1.11";
     private const string OidRsaSha384 = "1.2.840.113549.1.1.12";
     private const string OidRsaSha512 = "1.2.840.113549.1.1.13";
+    private const string OidRsaPss = "1.2.840.113549.1.1.10"; // id-RSASSA-PSS (RFC 4055)
     // ML-DSA OIDs (FIPS 204, NIST sigAlgs branch); used in X.509 certificates per RFC 9881.
     private const string OidMlDsa44 = "2.16.840.1.101.3.4.3.17";
     private const string OidMlDsa65 = "2.16.840.1.101.3.4.3.18";
@@ -233,21 +234,49 @@ public static class CertificateUtils
     //  Verify chain
     // ================================================================
 
-    // Map a certificate's signatureAlgorithm (the AlgorithmIdentifier SEQUENCE content) to its hash.
-    // Defaults to SHA-256 — what this stack's own CA issuance uses — for unrecognized OIDs.
-    private static HashAlgorithmName HashFromCertSigAlg(byte[] sigAlgSeqValue)
+    // Map a certificate's signatureAlgorithm (the AlgorithmIdentifier SEQUENCE content) to its hash
+    // and whether it is RSA-PSS. Defaults to SHA-256 / PKCS#1 — what this stack's own CA issuance
+    // uses — for unrecognized OIDs. RFC 4055: an RSA-PSS signature carries id-RSASSA-PSS as the OID
+    // and the actual hash in the parameters ([0] hashAlgorithm), so it cannot be told apart from the
+    // OID alone — the parameters must be parsed.
+    private static (HashAlgorithmName hash, bool isPss) SigAlgInfo(byte[] sigAlgSeqValue)
     {
         try
         {
             var items = Asn1.ReadSequenceItems(sigAlgSeqValue);
             byte[] oid = Asn1.Wrap(items[0].tag, items[0].value);
+            if (oid.AsSpan().SequenceEqual(Asn1.Oid(OidRsaPss)))
+            {
+                // RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] AlgId DEFAULT sha1, ... }.
+                // Pull the hash from the EXPLICIT [0] tag; default to SHA-256 for modern PKIs when absent.
+                HashAlgorithmName pssHash = HashAlgorithmName.SHA256;
+                if (items.Count > 1)
+                {
+                    foreach (var (tag, val) in Asn1.ReadSequenceItems(items[1].value))
+                    {
+                        if (tag != 0xA0) continue; // context [0], constructed (EXPLICIT)
+                        var hashAlg = Asn1.ReadSequenceItems(val);
+                        pssHash = HashFromHashOid(Asn1.Wrap(hashAlg[0].tag, hashAlg[0].value));
+                        break;
+                    }
+                }
+                return (pssHash, true);
+            }
             if (oid.AsSpan().SequenceEqual(Asn1.Oid(OidEcdsaSha384)) || oid.AsSpan().SequenceEqual(Asn1.Oid(OidRsaSha384)))
-                return HashAlgorithmName.SHA384;
+                return (HashAlgorithmName.SHA384, false);
             if (oid.AsSpan().SequenceEqual(Asn1.Oid(OidEcdsaSha512)) || oid.AsSpan().SequenceEqual(Asn1.Oid(OidRsaSha512)))
-                return HashAlgorithmName.SHA512;
+                return (HashAlgorithmName.SHA512, false);
         }
-        catch { /* fall through to the SHA-256 default */ }
-        return HashAlgorithmName.SHA256;
+        catch { /* fall through to the SHA-256 / PKCS#1 default */ }
+        return (HashAlgorithmName.SHA256, false);
+    }
+
+    // Map a DER-encoded hash AlgorithmIdentifier OID (the NIST SHA-2 arc) to a HashAlgorithmName.
+    private static HashAlgorithmName HashFromHashOid(byte[] hashOid)
+    {
+        if (hashOid.AsSpan().SequenceEqual(Asn1.Oid("2.16.840.1.101.3.4.2.2"))) return HashAlgorithmName.SHA384;
+        if (hashOid.AsSpan().SequenceEqual(Asn1.Oid("2.16.840.1.101.3.4.2.3"))) return HashAlgorithmName.SHA512;
+        return HashAlgorithmName.SHA256; // 2.16.840.1.101.3.4.2.1 (SHA-256) or unknown
     }
 
     /// <summary>Verify that a certificate was signed by the given CA certificate.</summary>
@@ -265,16 +294,17 @@ public static class CertificateUtils
             // (no hash — pure ML-DSA, FIPS 204 / RFC 9881).
             return MlDsaManaged.Verify(tbsCertDer, signature, ca.PublicKey, ca.SignatureAlgorithm);
 
-        // Hash named in the cert's signatureAlgorithm, not a hard-coded SHA-256, so a CA signing with
-        // SHA-384/512 verifies. (RSA here is PKCS#1 v1.5; RSA-PSS certs carry the hash in algorithm
-        // params and are not covered — use a ServerCertificateValidationCallback for those.)
-        HashAlgorithmName hash = HashFromCertSigAlg(certItems[1].value);
+        // Hash + padding named in the cert's signatureAlgorithm, not a hard-coded SHA-256/PKCS#1, so a
+        // CA signing with SHA-384/512 — or with RSA-PSS (id-RSASSA-PSS), as most modern PKIs now do —
+        // verifies correctly instead of being rejected as a bad signature.
+        var (hash, isPss) = SigAlgInfo(certItems[1].value);
 
         if (ca.IsRsa)
         {
             using var rsa = RsaManaged.Create();
             rsa.ImportRSAPublicKey(ca.PublicKey, out _);
-            return rsa.VerifyData(tbsCertDer, signature, hash, RSASignaturePadding.Pkcs1);
+            var padding = isPss ? RSASignaturePadding.Pss : RSASignaturePadding.Pkcs1;
+            return rsa.VerifyData(tbsCertDer, signature, hash, padding);
         }
         else
         {

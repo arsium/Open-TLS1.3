@@ -112,6 +112,7 @@ public TlsServer(TlsCertificate certificate);
 | `AllowedCipherSuites` | `CipherSuite[]?` | `null` (accept any supported) | Allow-list restricting which suites the server will select. |
 | `AllowedGroups` | `NamedGroup[]?` | `null` (accept any supported) | Allow-list restricting which key-exchange groups the server will select. |
 | `AcceptedClientSignatureSchemes` | `SignatureScheme[]?` | `null` (stack default) | mTLS: schemes advertised in CertificateRequest. |
+| `EnforceHelloRetryConsistency` | `bool` | `true` | Enforce RFC 8446 §4.1.4 — the client's 2nd ClientHello after a HelloRetryRequest must match the 1st except for the permitted changes (key_share, early_data, cookie, PSK binders, padding); a changed negotiated field aborts with `illegal_parameter`. Set `false` only for a non-conformant peer. |
 
 ### Methods
 ```csharp

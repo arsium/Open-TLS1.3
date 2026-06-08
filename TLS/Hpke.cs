@@ -82,6 +82,12 @@ public static class Hpke
             _sequenceNumber = 0;
         }
 
+        // KAT-only accessors (internal — not part of the public API): surface the derived secrets
+        // so the RFC 9180 Appendix A vectors can be asserted byte-for-byte. Return copies.
+        internal byte[] KeyForTest => (byte[])_key.Clone();
+        internal byte[] BaseNonceForTest => (byte[])_baseNonce.Clone();
+        internal byte[] ExporterSecretForTest => (byte[])_exporterSecret.Clone();
+
         /// <summary>RFC 9180 §5.4 secret export: derive an application secret of <paramref name="length"/>
         /// bytes bound to this context. Used by Oblivious DoH response encryption (RFC 9230 §6.2).</summary>
         public byte[] Export(byte[] exporterContext, int length)
@@ -186,6 +192,20 @@ public static class Hpke
             return (pkE, sharedSecret);
         }
 
+        /// <summary>KAT-only (internal — not public API): encapsulate with a caller-supplied
+        /// ephemeral private key so the RFC 9180 Appendix A vectors reproduce deterministically.
+        /// Public <see cref="Encap"/> always draws a fresh random ephemeral.</summary>
+        internal static (byte[] enc, byte[] sharedSecret) EncapDeterministic(byte[] skE, byte[] pkR)
+        {
+            if (pkR.Length != 32) throw new ArgumentException("Invalid X25519 public key length");
+            byte[] pkE = X25519.PublicFromPrivate(skE);
+            byte[] dh = X25519.SharedSecret(skE, pkR);
+            byte[] kemContext = CombineBytes(pkE, pkR);
+            byte[] sharedSecret = ExtractAndExpand(dh, kemContext);
+            CryptographicOperations.ZeroMemory(dh);
+            return (pkE, sharedSecret);
+        }
+
         /// <summary>Recover shared secret using recipient private key and encapsulated key.</summary>
         public static byte[] Decap(byte[] enc, byte[] skR)
         {
@@ -207,7 +227,8 @@ public static class Hpke
         private static byte[] ExtractAndExpand(byte[] dh, byte[] kemContext)
         {
             // RFC 9180 §4.1: ExtractAndExpand for DHKEM
-            string suiteId = "KEM" + ((char)0) + ((char)0) + ((char)(KEM_DHKEM_X25519_HKDF_SHA256 >> 8)) + ((char)(KEM_DHKEM_X25519_HKDF_SHA256 & 0xFF));
+            // RFC 9180 §4.1: suite_id = "KEM" || I2OSP(kem_id, 2)  — exactly two id bytes, no padding.
+            string suiteId = "KEM" + ((char)(KEM_DHKEM_X25519_HKDF_SHA256 >> 8)) + ((char)(KEM_DHKEM_X25519_HKDF_SHA256 & 0xFF));
             byte[] suiteIdBytes = System.Text.Encoding.UTF8.GetBytes(suiteId);
 
             // Extract
@@ -226,6 +247,18 @@ public static class Hpke
         public static (byte[] enc, HpkeContext context) SetupBaseSender(byte[] pkR, byte[] info, ushort aeadId = AEAD_AES_128_GCM)
         {
             var (enc, sharedSecret) = DhKem.Encap(pkR);
+            var context = KeyScheduleBase(0x00, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>(), aeadId);
+            CryptographicOperations.ZeroMemory(sharedSecret);
+            return (enc, context);
+        }
+
+        /// <summary>KAT-only (internal — not public API) deterministic counterpart to
+        /// <see cref="SetupBaseSender"/>: pins the ephemeral key so the RFC 9180 Appendix A
+        /// vectors reproduce (enc + ciphertext are otherwise randomised per call).</summary>
+        internal static (byte[] enc, HpkeContext context) SetupBaseSenderDeterministic(
+            byte[] pkR, byte[] info, ushort aeadId, byte[] skE)
+        {
+            var (enc, sharedSecret) = DhKem.EncapDeterministic(skE, pkR);
             var context = KeyScheduleBase(0x00, sharedSecret, info, Array.Empty<byte>(), Array.Empty<byte>(), aeadId);
             CryptographicOperations.ZeroMemory(sharedSecret);
             return (enc, context);
@@ -277,8 +310,10 @@ public static class Hpke
     // HKDF-Expand-Label utilities for HPKE
     private static byte[] LabeledExtract(byte[] salt, string label, byte[] ikm, byte[] suiteId)
     {
+        // RFC 9180 §4: LabeledExtract(salt, label, ikm) = Extract(salt, labeled_ikm),
+        // labeled_ikm = "HPKE-v1" || suite_id || label || ikm. Hkdf.Extract(hash, salt, ikm) → salt is the key.
         byte[] labeledIkm = CombineBytes(HPKE_V1_LABEL.ToUtf8(), suiteId, label.ToUtf8(), ikm);
-        return Hkdf.Extract(HashAlgorithmName.SHA256, labeledIkm, salt);
+        return Hkdf.Extract(HashAlgorithmName.SHA256, salt, labeledIkm);
     }
 
     private static byte[] LabeledExpand(byte[] prk, string label, byte[] info, int length, byte[] suiteId)
@@ -289,16 +324,14 @@ public static class Hpke
 
     private static byte[] LabeledInfo(string label, byte[] info, int length, byte[] suiteId)
     {
+        // RFC 9180 §4: labeled_info = I2OSP(L, 2) || "HPKE-v1" || suite_id || label || info
+        // — a flat concatenation. The only length field is I2OSP(L,2); there are NO inner length prefixes.
         using var ms = new MemoryStream();
-        BinaryHelper.WriteUInt16(ms, (ushort)length);
-
-        byte[] labeledInfoPrefix = CombineBytes(HPKE_V1_LABEL.ToUtf8(), suiteId, label.ToUtf8());
-        BinaryHelper.WriteUInt16(ms, (ushort)labeledInfoPrefix.Length);
-        ms.Write(labeledInfoPrefix);
-
-        BinaryHelper.WriteUInt16(ms, (ushort)info.Length);
+        BinaryHelper.WriteUInt16(ms, (ushort)length);   // I2OSP(L, 2)
+        ms.Write(HPKE_V1_LABEL.ToUtf8());
+        ms.Write(suiteId);
+        ms.Write(label.ToUtf8());
         ms.Write(info);
-
         return ms.ToArray();
     }
 

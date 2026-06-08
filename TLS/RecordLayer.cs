@@ -283,6 +283,21 @@ public sealed class RecordLayer : IDisposable
     }
 
     /// <summary>Read one TLS record, decrypting if a read cipher is active.</summary>
+    // RFC 8446 §5: CCS records are tolerated for middlebox compat but must carry exactly 0x01, and are
+    // bounded in count (each side legitimately sends ≤1) so a peer can't stream them unboundedly.
+    private int _ccsReceived;
+    private const int MaxChangeCipherSpec = 4;
+
+    /// <summary>RFC 8446 §5 validation for an inbound plaintext ChangeCipherSpec record (shared by the sync
+    /// and async read paths): payload MUST be a single 0x01, and the running count is bounded.</summary>
+    private void ValidateChangeCipherSpec(byte[] payload)
+    {
+        if (payload.Length != 1 || payload[0] != 0x01)
+            throw new TlsException(AlertDescription.UnexpectedMessage, "malformed ChangeCipherSpec (must be a single 0x01)");
+        if (++_ccsReceived > MaxChangeCipherSpec)
+            throw new TlsException(AlertDescription.UnexpectedMessage, "too many ChangeCipherSpec records");
+    }
+
     public (ContentType type, byte[] payload) ReadRecord()
     {
         byte[] header = BinaryHelper.ReadExact(_stream, 5);
@@ -337,6 +352,9 @@ public sealed class RecordLayer : IDisposable
         }
 
         byte[] plaintext = BinaryHelper.ReadExact(_stream, length);
+        // A protected CCS (wrapped in ApplicationData) is already rejected above via the inner-content-type
+        // check; here we validate the unencrypted middlebox-compat CCS (RFC 8446 §5).
+        if (outerType == ContentType.ChangeCipherSpec) ValidateChangeCipherSpec(plaintext);
         return (outerType, plaintext);
     }
 
@@ -488,6 +506,7 @@ public sealed class RecordLayer : IDisposable
         }
 
         byte[] plain = BinaryHelper.ReadExact(_stream, length);
+        if (outerType == ContentType.ChangeCipherSpec) ValidateChangeCipherSpec(plain);
         return (outerType, plain);
     }
 
@@ -542,6 +561,7 @@ public sealed class RecordLayer : IDisposable
         }
 
         byte[] plain = await BinaryHelper.ReadExactAsync(_stream, length, ct).ConfigureAwait(false);
+        if (outerType == ContentType.ChangeCipherSpec) ValidateChangeCipherSpec(plain);
         return (outerType, plain);
     }
 
@@ -600,6 +620,7 @@ public sealed class RecordLayer : IDisposable
         }
 
         byte[] plain = await BinaryHelper.ReadExactAsync(_stream, length, ct).ConfigureAwait(false);
+        if (outerType == ContentType.ChangeCipherSpec) ValidateChangeCipherSpec(plain);
         return (outerType, plain);
     }
 

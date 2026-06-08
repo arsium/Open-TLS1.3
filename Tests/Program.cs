@@ -34,6 +34,7 @@ if (args.Contains("fuzz"))
 Console.WriteLine("Open-TLS 1.3 — test vector & loopback suite");
 
 CryptoVectorTests.Run();
+Rfc8446Tests.Run();
 LoopbackTests.Run();
 
 return T.Summary();

@@ -148,6 +148,12 @@ public static class HandshakeMessages
 
         int compLen = body[p++];
         EnsureRemaining(body, p, compLen, "ClientHello compression_methods");
+        // RFC 8446 §4.1.2 / §4.2.1: a TLS 1.3 ClientHello MUST carry exactly the single null
+        // compression method (0x00). Anything else (e.g. a TLS-1.2 DEFLATE-style downgrade probe)
+        // → illegal_parameter.
+        if (compLen != 1 || body[p] != 0)
+            throw new TlsException(AlertDescription.IllegalParameter,
+                "ClientHello legacy_compression_methods must be a single null method");
         p += compLen; // skip compression
 
         var keyShares = new List<(NamedGroup, byte[])>();
@@ -477,6 +483,21 @@ public static class HandshakeMessages
             // RFC 8446 §4.2: duplicate extensions are illegal.
             if (!seenExts.Add(et))
                 throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate ServerHello extension: {et}");
+            // RFC 8446 §4.1.3/§4.2: a ServerHello may carry ONLY key_share, pre_shared_key and
+            // supported_versions; a HelloRetryRequest only key_share, cookie, supported_versions (+ the
+            // ECH HRR-confirmation, RFC 9849 §7.2.1). This stack also negotiates the 8773bis
+            // cert_with_extern_psk extension in ServerHello. A server MUST NOT send any other /
+            // unsolicited extension here — abort rather than silently ignoring it.
+            bool extAllowed = et switch
+            {
+                ExtensionType.KeyShare or ExtensionType.SupportedVersions => true,
+                ExtensionType.Cookie or ExtensionType.EncryptedClientHello => isHrr,
+                ExtensionType.PreSharedKey or ExtensionType.CertWithExternPsk => !isHrr,
+                _ => false,
+            };
+            if (!extAllowed)
+                throw new TlsException(AlertDescription.UnsupportedExtension,
+                    $"ServerHello/HelloRetryRequest carries a not-permitted extension: {et}");
             if (et == ExtensionType.KeyShare)
             {
                 EnsureRemaining(ed, 0, 2, "ServerHello key_share group");
@@ -1190,7 +1211,7 @@ public static class HandshakeMessages
     private static readonly SignatureScheme[] DefaultClientSigAlgs =
     {
         SignatureScheme.EcdsaSecp256r1Sha256,
-        SignatureScheme.EcdsaSecp384r1Sha384,
+        // EcdsaSecp384r1Sha384 dropped — P-256-only ECDSA verify (see TlsConnection.AdvertisedSigAlgs).
         SignatureScheme.Ed25519,
         SignatureScheme.RsaPssRsaeSha256,
         SignatureScheme.RsaPssRsaeSha384,
@@ -1203,7 +1224,7 @@ public static class HandshakeMessages
     // (the two extra hybrids cost ~MBs to pre-generate, so we advertise willingness and let the server
     // HRR to them on demand). Overridable per-connection via TlsConnection.SetOfferedGroups, which then
     // restricts the advertisement to exactly the offered groups.
-    private static readonly NamedGroup[] DefaultSupportedGroups =
+    internal static readonly NamedGroup[] DefaultSupportedGroups =
     {
         NamedGroup.X25519MLKEM768, NamedGroup.SecP256r1MLKEM768, NamedGroup.SecP384r1MLKEM1024,
         NamedGroup.X25519, NamedGroup.X448, NamedGroup.Secp256r1, NamedGroup.Secp384r1,

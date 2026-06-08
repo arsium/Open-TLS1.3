@@ -22,13 +22,13 @@ public sealed class AeadCipher : IDisposable
     // RFC 8446 §5.5: per-key usage limits (encryption side).
     // Watermark = soft trigger to request KeyUpdate; HardLimit = refuse to encrypt further.
     private const ulong AesGcmRekeyWatermark = 1UL << 23;                 // 8.4M records
-    private const ulong AesGcmHardLimit      = (1UL << 24) + (1UL << 23); // ≈2^24.5  (RFC 8446)
+    private const ulong AesGcmHardLimit      = 23_726_566;               // 2^24.5, the RFC 8446 §5.5 ceiling
     private const ulong ChachaRekeyWatermark = 1UL << 31;                 // 2.1G records
     private const ulong ChachaHardLimit      = 1UL << 47;                 // safety margin below RFC 8446's 2^48
     private const ulong MgmRekeyWatermark    = 1UL << 38;                 // conservative GOST watermark
     private const ulong MgmHardLimit         = 1UL << 39;                 // one doubling above watermark
-    // SM4-GCM/CCM share the AES-GCM structural family; reuse the AES-GCM limits.
-    private const ulong Sm4HardLimit         = (1UL << 24) + (1UL << 23);
+    // SM4-GCM/CCM share the AES-GCM structural family; reuse the AES-GCM limit (2^24.5).
+    private const ulong Sm4HardLimit         = 23_726_566;
     // AEGIS (draft-denis-tls-aegis §4): a KeyUpdate MUST happen before 2^48 records; fail closed below that.
     private const ulong AegisRekeyWatermark  = 1UL << 40;
     private const ulong AegisHardLimit       = 1UL << 47;

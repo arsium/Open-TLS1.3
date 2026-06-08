@@ -90,7 +90,9 @@ public sealed class TlsConnection : IDisposable
     private static readonly SignatureScheme[] AdvertisedSigAlgs =
     {
         SignatureScheme.EcdsaSecp256r1Sha256,
-        SignatureScheme.EcdsaSecp384r1Sha384,
+        // EcdsaSecp384r1Sha384 (0x0503) is intentionally NOT advertised: this stack's ECDSA verify/sign is
+        // P-256-only, and RFC 8446 §4.2.3 requires being able to process any scheme you offer — advertising
+        // P-384 made a handshake with a P-384 peer fail mid-flight. Re-add here once P-384 verify/sign exists.
         SignatureScheme.Ed25519,
         SignatureScheme.RsaPssRsaeSha256,
         SignatureScheme.RsaPssRsaeSha384,
@@ -203,6 +205,7 @@ public sealed class TlsConnection : IDisposable
     private bool _greaseEch;                                  // client: send a GREASE ECH ext when no real config
     private bool _echServerRejected;                          // server: saw an outer CH it couldn't decrypt → send retry_configs
     private bool _forceHrr;                                   // server (test): always send one HelloRetryRequest
+    private bool _enforceHrrConsistency = true;               // server: RFC 8446 §4.1.4 CH1↔CH2 invariant check (default on)
     private byte[]? _echRetryConfigs;                         // client: ECHConfigList from a rejecting server (retry_configs)
     /// <summary>True once ECH was confirmed accepted (server: decrypted; client: confirmation verified).</summary>
     public bool EchAccepted { get; private set; }
@@ -567,6 +570,9 @@ public sealed class TlsConnection : IDisposable
     /// <summary>Server: force a single HelloRetryRequest (testing only — lets the HRR + ECH-HRR-confirmation
     /// path be exercised in a loopback where the server otherwise accepts any offered key-share group).</summary>
     internal void ForceHelloRetryRequest() => _forceHrr = true;
+
+    /// <summary>Server: toggle the RFC 8446 §4.1.4 second-ClientHello consistency check (default on).</summary>
+    internal void SetEnforceHelloRetryConsistency(bool enabled) => _enforceHrrConsistency = enabled;
 
     /// <summary>Server: if <paramref name="ch"/> is an ECH ClientHelloOuter we can decrypt, swap it to the
     /// inner CH and return the framed inner CH to feed the transcript; otherwise return <paramref name="chMsg"/>.
@@ -1065,6 +1071,7 @@ public sealed class TlsConnection : IDisposable
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
         {
+            ValidateSelectedGroupOffered(sh.KeyShareGroup); // RFC 8446 §4.1.4
             if (_keySchedule == null)
             {
                 _keySchedule = new KeySchedule(sh.CipherSuite);
@@ -1217,6 +1224,7 @@ public sealed class TlsConnection : IDisposable
         _negotiatedGroup = sh.KeyShareGroup;
         if (sh.KeyShare == null || sh.KeyShare.Length == 0)
             AlertAndThrow(AlertDescription.DecodeError, "ServerHello has empty KeyShare");
+        ValidateSelectedGroupOffered(sh.KeyShareGroup); // RFC 8446 §4.2.8 (final selected_group)
         byte[] shared = ComputeClientSharedSecret(
             sh.KeyShareGroup, sh.KeyShare, x25519Priv, x25519Pub,
             p256Priv, p256Pub, p384Priv, p384Pub, x448Priv, mlkemDk);
@@ -1239,6 +1247,7 @@ public sealed class TlsConnection : IDisposable
         var (_, eeBody) = HandshakeMessages.Unframe(eeMsg);
         var ee = HandshakeMessages.ParseEncryptedExtensionsEx(eeBody);
         HandshakePhaseHook.Mark("client/after-EE");
+        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt);
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
@@ -1631,8 +1640,10 @@ public sealed class TlsConnection : IDisposable
 
             // RFC 8446 §4.2.11.2: server MUST re-verify PSK binder in CH2 after HRR
             var (_, ch2Body) = HandshakeMessages.Unframe(ch2Msg);
+            var ch1 = ch; // CH1 (already swapped to the ECH inner above, if accepted)
             ch = HandshakeMessages.ParseClientHello(ch2Body);
             byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
+            if (_enforceHrrConsistency) CheckHelloRetryConsistency(ch1, ch); // RFC 8446 §4.1.4
 
             if (isPskResumption && ch.PreSharedKeyData != null)
             {
@@ -2222,10 +2233,40 @@ public sealed class TlsConnection : IDisposable
         }
     }
 
+    // Carry-over for a post-handshake handshake message fragmented across application-data records.
+    private byte[] _postHsPartial = Array.Empty<byte>();
+
     private void HandlePostHandshakeMessages(byte[] payload)
     {
-        foreach (var m in HandshakeMessages.SplitMessages(payload))
+        // RFC 8446 §5.1: a post-handshake handshake message (a large NewSessionTicket, or a
+        // post-handshake Certificate chain) MAY be fragmented across several records. Accumulate across
+        // records, dispatch only complete length-prefixed messages, and retain any incomplete tail —
+        // mirrors EnqueueHandshake on the main handshake path (which previously was the only reassembled
+        // path; per-record SplitMessages here silently dropped a fragmented tail).
+        byte[] buf;
+        if (_postHsPartial.Length == 0)
         {
+            buf = payload;
+        }
+        else
+        {
+            buf = new byte[_postHsPartial.Length + payload.Length];
+            Buffer.BlockCopy(_postHsPartial, 0, buf, 0, _postHsPartial.Length);
+            Buffer.BlockCopy(payload, 0, buf, _postHsPartial.Length, payload.Length);
+        }
+
+        int p = 0;
+        while (p + 4 <= buf.Length)
+        {
+            uint len = BinaryHelper.ReadUInt24(buf.AsSpan(p + 1));
+            long total = 4L + len;
+            if (total > MaxHandshakeMessageLength)
+                throw new TlsException(AlertDescription.DecodeError,
+                    $"Post-handshake message length {len} exceeds reassembly limit");
+            if (p + total > buf.Length) break; // incomplete tail — wait for more records
+            byte[] m = buf[p..(p + (int)total)];
+            p += (int)total;
+
             var (hsType, body) = HandshakeMessages.Unframe(m);
             switch (hsType)
             {
@@ -2253,6 +2294,7 @@ public sealed class TlsConnection : IDisposable
                     break;
             }
         }
+        _postHsPartial = p == buf.Length ? Array.Empty<byte>() : buf[p..];
     }
 
     // Session ticket handling (client side)
@@ -2273,7 +2315,9 @@ public sealed class TlsConnection : IDisposable
                 ResumptionSecret = ticketPsk,
                 CipherSuite = _keySchedule.Suite,
                 IssuedAt = DateTime.UtcNow,
-                LifetimeSeconds = nst.Lifetime,
+                // RFC 8446 §4.6.1: a client MUST NOT cache a ticket for longer than 7 days,
+                // regardless of the lifetime the server advertises — clamp on intake.
+                LifetimeSeconds = Math.Min(nst.Lifetime, 604800),
                 AgeAdd = nst.AgeAdd,
                 MaxEarlyDataSize = nst.MaxEarlyDataSize
             };
@@ -2827,7 +2871,13 @@ public sealed class TlsConnection : IDisposable
     {
         bool standard = _keySchedule!.Suite is CipherSuite.TLS_AES_128_GCM_SHA256
             or CipherSuite.TLS_AES_256_GCM_SHA384 or CipherSuite.TLS_CHACHA20_POLY1305_SHA256;
-        if (!standard || ch.SignatureAlgorithms == null) return;
+        if (!standard) return; // national suites (GOST/SM) negotiate the scheme off-wire by design
+        // RFC 8446 §9.2: a ClientHello that wants certificate-based authentication MUST carry
+        // signature_algorithms. This method is only reached on the certificate path (never a PSK-only
+        // resumption), so an absent extension here is a missing mandatory extension, not an option.
+        if (ch.SignatureAlgorithms == null)
+            AlertAndThrow(AlertDescription.MissingExtension,
+                "ClientHello for a certificate handshake is missing signature_algorithms (RFC 8446 §9.2)");
         if (Array.IndexOf(ch.SignatureAlgorithms, _certificate!.SignatureAlgorithm) < 0)
             AlertAndThrow(AlertDescription.HandshakeFailure,
                 "Client's signature_algorithms does not include the server certificate's signature scheme");
@@ -2872,6 +2922,75 @@ public sealed class TlsConnection : IDisposable
         if (Array.IndexOf(_offeredSigAlgs ?? AdvertisedSigAlgs, scheme) < 0)
             AlertAndThrow(AlertDescription.IllegalParameter,
                 $"CertificateVerify uses unadvertised scheme: {scheme}");
+    }
+
+    // RFC 8446 §4.1.4 / §4.2.8 (client side): a server — in a HelloRetryRequest or a ServerHello — MUST
+    // select a key-exchange group the client actually advertised in supported_groups. Reject anything
+    // else with a clean illegal_parameter instead of letting it fall through to an opaque ECDH/decode
+    // failure. (We intentionally do NOT also enforce §4.1.4's lesser "the HRR group must differ from a
+    // group already in our key_share" no-op rule: this client advertises a broader supported_groups than
+    // it pre-shares, the transcript binds the retry regardless, and that rule collides with the
+    // ForceHelloRetryRequest test knob for no real-world benefit — a conformant server never HRRs us.)
+    private void ValidateSelectedGroupOffered(NamedGroup group)
+    {
+        var advertised = _offeredGroups ?? HandshakeMessages.DefaultSupportedGroups;
+        if (Array.IndexOf(advertised, group) < 0)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                $"Server selected a key-exchange group not offered in supported_groups: {group}");
+    }
+
+    // RFC 8446 §4.2 (client side): a server MUST NOT send an extension response the client did not
+    // solicit. Reject the recognized EncryptedExtensions responses we didn't offer. (Unknown extension
+    // types are ignored, per §4.2; cert-compression is always advertised by this client, and
+    // record_size_limit is sent independently by each peer per RFC 8449 — so neither is gated here.)
+    private void RejectUnsolicitedEncryptedExtensions(ParsedEncryptedExtensions ee, bool offeredEarlyData)
+    {
+        if (ee.AcceptEarlyData && !offeredEarlyData)
+            AlertAndThrow(AlertDescription.UnsupportedExtension,
+                "EncryptedExtensions accepted early_data the client did not offer");
+        if (ee.AlpnProtocol != null && (_alpnProtocols == null || _alpnProtocols.Length == 0))
+            AlertAndThrow(AlertDescription.UnsupportedExtension,
+                "EncryptedExtensions carries an unsolicited ALPN protocol");
+        if (ee.EchRetryConfigs != null && _echContext == null)
+            AlertAndThrow(AlertDescription.UnsupportedExtension,
+                "EncryptedExtensions carries unsolicited ECH retry_configs");
+    }
+
+    // RFC 8446 §4.1.4 (server side): the second ClientHello (after a HelloRetryRequest) MUST be
+    // identical to the first except for the explicitly-permitted changes — replacing key_share, removing
+    // early_data, adding a cookie, updating pre_shared_key/binders, adjusting padding. Verify the
+    // security-relevant invariant fields are unchanged; a mismatch → illegal_parameter. Both hellos are
+    // compared in their post-ECH-decrypt (inner) form. Gated by EnforceHelloRetryConsistency (default on);
+    // it is defense-in-depth (the transcript already binds both hellos) but rejects a client that tries
+    // to alter its negotiated parameters across the retry.
+    private void CheckHelloRetryConsistency(ParsedClientHello ch1, ParsedClientHello ch2)
+    {
+        if (!HelloRetryConsistent(ch1, ch2))
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "Second ClientHello after HelloRetryRequest changed a field RFC 8446 §4.1.4 requires to stay unchanged");
+    }
+
+    /// <summary>Pure RFC 8446 §4.1.4 CH1↔CH2 invariant predicate (internal for testing): the fields a
+    /// second ClientHello must NOT change across a HelloRetryRequest. key_share / early_data /
+    /// pre_shared_key / cookie / padding are deliberately excluded (they are allowed to change).</summary>
+    internal static bool HelloRetryConsistent(ParsedClientHello ch1, ParsedClientHello ch2) =>
+        SeqEq(ch1.ClientRandom, ch2.ClientRandom) &&
+        SeqEq(ch1.SessionId, ch2.SessionId) &&
+        SeqEq(ch1.CipherSuites, ch2.CipherSuites) &&
+        SeqEq(ch1.SupportedGroups, ch2.SupportedGroups) &&
+        SeqEq(ch1.SignatureAlgorithms, ch2.SignatureAlgorithms) &&
+        SeqEq(ch1.AlpnProtocols, ch2.AlpnProtocols) &&
+        ch1.ServerName == ch2.ServerName;
+
+    // Null-safe element-wise array equality (no LINQ dependency; works for byte[] and enum/string arrays).
+    private static bool SeqEq<T>(T[]? a, T[]? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a == null || b == null || a.Length != b.Length) return false;
+        var cmp = EqualityComparer<T>.Default;
+        for (int i = 0; i < a.Length; i++)
+            if (!cmp.Equals(a[i], b[i])) return false;
+        return true;
     }
 
     private void ValidatePeerCertificate(byte[] certDer, string? expectedHostname)
@@ -3515,6 +3634,7 @@ public sealed class TlsConnection : IDisposable
         // 4. Handle HelloRetryRequest
         if (sh.IsHelloRetryRequest)
         {
+            ValidateSelectedGroupOffered(sh.KeyShareGroup); // RFC 8446 §4.1.4
             if (_keySchedule == null)
             {
                 _keySchedule = new KeySchedule(sh.CipherSuite);
@@ -3664,6 +3784,7 @@ public sealed class TlsConnection : IDisposable
         _negotiatedGroup = sh.KeyShareGroup;
         if (sh.KeyShare == null || sh.KeyShare.Length == 0)
             AlertAndThrow(AlertDescription.DecodeError, "ServerHello has empty KeyShare");
+        ValidateSelectedGroupOffered(sh.KeyShareGroup); // RFC 8446 §4.2.8 (final selected_group)
         byte[] shared = ComputeClientSharedSecret(
             sh.KeyShareGroup, sh.KeyShare, x25519Priv, x25519Pub,
             p256Priv, p256Pub, p384Priv, p384Pub, x448Priv, mlkemDk);
@@ -3683,6 +3804,7 @@ public sealed class TlsConnection : IDisposable
         _transcript.Update(eeMsg);
         var (_, eeBody) = HandshakeMessages.Unframe(eeMsg);
         var ee = HandshakeMessages.ParseEncryptedExtensionsEx(eeBody);
+        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt);
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
@@ -4016,8 +4138,10 @@ public sealed class TlsConnection : IDisposable
 
             // RFC 8446 §4.2.11.2: re-verify PSK binder in CH2
             var (_, ch2Body) = HandshakeMessages.Unframe(ch2Msg);
+            var ch1 = ch; // CH1 (already swapped to the ECH inner above, if accepted)
             ch = HandshakeMessages.ParseClientHello(ch2Body);
             byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
+            if (_enforceHrrConsistency) CheckHelloRetryConsistency(ch1, ch); // RFC 8446 §4.1.4
 
             if (isPskResumption && ch.PreSharedKeyData != null)
             {
