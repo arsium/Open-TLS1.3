@@ -15,8 +15,8 @@ public sealed class TlsServer : IDisposable
     /// <summary>CA certificate used to verify client certificates during mTLS.</summary>
     public TlsCertificate? CaCertificate { get; set; }
 
-    /// <summary>Handshake timeout in milliseconds. 0 = no timeout (default).</summary>
-    public int HandshakeTimeoutMs { get; set; }
+    /// <summary>Handshake timeout in milliseconds. 0 = no timeout.</summary>
+    public int HandshakeTimeoutMs { get; set; } = 10000;
 
     /// <summary>Ticket encryption instance. Set to enable session ticket issuance for PSK resumption.</summary>
     public TicketEncryption? TicketEncryption { get; set; }

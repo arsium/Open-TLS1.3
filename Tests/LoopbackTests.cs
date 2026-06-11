@@ -605,7 +605,8 @@ public static class LoopbackTests
 
         // --- Exporter, channel binding, exported authenticator, KeyUpdate, post-handshake auth ---
         {
-            var (c, s, cleanup) = RawPair(ca, ecCert, clientCert: ecCert);
+            var (c, s, cleanup) = RawPair(ca, ecCert, clientCert: ecCert,
+                cfgClient: x => x.EnablePostHandshakeAuth());
             try
             {
                 // Key exporter (RFC 5705 / RFC 8446 §7.5): both ends derive the same bytes.

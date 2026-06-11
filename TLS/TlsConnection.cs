@@ -184,6 +184,8 @@ public sealed class TlsConnection : IDisposable
     // Post-handshake auth
     private PostHsAuthState _postHsAuthState = PostHsAuthState.None;
     private byte[]? _pendingPostHsContext;
+    private bool _offerPostHandshakeAuth;                    // client: advertise post_handshake_auth
+    private bool _peerAllowsPostHandshakeAuth;                // server: client advertised post_handshake_auth
     private byte[]? _serverFinishedHash; // Transcript-Hash(CH..SF), used for DeriveAppSecrets
 
     // OCSP stapling
@@ -268,6 +270,9 @@ public sealed class TlsConnection : IDisposable
 
     /// <summary>Set ALPN protocols to offer (client) or accept (server).</summary>
     public void SetAlpnProtocols(string[] protocols) => _alpnProtocols = protocols;
+
+    /// <summary>Client: advertise RFC 8446 post_handshake_auth and accept post-handshake CertificateRequest.</summary>
+    public void EnablePostHandshakeAuth() => _offerPostHandshakeAuth = true;
 
     /// <summary>Client: override the cipher suites offered in ClientHello (in preference order).</summary>
     public void SetOfferedCipherSuites(CipherSuite[] suites) => _offeredSuites = suites;
@@ -373,6 +378,51 @@ public sealed class TlsConnection : IDisposable
         if (!sent.AsSpan().SequenceEqual(echoed))
             AlertAndThrow(AlertDescription.IllegalParameter,
                 "ServerHello legacy_session_id_echo does not match the ClientHello session_id");
+    }
+
+    private void ValidateServerCipherSuiteOffered(CipherSuite suite, CipherSuite[] offeredSuites)
+    {
+        if (Array.IndexOf(offeredSuites, suite) < 0)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                $"Server selected a cipher suite the client did not offer: {suite}");
+    }
+
+    private void ValidateServerPskSelection(ParsedServerHello sh, byte[]? offeredPsk, bool offeredCertWithExternPsk, CipherSuite? offeredPskSuite)
+    {
+        if (sh.CertWithExternPsk && !offeredCertWithExternPsk)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "Server selected tls_cert_with_extern_psk without a matching client offer");
+
+        if (sh.CertWithExternPsk && sh.SelectedPskIndex < 0)
+            AlertAndThrow(AlertDescription.MissingExtension,
+                "Server selected tls_cert_with_extern_psk without selecting a PSK identity");
+
+        if (sh.SelectedPskIndex < 0) return;
+
+        if (offeredPsk == null)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "Server selected a PSK identity the client did not offer");
+
+        if (sh.SelectedPskIndex != 0)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                $"Server selected PSK identity {sh.SelectedPskIndex}, but this client offered only identity 0");
+
+        if (offeredPskSuite.HasValue && sh.CipherSuite != offeredPskSuite.Value)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "Server selected a cipher suite incompatible with the offered PSK");
+    }
+
+    private void ValidateCertificateContext(byte[] actual, byte[] expected, string message)
+    {
+        if (!actual.AsSpan().SequenceEqual(expected))
+            AlertAndThrow(AlertDescription.IllegalParameter, message);
+    }
+
+    private void ValidateClientCertificateSignatureScheme(SignatureScheme[] allowed, SignatureScheme scheme)
+    {
+        if (Array.IndexOf(allowed, scheme) < 0)
+            AlertAndThrow(AlertDescription.HandshakeFailure,
+                $"Client certificate signature scheme was not allowed by CertificateRequest: {scheme}");
     }
 
     // RFC 8449: clamp our outgoing record size to the peer's advertised record_size_limit.
@@ -494,11 +544,13 @@ public sealed class TlsConnection : IDisposable
         CipherSuite[] suites, (NamedGroup, byte[])[] keyShares, string? serverName, byte[]? cookie)
     {
         byte[] inner2 = HandshakeMessages.BuildClientHello(_echInnerRandom!, sessionId, suites, keyShares,
-            serverName, cookie, _alpnProtocols, _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+            serverName, cookie, _alpnProtocols, _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs,
+            offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
         var cfg = _echConfigs![0];
         var (outer2, _) = EncryptedClientHello.EncryptClientHello(inner2, _echInnerRandom!, cfg,
             echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-                cfg.PublicNameString, cookie, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups));
+                cfg.PublicNameString, cookie, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody,
+                offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth));
         _echOuterChMsg = outer2;
         return (outer2, EchAccepted ? inner2 : outer2);
     }
@@ -530,11 +582,13 @@ public sealed class TlsConnection : IDisposable
         var echConfig = _echConfigs[0];
         byte[] innerRandom = RandomnessWrapper.GetHandshakeBytes(32);
         byte[] innerCh = HandshakeMessages.BuildClientHello(innerRandom, sessionId, suites, keyShares,
-            serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+            serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling,
+            offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
         string publicName = echConfig.PublicNameString;
         var (outerCh, echContext) = EncryptedClientHello.EncryptClientHello(innerCh, innerRandom, echConfig,
             echExtBody => HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-                publicName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups));
+                publicName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExtBody,
+                offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth));
         _echContext = echContext;
         _echInnerRandom = innerRandom;
         _echTranscriptOverride = innerCh;
@@ -556,7 +610,8 @@ public sealed class TlsConnection : IDisposable
         byte[] echExt = EncryptedClientHello.BuildOuterEchExtBody(configId,
             Hpke.KDF_HKDF_SHA256, Hpke.AEAD_AES_128_GCM, enc, payload);
         return HandshakeMessages.BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
-            serverName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExt, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+            serverName, null, null, false, _alpnProtocols, _requestOcspStapling, 0, echExt,
+            offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
     }
 
     /// <summary>Server: the ECHConfigList to return as retry_configs after an ECH reject (its own
@@ -968,7 +1023,8 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs,
+                offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -1001,7 +1057,8 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 BuildImportedIdentity(_externalPsk), 0, placeholder, // External PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk,
+                offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
 
             // Compute and patch the real binder
             int bindersLen = HandshakeMessages.PskBindersTailLength(binderLen);
@@ -1023,7 +1080,7 @@ public sealed class TlsConnection : IDisposable
                 ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
                     serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling,
-                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
         }
 
         _record.WriteRecord(ContentType.Handshake, chMsg);
@@ -1064,6 +1121,7 @@ public sealed class TlsConnection : IDisposable
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
         CheckSessionIdEcho(sessionId, sh.SessionId);
+        ValidateServerCipherSuiteOffered(sh.CipherSuite, suites);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
         VerifyEchAcceptConfirmation(shMsg, sh);
         HandshakePhaseHook.Mark("client/after-SH-received");
@@ -1153,18 +1211,32 @@ public sealed class TlsConnection : IDisposable
             _sentCcs = true;
 
             byte[] ch2Msg;
-            if (psk != null && _pskTicket != null)
+            if (psk != null && (_pskTicket != null || _externalPsk != null))
             {
                 // Rebuild CH2 with PSK extension (RFC 8446 §4.2.11)
-                var elapsed2 = DateTime.UtcNow - _pskTicket.IssuedAt;
-                uint obfuscatedAge2 = (uint)elapsed2.TotalMilliseconds + _pskTicket.AgeAdd;
+                byte[] pskIdentity;
+                uint obfuscatedAge2;
+                bool externalPskBinder = _pskTicket == null;
+                if (_pskTicket != null)
+                {
+                    var elapsed2 = DateTime.UtcNow - _pskTicket.IssuedAt;
+                    obfuscatedAge2 = (uint)elapsed2.TotalMilliseconds + _pskTicket.AgeAdd;
+                    pskIdentity = _pskTicket.Ticket;
+                }
+                else
+                {
+                    obfuscatedAge2 = 0;
+                    pskIdentity = BuildImportedIdentity(_externalPsk!);
+                }
                 int binderLen2 = _keySchedule.HashLen;
 
                 ch2Msg = HandshakeMessages.BuildClientHelloWithPsk(
                     clientRandom, sessionId, suites, keyShares,
-                    _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
+                    pskIdentity, obfuscatedAge2, new byte[binderLen2],
                     false, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups); // no 0-RTT after HRR
+                    requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk,
+                    offeredSigAlgs: _offeredSigAlgs,
+                    offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -1172,8 +1244,10 @@ public sealed class TlsConnection : IDisposable
                 binderTranscript2.Update(ch2Msg[..^bindersLen2]);
 
                 byte[] binder2 = HandshakeMessages.ComputePskBinder(
-                    _keySchedule.DeriveBinderKey(), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
+                    _keySchedule.DeriveBinderKey(external: externalPskBinder), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
                 HandshakeMessages.PatchPskBinder(ch2Msg, binder2);
+                _record.WriteRecord(ContentType.Handshake, ch2Msg);
+                _transcript.Update(ch2Msg);
             }
             else if (_echContext != null)
             {
@@ -1187,7 +1261,8 @@ public sealed class TlsConnection : IDisposable
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs,
+                    offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
                 _record.WriteRecord(ContentType.Handshake, ch2Msg);
                 _transcript.Update(ch2Msg);
             }
@@ -1196,6 +1271,7 @@ public sealed class TlsConnection : IDisposable
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
             sh = HandshakeMessages.ParseServerHello(shBody);
             CheckSessionIdEcho(sessionId, sh.SessionId);
+            ValidateServerCipherSuiteOffered(sh.CipherSuite, suites);
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
@@ -1207,6 +1283,8 @@ public sealed class TlsConnection : IDisposable
         // 5. Set up key schedule (if not already from PSK/HRR)
         // draft-ietf-tls-8773bis: a server that echoes tls_cert_with_extern_psk mixes the PSK into the
         // key schedule but still runs a FULL certificate handshake (not a resumption skip).
+        ValidateServerPskSelection(sh, psk, _certWithExternPsk && _externalPsk != null,
+            _pskTicket?.CipherSuite ?? _externalPsk?.Suite);
         bool certWithPsk = sh.CertWithExternPsk && psk != null;
         bool isPskResumption = !certWithPsk && sh.SelectedPskIndex >= 0 && psk != null;
         if (_keySchedule == null || (!isPskResumption && !certWithPsk && psk != null))
@@ -1247,14 +1325,14 @@ public sealed class TlsConnection : IDisposable
         var (_, eeBody) = HandshakeMessages.Unframe(eeMsg);
         var ee = HandshakeMessages.ParseEncryptedExtensionsEx(eeBody);
         HandshakePhaseHook.Mark("client/after-EE");
-        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt);
+        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt, isPskResumption);
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
         ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
         // ECH reject: the server returned a fresh ECHConfigList (retry_configs) for the next attempt.
         if (_echContext != null && !EchAccepted) _echRetryConfigs = ee.EchRetryConfigs;
-        EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
+        EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt && isPskResumption;
 
         // 9. If PSK resumption: skip to Finished (no Certificate/CertificateVerify)
         if (isPskResumption)
@@ -1312,13 +1390,17 @@ public sealed class TlsConnection : IDisposable
         // 10. Check for CertificateRequest (mTLS) or Certificate / CompressedCertificate
         byte[] nextMsg = NextHandshakeAny(out HandshakeType nextType);
         byte[]? certReqContext = null;
+        SignatureScheme[]? certReqSigAlgorithms = null;
 
         if (nextType == HandshakeType.CertificateRequest)
         {
             _transcript.Update(nextMsg);
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
-            var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            var (ctx, sigAlgs, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            ValidateCertificateContext(ctx, Array.Empty<byte>(),
+                "Initial CertificateRequest certificate_request_context must be empty");
             certReqContext = ctx;
+            certReqSigAlgorithms = sigAlgs;
             _serverCertReqCompAlgs = HandshakeMessages.ParseCertReqCertCompression(crBody);
             nextMsg = NextHandshakeAny(out nextType);
         }
@@ -1334,13 +1416,15 @@ public sealed class TlsConnection : IDisposable
         if (nextType == HandshakeType.CompressedCertificate)
         {
             var (_, compBody) = HandshakeMessages.Unframe(nextMsg);
-            certBody = HandshakeMessages.ParseCompressedCertificate(compBody);
+            certBody = HandshakeMessages.ParseCompressedCertificate(compBody, CertCompAdvertise);
         }
         else
         {
             (_, certBody) = HandshakeMessages.Unframe(nextMsg);
         }
-        var (_, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        var (serverCertContext, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        ValidateCertificateContext(serverCertContext, Array.Empty<byte>(),
+            "Server Certificate certificate_request_context must be empty");
         if (serverCertEntries.Count == 0)
             AlertAndThrow(AlertDescription.CertificateRequired, "Server sent empty certificate");
         byte[] serverCertDer = serverCertEntries[0].CertDer;
@@ -1403,6 +1487,7 @@ public sealed class TlsConnection : IDisposable
         {
             if (_certificate != null)
             {
+                ValidateClientCertificateSignatureScheme(certReqSigAlgorithms!, _certificate.SignatureAlgorithm);
                 byte[] clientCertMsg = HandshakeMessages.BuildCertificateMsg(
                     _certificate.DerData, certReqContext, _certificate.ChainCertificates);
                 ushort clientCompAlg = SelectClientCertCompression();
@@ -1479,6 +1564,7 @@ public sealed class TlsConnection : IDisposable
             // else: ECH reject — fall through to the public_name handshake on the outer CH.
         }
         _transcript.Update(transcriptCh);
+        _peerAllowsPostHandshakeAuth = ch.OffersPostHandshakeAuth;
 
         // RFC 9149: Store ticket request count
         _ticketRequestCount = ch.TicketRequestCount;
@@ -1490,6 +1576,8 @@ public sealed class TlsConnection : IDisposable
         bool certWithPsk = false;   // draft-ietf-tls-8773bis: cert + external PSK (full cert handshake)
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
+        int selectedPskIndex = -1;
+        bool selectedPskIsExternal = false;
 
         // draft-ietf-tls-8773bis §4: tls_cert_with_extern_psk MUST NOT be combined with early_data.
         if (ch.OffersCertWithExternPsk && ch.OffersEarlyData)
@@ -1535,8 +1623,8 @@ public sealed class TlsConnection : IDisposable
                     byte[] binderKey = tempKs.DeriveBinderKey();
 
                     // Truncated transcript: CH up to the binders
-                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders);
+                    byte[] truncatedCh = transcriptCh[..^bindersLen];
                     var binderTranscript = new TranscriptHash(hashAlg);
                     binderTranscript.Update(truncatedCh);
                     byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
@@ -1545,10 +1633,12 @@ public sealed class TlsConnection : IDisposable
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
                         isPskResumption = true;
+                        selectedPskIndex = i;
+                        selectedPskIsExternal = false;
                         suite = ticketSuite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
                         pskMaxEarlyData = maxEarly;
                         // 0-RTT anti-replay: only accept if ticket hasn't been used before (RFC 8446 §8)
-                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
+                        accept0Rtt = i == 0 && _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
                             && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
                         break;
                     }
@@ -1572,8 +1662,8 @@ public sealed class TlsConnection : IDisposable
                     byte[] binderKey = tempKs.DeriveBinderKey(external: true);
 
                     // Truncated transcript: CH up to the binders
-                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders);
+                    byte[] truncatedCh = transcriptCh[..^bindersLen];
                     var binderTranscript = new TranscriptHash(hashAlg);
                     binderTranscript.Update(truncatedCh);
                     byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
@@ -1582,6 +1672,8 @@ public sealed class TlsConnection : IDisposable
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
                         suite = _externalPsk.Suite; // RFC 8446 §4.2.11: MUST use the PSK's original suite
+                        selectedPskIndex = i;
+                        selectedPskIsExternal = true;
                         if (ch.OffersCertWithExternPsk)
                         {
                             // draft-ietf-tls-8773bis: the client asked to combine this external PSK with a
@@ -1599,7 +1691,7 @@ public sealed class TlsConnection : IDisposable
                             // verbatim replay reuses the binder and is rejected, while a fresh ClientHello with
                             // the same PSK still gets 0-RTT. Requires a replay store; without one we refuse
                             // 0-RTT (fall back to 1-RTT resumption) rather than accept un-tracked early data.
-                            accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                            accept0Rtt = i == 0 && _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
                                 && _ticketEncryption != null
                                 && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
                         }
@@ -1645,43 +1737,34 @@ public sealed class TlsConnection : IDisposable
             byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
             if (_enforceHrrConsistency) CheckHelloRetryConsistency(ch1, ch); // RFC 8446 §4.1.4
 
-            if (isPskResumption && ch.PreSharedKeyData != null)
+            _peerAllowsPostHandshakeAuth = ch.OffersPostHandshakeAuth;
+            if (isPskResumption || certWithPsk)
             {
-                var (identities2, _, binders2) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
-                if (binders2.Length > 0)
+                if (ch.PreSharedKeyData == null)
+                    AlertAndThrow(AlertDescription.MissingExtension,
+                        "Second ClientHello after HRR omitted the selected PSK extension");
+                var (_, _, binders2) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
+                if (selectedPskIndex >= 0 && selectedPskIndex < binders2.Length)
                 {
-                    int bindersLen2 = HandshakeMessages.PskBindersTailLength(binders2[0].Length);
-                    byte[] truncatedCh2 = ch2Msg[..^bindersLen2];
+                    int bindersLen2 = HandshakeMessages.PskBindersTailLength(binders2);
+                    byte[] truncatedCh2 = transcriptCh2[..^bindersLen2];
                     var binderTranscript2 = _transcript.Clone();
                     binderTranscript2.Update(truncatedCh2);
-                    byte[] binderKey2 = _keySchedule.DeriveBinderKey();
+                    byte[] binderKey2 = _keySchedule.DeriveBinderKey(external: selectedPskIsExternal);
                     byte[] expectedBinder2 = HandshakeMessages.ComputePskBinder(
                         binderKey2, binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
 
-                    if (!CryptographicOperations.FixedTimeEquals(binders2[0], expectedBinder2))
+                    if (!CryptographicOperations.FixedTimeEquals(binders2[selectedPskIndex], expectedBinder2))
                     {
-                        // Binder mismatch — fall back to non-PSK handshake
-                        isPskResumption = false;
-                        psk = null;
-                        accept0Rtt = false;
-                        _keySchedule = new KeySchedule(suite);
-                        _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
+                        AlertAndThrow(AlertDescription.DecryptError,
+                            "Second ClientHello PSK binder verification failed after HRR");
                     }
                 }
                 else
                 {
-                    // CH2 dropped PSK extension — fall back to non-PSK
-                    isPskResumption = false;
-                    psk = null;
-                    accept0Rtt = false;
+                    AlertAndThrow(AlertDescription.IllegalParameter,
+                        "Second ClientHello after HRR does not contain the selected PSK binder");
                 }
-            }
-            else if (isPskResumption)
-            {
-                // CH2 dropped PSK — fall back to non-PSK
-                isPskResumption = false;
-                psk = null;
-                accept0Rtt = false;
             }
 
             _transcript.Update(transcriptCh2);
@@ -1704,9 +1787,9 @@ public sealed class TlsConnection : IDisposable
         byte[] shMsg;
         if (certWithPsk)
             // draft-ietf-tls-8773bis: echo tls_cert_with_extern_psk + the selected PSK; a full cert handshake follows.
-            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0, certWithExternPsk: true);
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, (ushort)selectedPskIndex, certWithExternPsk: true);
         else if (isPskResumption)
-            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, (ushort)selectedPskIndex);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
         PatchEchAcceptConfirmation(shMsg); // ECH §7.2 (no-op unless ECH accepted)
@@ -1776,9 +1859,10 @@ public sealed class TlsConnection : IDisposable
                     var (type, payload) = _record.ReadRecord();
                     if (type == ContentType.ApplicationData)
                     {
-                        if (earlyBuf.Length + payload.Length <= pskMaxEarlyData)
-                            earlyBuf.Write(payload);
-                        // If over limit, discard but keep reading until EndOfEarlyData
+                        if (earlyBuf.Length + payload.Length > pskMaxEarlyData)
+                            AlertAndThrow(AlertDescription.UnexpectedMessage,
+                                "0-RTT data exceeded max_early_data_size");
+                        earlyBuf.Write(payload);
                     }
                     else if (type == ContentType.Handshake)
                     {
@@ -1915,10 +1999,21 @@ public sealed class TlsConnection : IDisposable
                 AlertAndThrow(AlertDescription.UnexpectedMessage, $"Expected client Certificate, got {clientCertType}");
             _transcript.Update(clientCertMsg);
             var (_, clientCertRaw) = HandshakeMessages.Unframe(clientCertMsg);
+            if (clientCertType == HandshakeType.CompressedCertificate)
+            {
+                if (clientCertRaw.Length < 2)
+                    AlertAndThrow(AlertDescription.DecodeError, "CompressedCertificate missing algorithm");
+                ushort clientCompAlg = BinaryHelper.ReadUInt16(clientCertRaw.AsSpan(0));
+                if (!_useCertCompression || Array.IndexOf(CertCompAdvertise, clientCompAlg) < 0)
+                    AlertAndThrow(AlertDescription.BadCertificate,
+                        $"Client used an unadvertised certificate compression algorithm: {clientCompAlg}");
+            }
             byte[] clientCertBody = clientCertType == HandshakeType.CompressedCertificate
                 ? HandshakeMessages.ParseCompressedCertificate(clientCertRaw)  // RFC 8879 → Certificate body
                 : clientCertRaw;
-            var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            var (clientCertContext, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            ValidateCertificateContext(clientCertContext, Array.Empty<byte>(),
+                "Initial client Certificate certificate_request_context must be empty");
 
             if (clientCertEntries.Count > 0)
             {
@@ -1992,6 +2087,8 @@ public sealed class TlsConnection : IDisposable
     {
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
+        if (!_peerAllowsPostHandshakeAuth)
+            throw new InvalidOperationException("Peer did not advertise post_handshake_auth");
         if (_postHsAuthState != PostHsAuthState.None)
             throw new InvalidOperationException("A post-handshake auth flow is already in progress");
 
@@ -2329,7 +2426,10 @@ public sealed class TlsConnection : IDisposable
     private void HandlePostHandshakeCertRequest(byte[] body)
     {
         if (_isServer) return;
-        var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(body);
+        if (!_offerPostHandshakeAuth)
+            AlertAndThrow(AlertDescription.UnexpectedMessage,
+                "Received post-handshake CertificateRequest without negotiating post_handshake_auth");
+        var (ctx, sigAlgs, _) = HandshakeMessages.ParseCertificateRequest(body);
 
         // Post-handshake auth signs over the *continued* handshake transcript (RFC 8446 §4.4):
         // the full CH..client-Finished transcript, then CertificateRequest, Certificate,
@@ -2341,6 +2441,7 @@ public sealed class TlsConnection : IDisposable
 
         if (_certificate != null)
         {
+            ValidateClientCertificateSignatureScheme(sigAlgs, _certificate.SignatureAlgorithm);
             byte[] certMsg = HandshakeMessages.BuildCertificateMsg(
                 _certificate.DerData, ctx, _certificate.ChainCertificates);
             _record.WriteRecord(ContentType.Handshake, certMsg);
@@ -2389,7 +2490,9 @@ public sealed class TlsConnection : IDisposable
         _postHsTranscript.Update(fullMsg);
 
         var (_, certBody) = HandshakeMessages.Unframe(fullMsg);
-        var (_, certEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        var (certContext, certEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        ValidateCertificateContext(certContext, _pendingPostHsContext!,
+            "Post-handshake client Certificate context does not match CertificateRequest");
         _postHsCertDer = certEntries.Count > 0 ? certEntries[0].CertDer : null;
 
         // Verify against CA if available
@@ -2943,14 +3046,17 @@ public sealed class TlsConnection : IDisposable
     // solicit. Reject the recognized EncryptedExtensions responses we didn't offer. (Unknown extension
     // types are ignored, per §4.2; cert-compression is always advertised by this client, and
     // record_size_limit is sent independently by each peer per RFC 8449 — so neither is gated here.)
-    private void RejectUnsolicitedEncryptedExtensions(ParsedEncryptedExtensions ee, bool offeredEarlyData)
+    private void RejectUnsolicitedEncryptedExtensions(ParsedEncryptedExtensions ee, bool offeredEarlyData, bool pskResumptionAccepted)
     {
-        if (ee.AcceptEarlyData && !offeredEarlyData)
+        if (ee.AcceptEarlyData && (!offeredEarlyData || !pskResumptionAccepted))
             AlertAndThrow(AlertDescription.UnsupportedExtension,
-                "EncryptedExtensions accepted early_data the client did not offer");
+                "EncryptedExtensions accepted early_data without a valid 0-RTT PSK resumption");
         if (ee.AlpnProtocol != null && (_alpnProtocols == null || _alpnProtocols.Length == 0))
             AlertAndThrow(AlertDescription.UnsupportedExtension,
                 "EncryptedExtensions carries an unsolicited ALPN protocol");
+        if (ee.AlpnProtocol != null && Array.IndexOf(_alpnProtocols!, ee.AlpnProtocol) < 0)
+            AlertAndThrow(AlertDescription.IllegalParameter,
+                "EncryptedExtensions selected an ALPN protocol the client did not offer");
         if (ee.EchRetryConfigs != null && _echContext == null)
             AlertAndThrow(AlertDescription.UnsupportedExtension,
                 "EncryptedExtensions carries unsolicited ECH retry_configs");
@@ -2979,8 +3085,15 @@ public sealed class TlsConnection : IDisposable
         SeqEq(ch1.CipherSuites, ch2.CipherSuites) &&
         SeqEq(ch1.SupportedGroups, ch2.SupportedGroups) &&
         SeqEq(ch1.SignatureAlgorithms, ch2.SignatureAlgorithms) &&
+        SeqEq(ch1.SignatureAlgorithmsCert, ch2.SignatureAlgorithmsCert) &&
         SeqEq(ch1.AlpnProtocols, ch2.AlpnProtocols) &&
-        ch1.ServerName == ch2.ServerName;
+        SeqEq(ch1.CertCompressionAlgorithms, ch2.CertCompressionAlgorithms) &&
+        ch1.ServerName == ch2.ServerName &&
+        ch1.RequestsOcspStapling == ch2.RequestsOcspStapling &&
+        ch1.OffersCertWithExternPsk == ch2.OffersCertWithExternPsk &&
+        ch1.OffersPostHandshakeAuth == ch2.OffersPostHandshakeAuth &&
+        ch1.OffersPskDheKe == ch2.OffersPskDheKe &&
+        ch1.RecordSizeLimit == ch2.RecordSizeLimit;
 
     // Null-safe element-wise array equality (no LINQ dependency; works for byte[] and enum/string arrays).
     private static bool SeqEq<T>(T[]? a, T[]? b)
@@ -3408,6 +3521,8 @@ public sealed class TlsConnection : IDisposable
     {
         if (!_isServer || !IsHandshakeComplete)
             throw new InvalidOperationException("Only server can request post-handshake auth after handshake");
+        if (!_peerAllowsPostHandshakeAuth)
+            throw new InvalidOperationException("Peer did not advertise post_handshake_auth");
         if (_postHsAuthState != PostHsAuthState.None)
             throw new InvalidOperationException("A post-handshake auth flow is already in progress");
 
@@ -3539,7 +3654,8 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 _pskTicket.Ticket, obfuscatedAge, placeholder,
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs,
+                offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
 
             // Compute and patch the real binder
             // Truncated transcript = ClientHello up to (but not including) the binders list
@@ -3571,7 +3687,8 @@ public sealed class TlsConnection : IDisposable
                 clientRandom, sessionId, suites, keyShares,
                 BuildImportedIdentity(_externalPsk), 0, placeholderE, // external PSK age is always 0
                 offer0Rtt, serverName, alpnProtocols: _alpnProtocols,
-                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk,
+                offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
 
             int bindersLenE = HandshakeMessages.PskBindersTailLength(binderLenE);
             byte[] truncatedChE = chMsg[..^bindersLenE];
@@ -3592,7 +3709,7 @@ public sealed class TlsConnection : IDisposable
                 ?? BuildGreaseEchClientHello(clientRandom, sessionId, suites, keyShares, serverName)
                 ?? HandshakeMessages.BuildClientHello(clientRandom, sessionId, suites, keyShares,
                     serverName, alpnProtocols: _alpnProtocols, requestOcspStapling: _requestOcspStapling,
-                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                    offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
         }
 
         await _record.WriteRecordAsync(ContentType.Handshake, chMsg, ct).ConfigureAwait(false);
@@ -3628,6 +3745,7 @@ public sealed class TlsConnection : IDisposable
         var (_, shBody) = HandshakeMessages.Unframe(shMsg);
         var sh = HandshakeMessages.ParseServerHello(shBody);
         CheckSessionIdEcho(sessionId, sh.SessionId);
+        ValidateServerCipherSuiteOffered(sh.CipherSuite, suites);
         if (!sh.IsHelloRetryRequest) CheckDowngradeSentinel(sh.ServerRandom);
         VerifyEchAcceptConfirmation(shMsg, sh);
 
@@ -3716,18 +3834,32 @@ public sealed class TlsConnection : IDisposable
             _sentCcs = true;
 
             byte[] ch2Msg;
-            if (psk != null && _pskTicket != null)
+            if (psk != null && (_pskTicket != null || _externalPsk != null))
             {
                 // Rebuild CH2 with PSK extension (RFC 8446 §4.2.11)
-                var elapsed2 = DateTime.UtcNow - _pskTicket.IssuedAt;
-                uint obfuscatedAge2 = (uint)elapsed2.TotalMilliseconds + _pskTicket.AgeAdd;
+                byte[] pskIdentity;
+                uint obfuscatedAge2;
+                bool externalPskBinder = _pskTicket == null;
+                if (_pskTicket != null)
+                {
+                    var elapsed2 = DateTime.UtcNow - _pskTicket.IssuedAt;
+                    obfuscatedAge2 = (uint)elapsed2.TotalMilliseconds + _pskTicket.AgeAdd;
+                    pskIdentity = _pskTicket.Ticket;
+                }
+                else
+                {
+                    obfuscatedAge2 = 0;
+                    pskIdentity = BuildImportedIdentity(_externalPsk!);
+                }
                 int binderLen2 = _keySchedule.HashLen;
 
                 ch2Msg = HandshakeMessages.BuildClientHelloWithPsk(
                     clientRandom, sessionId, suites, keyShares,
-                    _pskTicket.Ticket, obfuscatedAge2, new byte[binderLen2],
+                    pskIdentity, obfuscatedAge2, new byte[binderLen2],
                     false, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups); // no 0-RTT after HRR
+                    requestOcspStapling: _requestOcspStapling, certWithExternPsk: _certWithExternPsk,
+                    offeredSigAlgs: _offeredSigAlgs,
+                    offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth); // no 0-RTT after HRR
 
                 // Binder computed over: transcript(message_hash(CH1) || HRR) + truncated(CH2)
                 int bindersLen2 = HandshakeMessages.PskBindersTailLength(binderLen2);
@@ -3735,8 +3867,10 @@ public sealed class TlsConnection : IDisposable
                 binderTranscript2.Update(ch2Msg[..^bindersLen2]);
 
                 byte[] binder2 = HandshakeMessages.ComputePskBinder(
-                    _keySchedule.DeriveBinderKey(), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
+                    _keySchedule.DeriveBinderKey(external: externalPskBinder), binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
                 HandshakeMessages.PatchPskBinder(ch2Msg, binder2);
+                await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
+                _transcript.Update(ch2Msg);
             }
             else if (_echContext != null)
             {
@@ -3750,7 +3884,8 @@ public sealed class TlsConnection : IDisposable
             {
                 ch2Msg = HandshakeMessages.BuildClientHello(
                     clientRandom, sessionId, suites, keyShares, serverName, sh.Cookie, _alpnProtocols,
-                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs, offeredGroups: _offeredGroups);
+                    requestOcspStapling: _requestOcspStapling, offeredSigAlgs: _offeredSigAlgs,
+                    offeredGroups: _offeredGroups, postHandshakeAuth: _offerPostHandshakeAuth);
                 await _record.WriteRecordAsync(ContentType.Handshake, ch2Msg, ct).ConfigureAwait(false);
                 _transcript.Update(ch2Msg);
             }
@@ -3759,6 +3894,7 @@ public sealed class TlsConnection : IDisposable
             (_, shBody) = HandshakeMessages.Unframe(shMsg);
             sh = HandshakeMessages.ParseServerHello(shBody);
             CheckSessionIdEcho(sessionId, sh.SessionId);
+            ValidateServerCipherSuiteOffered(sh.CipherSuite, suites);
 
             if (sh.IsHelloRetryRequest)
                 AlertAndThrow(AlertDescription.UnexpectedMessage, "Second HelloRetryRequest not allowed");
@@ -3769,6 +3905,8 @@ public sealed class TlsConnection : IDisposable
 
         // 5. Set up key schedule
         // draft-ietf-tls-8773bis: cert + external PSK uses the PSK-seeded schedule + full cert handshake.
+        ValidateServerPskSelection(sh, psk, _certWithExternPsk && _externalPsk != null,
+            _pskTicket?.CipherSuite ?? _externalPsk?.Suite);
         bool certWithPsk = sh.CertWithExternPsk && psk != null;
         bool isPskResumption = !certWithPsk && sh.SelectedPskIndex >= 0 && psk != null;
         if (_keySchedule == null || (!isPskResumption && !certWithPsk && psk != null))
@@ -3804,14 +3942,14 @@ public sealed class TlsConnection : IDisposable
         _transcript.Update(eeMsg);
         var (_, eeBody) = HandshakeMessages.Unframe(eeMsg);
         var ee = HandshakeMessages.ParseEncryptedExtensionsEx(eeBody);
-        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt);
+        RejectUnsolicitedEncryptedExtensions(ee, offer0Rtt, isPskResumption);
         bool earlyDataServerAccepted = ee.AcceptEarlyData;
         _negotiatedAlpn = ee.AlpnProtocol;
         _peerCertCompAlgorithm = ee.CertCompressionAlgorithm;
         ApplyPeerRecordSizeLimit(ee.RecordSizeLimit);
         // ECH reject: the server returned a fresh ECHConfigList (retry_configs) for the next attempt.
         if (_echContext != null && !EchAccepted) _echRetryConfigs = ee.EchRetryConfigs;
-        EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt;
+        EarlyDataAccepted = earlyDataServerAccepted && offer0Rtt && isPskResumption;
 
         // 9. PSK resumption: skip to Finished
         if (isPskResumption)
@@ -3858,13 +3996,17 @@ public sealed class TlsConnection : IDisposable
         // 10. Check for CertificateRequest (mTLS) or Certificate / CompressedCertificate
         var (nextMsg, nextType) = await NextHandshakeAnyAsync(ct).ConfigureAwait(false);
         byte[]? certReqContext = null;
+        SignatureScheme[]? certReqSigAlgorithms = null;
 
         if (nextType == HandshakeType.CertificateRequest)
         {
             _transcript.Update(nextMsg);
             var (_, crBody) = HandshakeMessages.Unframe(nextMsg);
-            var (ctx, _, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            var (ctx, sigAlgs, _) = HandshakeMessages.ParseCertificateRequest(crBody);
+            ValidateCertificateContext(ctx, Array.Empty<byte>(),
+                "Initial CertificateRequest certificate_request_context must be empty");
             certReqContext = ctx;
+            certReqSigAlgorithms = sigAlgs;
             _serverCertReqCompAlgs = HandshakeMessages.ParseCertReqCertCompression(crBody);
             (nextMsg, nextType) = await NextHandshakeAnyAsync(ct).ConfigureAwait(false);
         }
@@ -3880,13 +4022,15 @@ public sealed class TlsConnection : IDisposable
         if (nextType == HandshakeType.CompressedCertificate)
         {
             var (_, compBody) = HandshakeMessages.Unframe(nextMsg);
-            certBody = HandshakeMessages.ParseCompressedCertificate(compBody);
+            certBody = HandshakeMessages.ParseCompressedCertificate(compBody, CertCompAdvertise);
         }
         else
         {
             (_, certBody) = HandshakeMessages.Unframe(nextMsg);
         }
-        var (_, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        var (serverCertContext, serverCertEntries) = HandshakeMessages.ParseCertificateEx(certBody);
+        ValidateCertificateContext(serverCertContext, Array.Empty<byte>(),
+            "Server Certificate certificate_request_context must be empty");
         if (serverCertEntries.Count == 0)
             AlertAndThrow(AlertDescription.CertificateRequired, "Server sent empty certificate");
         byte[] serverCertDer = serverCertEntries[0].CertDer;
@@ -3940,6 +4084,7 @@ public sealed class TlsConnection : IDisposable
         {
             if (_certificate != null)
             {
+                ValidateClientCertificateSignatureScheme(certReqSigAlgorithms!, _certificate.SignatureAlgorithm);
                 byte[] clientCertMsg = HandshakeMessages.BuildCertificateMsg(
                     _certificate.DerData, certReqContext, _certificate.ChainCertificates);
                 ushort clientCompAlg = SelectClientCertCompression();
@@ -3996,6 +4141,7 @@ public sealed class TlsConnection : IDisposable
         // ECH: decrypt the inner CH and drive the transcript off it (see the sync server for rationale).
         byte[] transcriptCh = ServerDecryptEch(chMsg, chBody, ref ch);
         _transcript.Update(transcriptCh);
+        _peerAllowsPostHandshakeAuth = ch.OffersPostHandshakeAuth;
 
         // RFC 9149: Store ticket request count
         _ticketRequestCount = ch.TicketRequestCount;
@@ -4007,6 +4153,8 @@ public sealed class TlsConnection : IDisposable
         bool certWithPsk = false;   // draft-ietf-tls-8773bis: cert + external PSK (full cert handshake)
         bool accept0Rtt = false;
         uint pskMaxEarlyData = 0;
+        int selectedPskIndex = -1;
+        bool selectedPskIsExternal = false;
 
         // draft-ietf-tls-8773bis §4: tls_cert_with_extern_psk MUST NOT be combined with early_data.
         if (ch.OffersCertWithExternPsk && ch.OffersEarlyData)
@@ -4045,8 +4193,8 @@ public sealed class TlsConnection : IDisposable
                     var tempKs = new KeySchedule(ticketSuite, psk);
                     byte[] binderKey = tempKs.DeriveBinderKey();
 
-                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders);
+                    byte[] truncatedCh = transcriptCh[..^bindersLen];
                     var binderTranscript = new TranscriptHash(hashAlg);
                     binderTranscript.Update(truncatedCh);
                     byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
@@ -4055,9 +4203,11 @@ public sealed class TlsConnection : IDisposable
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
                         isPskResumption = true;
+                        selectedPskIndex = i;
+                        selectedPskIsExternal = false;
                         suite = ticketSuite;
                         pskMaxEarlyData = maxEarly;
-                        accept0Rtt = _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
+                        accept0Rtt = i == 0 && _accept0Rtt && ch.OffersEarlyData && maxEarly > 0
                             && _ticketEncryption!.TryMarkUsedForEarlyData(identities[i]);
                         break;
                     }
@@ -4077,8 +4227,8 @@ public sealed class TlsConnection : IDisposable
                     var tempKs = new KeySchedule(_externalPsk.Suite, psk);
                     byte[] binderKey = tempKs.DeriveBinderKey(external: true);
 
-                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders[i].Length);
-                    byte[] truncatedCh = chMsg[..^bindersLen];
+                    int bindersLen = HandshakeMessages.PskBindersTailLength(binders);
+                    byte[] truncatedCh = transcriptCh[..^bindersLen];
                     var binderTranscript = new TranscriptHash(hashAlg);
                     binderTranscript.Update(truncatedCh);
                     byte[] expectedBinder = HandshakeMessages.ComputePskBinder(
@@ -4087,6 +4237,8 @@ public sealed class TlsConnection : IDisposable
                     if (CryptographicOperations.FixedTimeEquals(binders[i], expectedBinder))
                     {
                         suite = _externalPsk.Suite;
+                        selectedPskIndex = i;
+                        selectedPskIsExternal = true;
                         if (ch.OffersCertWithExternPsk)
                         {
                             // draft-ietf-tls-8773bis: combine this external PSK with a full cert handshake.
@@ -4098,7 +4250,7 @@ public sealed class TlsConnection : IDisposable
                             pskMaxEarlyData = _externalPsk.MaxEarlyDataSize;
                             // External-PSK 0-RTT anti-replay: single-use the binder (bound to this exact
                             // ClientHello), requires a replay store; without one, fall back to 1-RTT.
-                            accept0Rtt = _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
+                            accept0Rtt = i == 0 && _accept0Rtt && ch.OffersEarlyData && _externalPsk.MaxEarlyDataSize > 0
                                 && _ticketEncryption != null
                                 && _ticketEncryption.TryMarkUsedForEarlyData(binders[i]);
                         }
@@ -4143,40 +4295,34 @@ public sealed class TlsConnection : IDisposable
             byte[] transcriptCh2 = ServerDecryptEch(ch2Msg, ch2Body, ref ch); // ECH: swap CH2 to its inner
             if (_enforceHrrConsistency) CheckHelloRetryConsistency(ch1, ch); // RFC 8446 §4.1.4
 
-            if (isPskResumption && ch.PreSharedKeyData != null)
+            _peerAllowsPostHandshakeAuth = ch.OffersPostHandshakeAuth;
+            if (isPskResumption || certWithPsk)
             {
-                var (identities2, _, binders2) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
-                if (binders2.Length > 0)
+                if (ch.PreSharedKeyData == null)
+                    AlertAndThrow(AlertDescription.MissingExtension,
+                        "Second ClientHello after HRR omitted the selected PSK extension");
+                var (_, _, binders2) = HandshakeMessages.ParsePreSharedKeyExtension(ch.PreSharedKeyData);
+                if (selectedPskIndex >= 0 && selectedPskIndex < binders2.Length)
                 {
-                    int bindersLen2 = HandshakeMessages.PskBindersTailLength(binders2[0].Length);
-                    byte[] truncatedCh2 = ch2Msg[..^bindersLen2];
+                    int bindersLen2 = HandshakeMessages.PskBindersTailLength(binders2);
+                    byte[] truncatedCh2 = transcriptCh2[..^bindersLen2];
                     var binderTranscript2 = _transcript.Clone();
                     binderTranscript2.Update(truncatedCh2);
-                    byte[] binderKey2 = _keySchedule.DeriveBinderKey();
+                    byte[] binderKey2 = _keySchedule.DeriveBinderKey(external: selectedPskIsExternal);
                     byte[] expectedBinder2 = HandshakeMessages.ComputePskBinder(
                         binderKey2, binderTranscript2.GetHash(), _keySchedule.HashAlgorithm);
 
-                    if (!CryptographicOperations.FixedTimeEquals(binders2[0], expectedBinder2))
+                    if (!CryptographicOperations.FixedTimeEquals(binders2[selectedPskIndex], expectedBinder2))
                     {
-                        isPskResumption = false;
-                        psk = null;
-                        accept0Rtt = false;
-                        _keySchedule = new KeySchedule(suite);
-                        _transcript.SetAlgorithm(_keySchedule.HashAlgorithm);
+                        AlertAndThrow(AlertDescription.DecryptError,
+                            "Second ClientHello PSK binder verification failed after HRR");
                     }
                 }
                 else
                 {
-                    isPskResumption = false;
-                    psk = null;
-                    accept0Rtt = false;
+                    AlertAndThrow(AlertDescription.IllegalParameter,
+                        "Second ClientHello after HRR does not contain the selected PSK binder");
                 }
-            }
-            else if (isPskResumption)
-            {
-                isPskResumption = false;
-                psk = null;
-                accept0Rtt = false;
             }
 
             _transcript.Update(transcriptCh2);
@@ -4199,9 +4345,9 @@ public sealed class TlsConnection : IDisposable
         byte[] shMsg;
         if (certWithPsk)
             // draft-ietf-tls-8773bis: echo tls_cert_with_extern_psk + the selected PSK; a full cert handshake follows.
-            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0, certWithExternPsk: true);
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, (ushort)selectedPskIndex, certWithExternPsk: true);
         else if (isPskResumption)
-            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, 0);
+            shMsg = HandshakeMessages.BuildServerHelloWithPsk(serverRandom, ch.SessionId, suite, group, sPub, (ushort)selectedPskIndex);
         else
             shMsg = HandshakeMessages.BuildServerHello(serverRandom, ch.SessionId, suite, group, sPub);
         PatchEchAcceptConfirmation(shMsg); // ECH §7.2 (no-op unless ECH accepted)
@@ -4262,8 +4408,10 @@ public sealed class TlsConnection : IDisposable
                     var (type, payload) = await _record.ReadRecordAsync(ct).ConfigureAwait(false);
                     if (type == ContentType.ApplicationData)
                     {
-                        if (earlyBuf.Length + payload.Length <= pskMaxEarlyData)
-                            earlyBuf.Write(payload);
+                        if (earlyBuf.Length + payload.Length > pskMaxEarlyData)
+                            AlertAndThrow(AlertDescription.UnexpectedMessage,
+                                "0-RTT data exceeded max_early_data_size");
+                        earlyBuf.Write(payload);
                     }
                     else if (type == ContentType.Handshake)
                     {
@@ -4390,10 +4538,21 @@ public sealed class TlsConnection : IDisposable
                 AlertAndThrow(AlertDescription.UnexpectedMessage, $"Expected client Certificate, got {clientCertType}");
             _transcript.Update(clientCertMsg);
             var (_, clientCertRaw) = HandshakeMessages.Unframe(clientCertMsg);
+            if (clientCertType == HandshakeType.CompressedCertificate)
+            {
+                if (clientCertRaw.Length < 2)
+                    AlertAndThrow(AlertDescription.DecodeError, "CompressedCertificate missing algorithm");
+                ushort clientCompAlg = BinaryHelper.ReadUInt16(clientCertRaw.AsSpan(0));
+                if (!_useCertCompression || Array.IndexOf(CertCompAdvertise, clientCompAlg) < 0)
+                    AlertAndThrow(AlertDescription.BadCertificate,
+                        $"Client used an unadvertised certificate compression algorithm: {clientCompAlg}");
+            }
             byte[] clientCertBody = clientCertType == HandshakeType.CompressedCertificate
                 ? HandshakeMessages.ParseCompressedCertificate(clientCertRaw)
                 : clientCertRaw;
-            var (_, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            var (clientCertContext, clientCertEntries) = HandshakeMessages.ParseCertificateEx(clientCertBody);
+            ValidateCertificateContext(clientCertContext, Array.Empty<byte>(),
+                "Initial client Certificate certificate_request_context must be empty");
 
             if (clientCertEntries.Count > 0)
             {

@@ -95,6 +95,8 @@ public sealed class RecordLayer : IDisposable
         if (recordLen > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {recordLen}");
 
+        RejectPlaintextWhenProtected(outerType);
+
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {
             int ctLen = recordLen - _readCipher.TagLength;
@@ -171,6 +173,8 @@ public sealed class RecordLayer : IDisposable
         try
         {
             BinaryHelper.ReadExactInto(_stream, plainRented.AsSpan(0, recordLen));
+            if (outerType == ContentType.ChangeCipherSpec)
+                ValidateChangeCipherSpec(plainRented.AsSpan(0, recordLen));
             var result = new RecordIntoResult(outerType, recordLen, leasedBuffer: plainRented);
             transferred = true;
             return result;
@@ -195,6 +199,8 @@ public sealed class RecordLayer : IDisposable
 
         if (recordLen > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {recordLen}");
+
+        RejectPlaintextWhenProtected(outerType);
 
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {
@@ -268,6 +274,8 @@ public sealed class RecordLayer : IDisposable
         try
         {
             await BinaryHelper.ReadExactIntoAsync(_stream, plainRented.AsMemory(0, recordLen), ct).ConfigureAwait(false);
+            if (outerType == ContentType.ChangeCipherSpec)
+                ValidateChangeCipherSpec(plainRented.AsSpan(0, recordLen));
             var result = new RecordIntoResult(outerType, recordLen, leasedBuffer: plainRented);
             transferred = true;
             return result;
@@ -290,12 +298,19 @@ public sealed class RecordLayer : IDisposable
 
     /// <summary>RFC 8446 §5 validation for an inbound plaintext ChangeCipherSpec record (shared by the sync
     /// and async read paths): payload MUST be a single 0x01, and the running count is bounded.</summary>
-    private void ValidateChangeCipherSpec(byte[] payload)
+    private void ValidateChangeCipherSpec(ReadOnlySpan<byte> payload)
     {
         if (payload.Length != 1 || payload[0] != 0x01)
             throw new TlsException(AlertDescription.UnexpectedMessage, "malformed ChangeCipherSpec (must be a single 0x01)");
         if (++_ccsReceived > MaxChangeCipherSpec)
             throw new TlsException(AlertDescription.UnexpectedMessage, "too many ChangeCipherSpec records");
+    }
+
+    private void RejectPlaintextWhenProtected(ContentType outerType)
+    {
+        if (_readCipher != null && outerType != ContentType.ApplicationData && outerType != ContentType.ChangeCipherSpec)
+            throw new TlsException(AlertDescription.UnexpectedMessage,
+                $"Protected TLS 1.3 records must use outer application_data, got {outerType}");
     }
 
     public (ContentType type, byte[] payload) ReadRecord()
@@ -306,6 +321,8 @@ public sealed class RecordLayer : IDisposable
 
         if (length > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
+
+        RejectPlaintextWhenProtected(outerType);
 
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {
@@ -465,6 +482,8 @@ public sealed class RecordLayer : IDisposable
         if (length > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
 
+        RejectPlaintextWhenProtected(outerType);
+
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {
             byte[] encRented = ArrayPool<byte>.Shared.Rent(length);
@@ -519,6 +538,8 @@ public sealed class RecordLayer : IDisposable
 
         if (length > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
+
+        RejectPlaintextWhenProtected(outerType);
 
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {
@@ -578,6 +599,8 @@ public sealed class RecordLayer : IDisposable
 
         if (length > TlsConst.MaxCiphertextLength)
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
+
+        RejectPlaintextWhenProtected(outerType);
 
         if (_readCipher != null && outerType == ContentType.ApplicationData)
         {

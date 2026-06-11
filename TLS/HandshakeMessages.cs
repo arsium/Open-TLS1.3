@@ -48,11 +48,11 @@ public static class HandshakeMessages
         string? serverName = null, byte[]? cookie = null, string[]? alpnProtocols = null,
         bool requestOcspStapling = false, ushort ticketRequestCount = 0,
         SignatureScheme[]? offeredSigAlgs = null,
-        NamedGroup[]? offeredGroups = null)
+        NamedGroup[]? offeredGroups = null, bool postHandshakeAuth = false)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
             serverName, cookie, null, false, alpnProtocols, requestOcspStapling, ticketRequestCount,
-            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups);
+            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups, postHandshakeAuth: postHandshakeAuth);
     }
 
     /// <summary>Build ClientHello with PSK and optional early_data extension.</summary>
@@ -63,12 +63,12 @@ public static class HandshakeMessages
         string[]? alpnProtocols = null, bool requestOcspStapling = false,
         ushort ticketRequestCount = 0, bool certWithExternPsk = false,
         SignatureScheme[]? offeredSigAlgs = null,
-        NamedGroup[]? offeredGroups = null)
+        NamedGroup[]? offeredGroups = null, bool postHandshakeAuth = false)
     {
         return BuildClientHelloInner(clientRandom, sessionId, suites, keyShares,
             serverName, cookie, (pskIdentity, obfuscatedAge, binderPlaceholder), offerEarlyData,
             alpnProtocols, requestOcspStapling, ticketRequestCount, certWithExternPsk: certWithExternPsk,
-            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups);
+            offeredSigAlgs: offeredSigAlgs, offeredGroups: offeredGroups, postHandshakeAuth: postHandshakeAuth);
     }
 
     /// <summary>
@@ -90,6 +90,13 @@ public static class HandshakeMessages
         return 2 + 1 + binderLen; // list_len(2) + entry_len(1) + binder
     }
 
+    public static int PskBindersTailLength(byte[][] binders)
+    {
+        int len = 2; // binders list length
+        foreach (var binder in binders) len += 1 + binder.Length;
+        return len;
+    }
+
     public static byte[] BuildClientHelloInner(byte[] clientRandom, byte[] sessionId,
         CipherSuite[] suites, (NamedGroup group, byte[] pubKey)[] keyShares,
         string? serverName, byte[]? cookie,
@@ -97,7 +104,7 @@ public static class HandshakeMessages
         string[]? alpnProtocols, bool requestOcspStapling, ushort ticketRequestCount = 0,
         byte[]? echExtensionData = null, bool certWithExternPsk = false,
         SignatureScheme[]? offeredSigAlgs = null,
-        NamedGroup[]? offeredGroups = null)
+        NamedGroup[]? offeredGroups = null, bool postHandshakeAuth = false)
     {
         // ClientHello body fits comfortably in 1-2 KB without PSK; pre-size to avoid
         // most internal regrowths inside ArrayBufferWriter.
@@ -117,7 +124,8 @@ public static class HandshakeMessages
         BinaryHelper.WriteByte(bw, 1); BinaryHelper.WriteByte(bw, 0); // compression_methods = {null}
 
         byte[] ext = BuildClientHelloExtensions(keyShares, serverName, cookie,
-            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, echExtensionData, certWithExternPsk, offeredSigAlgs, offeredGroups);
+            psk, offerEarlyData, alpnProtocols, requestOcspStapling, ticketRequestCount, echExtensionData, certWithExternPsk,
+            offeredSigAlgs, offeredGroups, postHandshakeAuth);
         BinaryHelper.WriteUInt16(bw, (ushort)ext.Length);       // extensions length
         BinaryHelper.WriteBytes(bw, ext);
 
@@ -172,6 +180,7 @@ public static class HandshakeMessages
         bool isOuterCH = false;
         bool offersPskDheKe = false;
         bool offersCertWithExternPsk = false;
+        bool offersPostHandshakeAuth = false;
         bool offersTls13 = false;
 
         if (p < body.Length)
@@ -196,6 +205,8 @@ public static class HandshakeMessages
                     EnsureRemaining(ed, 0, 2, "key_share list length");
                     ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                     EnsureRemaining(ed, 2, listLen, "key_share list");
+                    if (2 + listLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "key_share extension has trailing data");
                     int kp = 2;
                     int kEnd = 2 + listLen;
                     while (kp < kEnd)
@@ -215,6 +226,8 @@ public static class HandshakeMessages
                     if ((groupsLen & 1) != 0)
                         throw new TlsException(AlertDescription.DecodeError, "supported_groups length must be even");
                     EnsureRemaining(ed, 2, groupsLen, "supported_groups list");
+                    if (2 + groupsLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "supported_groups extension has trailing data");
                     int gp = 2;
                     int gEnd = 2 + groupsLen;
                     while (gp < gEnd)
@@ -227,9 +240,14 @@ public static class HandshakeMessages
                 {
                     EnsureRemaining(ed, 0, 5, "server_name header");
                     int sp = 2; // skip list length
+                    ushort serverNameListLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    if (serverNameListLen + 2 != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "server_name extension length mismatch");
                     sp++;       // skip name type
                     ushort nl = BinaryHelper.ReadUInt16(ed.AsSpan(sp)); sp += 2;
                     EnsureRemaining(ed, sp, nl, "server_name host_name");
+                    if (sp + nl != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "server_name extension has trailing data");
                     sni = System.Text.Encoding.ASCII.GetString(ed, sp, nl);
                 }
                 else if (et == ExtensionType.PreSharedKey)
@@ -254,12 +272,16 @@ public static class HandshakeMessages
                     EnsureRemaining(ed, 0, 2, "ALPN list length");
                     ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                     EnsureRemaining(ed, 2, listLen, "ALPN protocol list");
+                    if (2 + listLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "ALPN extension has trailing data");
                     int ap = 2;
                     int apEnd = 2 + listLen;
                     while (ap < apEnd)
                     {
                         EnsureRemaining(ed, ap, 1, "ALPN proto length byte");
                         int pLen = ed[ap++];
+                        if (pLen == 0)
+                            throw new TlsException(AlertDescription.DecodeError, "ALPN protocol name cannot be empty");
                         EnsureRemaining(ed, ap, pLen, "ALPN proto name");
                         protos.Add(System.Text.Encoding.ASCII.GetString(ed, ap, pLen));
                         ap += pLen;
@@ -272,7 +294,11 @@ public static class HandshakeMessages
                     int algBytes = ed[0];
                     if ((algBytes & 1) != 0)
                         throw new TlsException(AlertDescription.DecodeError, "compress_certificate list length must be even");
+                    if (algBytes == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "compress_certificate list cannot be empty");
                     EnsureRemaining(ed, 1, algBytes, "compress_certificate algorithm list");
+                    if (1 + algBytes != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "compress_certificate extension has trailing data");
                     int numAlgs = algBytes / 2;
                     certCompAlgorithms = new ushort[numAlgs];
                     for (int a = 0; a < numAlgs; a++)
@@ -281,46 +307,54 @@ public static class HandshakeMessages
                 else if (et == ExtensionType.TicketRequest)
                 {
                     // RFC 9149 §3: ticket_request_count is a uint16
-                    if (ed.Length >= 2)
-                        ticketRequestCount = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    if (ed.Length != 2)
+                        throw new TlsException(AlertDescription.DecodeError, "ticket_request extension must be exactly 2 bytes");
+                    ticketRequestCount = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                 }
                 else if (et == ExtensionType.PskKeyExchangeModes)
                 {
                     // RFC 8446 §4.2.9: ke_modes<1..255> — list-length byte then 1 byte per mode.
                     // We only do psk_dhe_ke (0x01); record whether the client advertised it so the
                     // server can (a) gate PSK selection on it and (b) decide to issue tickets.
-                    if (ed.Length >= 1)
-                    {
-                        int modesLen = ed[0];
-                        EnsureRemaining(ed, 1, modesLen, "psk_key_exchange_modes list");
-                        for (int m = 0; m < modesLen; m++)
-                            if (ed[1 + m] == 0x01) offersPskDheKe = true; // psk_dhe_ke
-                    }
+                    EnsureRemaining(ed, 0, 1, "psk_key_exchange_modes length");
+                    int modesLen = ed[0];
+                    if (modesLen == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "psk_key_exchange_modes list cannot be empty");
+                    EnsureRemaining(ed, 1, modesLen, "psk_key_exchange_modes list");
+                    if (1 + modesLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "psk_key_exchange_modes extension has trailing data");
+                    for (int m = 0; m < modesLen; m++)
+                        if (ed[1 + m] == 0x01) offersPskDheKe = true; // psk_dhe_ke
                 }
                 else if (et == ExtensionType.SignatureAlgorithms)
                 {
                     // RFC 8446 §4.2.3: signature_algorithms — schemes the client accepts in CertificateVerify
-                    if (ed.Length >= 2)
-                    {
-                        ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
-                        int n = Math.Min(algLen / 2, (ed.Length - 2) / 2);
-                        var algs = new SignatureScheme[n];
-                        for (int i = 0; i < n; i++)
-                            algs[i] = (SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2));
-                        sigAlgs = algs;
-                    }
+                    EnsureRemaining(ed, 0, 2, "signature_algorithms length");
+                    ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    if ((algLen & 1) != 0 || algLen == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "signature_algorithms length must be non-zero and even");
+                    EnsureRemaining(ed, 2, algLen, "signature_algorithms list");
+                    if (2 + algLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "signature_algorithms extension has trailing data");
+                    var algs = new SignatureScheme[algLen / 2];
+                    for (int i = 0; i < algs.Length; i++)
+                        algs[i] = (SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2));
+                    sigAlgs = algs;
                 }
                 else if (et == ExtensionType.SignatureAlgorithmsCert)
                 {
                     // RFC 8446 §4.2.3: signature_algorithms_cert extension
-                    if (ed.Length >= 2)
-                    {
-                        ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
-                        var certSigAlgs = new List<SignatureScheme>();
-                        for (int i = 0; i < algLen / 2; i++)
-                            certSigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
-                        sigAlgsCert = certSigAlgs.ToArray();
-                    }
+                    EnsureRemaining(ed, 0, 2, "signature_algorithms_cert length");
+                    ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    if ((algLen & 1) != 0 || algLen == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert length must be non-zero and even");
+                    EnsureRemaining(ed, 2, algLen, "signature_algorithms_cert list");
+                    if (2 + algLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert extension has trailing data");
+                    var certSigAlgs = new List<SignatureScheme>();
+                    for (int i = 0; i < algLen / 2; i++)
+                        certSigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
+                    sigAlgsCert = certSigAlgs.ToArray();
                 }
                 else if (et == ExtensionType.EncryptedClientHello)
                 {
@@ -328,9 +362,17 @@ public static class HandshakeMessages
                     echData = ed.ToArray();
                     isOuterCH = true; // Presence of ECH extension indicates this is an outer ClientHello
                 }
-                else if (et == ExtensionType.RecordSizeLimit && ed.Length >= 2)
+                else if (et == ExtensionType.RecordSizeLimit)
                 {
+                    if (ed.Length != 2)
+                        throw new TlsException(AlertDescription.DecodeError, "record_size_limit extension must be exactly 2 bytes");
                     recordSizeLimit = BinaryHelper.ReadUInt16(ed.AsSpan()); // RFC 8449
+                }
+                else if (et == ExtensionType.PostHandshakeAuth)
+                {
+                    if (ed.Length != 0)
+                        throw new TlsException(AlertDescription.DecodeError, "post_handshake_auth extension must be empty");
+                    offersPostHandshakeAuth = true;
                 }
                 else if (et == ExtensionType.SupportedVersions)
                 {
@@ -342,12 +384,19 @@ public static class HandshakeMessages
                     if ((svLen & 1) != 0)
                         throw new TlsException(AlertDescription.DecodeError, "supported_versions list length must be even");
                     EnsureRemaining(ed, 1, svLen, "supported_versions list");
+                    if (1 + svLen != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "supported_versions extension has trailing data");
                     for (int sp = 1; sp < 1 + svLen; sp += 2)
                         if (BinaryHelper.ReadUInt16(ed.AsSpan(sp)) == TlsConst.Tls13Version)
                             offersTls13 = true;
                 }
             }
+            if (p != extEnd)
+                throw new TlsException(AlertDescription.DecodeError, "ClientHello extensions length mismatch");
         }
+
+        if (p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "ClientHello has trailing data");
 
         // RFC 8446 §4.2.1: a TLS 1.3 server MUST negotiate the version from supported_versions. This
         // 1.3-only server rejects any ClientHello that doesn't offer 0x0304 there.
@@ -375,7 +424,8 @@ public static class HandshakeMessages
             EncryptedClientHelloData = echData,
             IsOuterClientHello = isOuterCH,
             OffersPskDheKe = offersPskDheKe,
-            OffersCertWithExternPsk = offersCertWithExternPsk
+            OffersCertWithExternPsk = offersCertWithExternPsk,
+            OffersPostHandshakeAuth = offersPostHandshakeAuth
         };
     }
 
@@ -464,7 +514,8 @@ public static class HandshakeMessages
         byte[] sessionId = body[p..(p + sidLen)]; p += sidLen;
 
         var suite = (CipherSuite)BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
-        p++; // compression
+        if (body[p++] != 0)
+            throw new TlsException(AlertDescription.IllegalParameter, "ServerHello legacy_compression_method must be null");
 
         NamedGroup keyShareGroup = 0;
         byte[]? keyShare = null;
@@ -509,7 +560,13 @@ public static class HandshakeMessages
                     int kp = 2;
                     ushort kl = BinaryHelper.ReadUInt16(ed.AsSpan(kp)); kp += 2;
                     EnsureRemaining(ed, kp, kl, "ServerHello key_share key bytes");
+                    if (kp + kl != ed.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "ServerHello key_share has trailing data");
                     keyShare = ed[kp..(kp + kl)];
+                }
+                else if (ed.Length != 2)
+                {
+                    throw new TlsException(AlertDescription.DecodeError, "HelloRetryRequest key_share must contain only selected_group");
                 }
                 // HRR: just the group (2 bytes), keyShare stays null
             }
@@ -518,11 +575,15 @@ public static class HandshakeMessages
                 EnsureRemaining(ed, 0, 2, "cookie length");
                 ushort cookieLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                 EnsureRemaining(ed, 2, cookieLen, "cookie data");
+                if (2 + cookieLen != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "cookie extension has trailing data");
                 cookie = ed[2..(2 + cookieLen)];
             }
             else if (et == ExtensionType.PreSharedKey)
             {
                 EnsureRemaining(ed, 0, 2, "PSK selected_identity");
+                if (ed.Length != 2)
+                    throw new TlsException(AlertDescription.DecodeError, "PSK selected_identity extension must be exactly 2 bytes");
                 selectedPsk = BinaryHelper.ReadUInt16(ed.AsSpan(0));
             }
             else if (et == ExtensionType.CertWithExternPsk)
@@ -534,9 +595,15 @@ public static class HandshakeMessages
                 // RFC 8446 §4.2.1: ServerHello supported_versions carries a single selected_version
                 // (2 bytes, no list prefix). This is the authoritative negotiated version.
                 EnsureRemaining(ed, 0, 2, "ServerHello supported_versions selected_version");
+                if (ed.Length != 2)
+                    throw new TlsException(AlertDescription.DecodeError, "ServerHello supported_versions must be exactly 2 bytes");
                 selectedVersion = BinaryHelper.ReadUInt16(ed.AsSpan(0));
             }
         }
+        if (p != extEnd)
+            throw new TlsException(AlertDescription.DecodeError, "ServerHello extensions length mismatch");
+        if (p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "ServerHello has trailing data");
 
         // RFC 8446 §4.2.1: a TLS 1.3 client MUST check the server selected 0x0304 via
         // supported_versions (legacy_version is pinned at 0x0303 and is not authoritative). A
@@ -545,7 +612,7 @@ public static class HandshakeMessages
             throw new TlsException(AlertDescription.ProtocolVersion,
                 "ServerHello did not select TLS 1.3 via supported_versions (RFC 8446 §4.2.1)");
 
-        if (!isHrr && keyShare == null && selectedPsk < 0)
+        if (!isHrr && keyShare == null)
             throw new TlsException(AlertDescription.MissingExtension, "ServerHello missing KeyShare extension");
 
         return new ParsedServerHello
@@ -621,8 +688,9 @@ public static class HandshakeMessages
         byte[]? echRetryConfigs = null;
 
         int p = 0;
-        if (body.Length < 2) return new ParsedEncryptedExtensions();
+        EnsureRemaining(body, p, 2, "EncryptedExtensions extensions length");
         ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        EnsureRemaining(body, p, extLen, "EncryptedExtensions extensions block");
         int extEnd = p + extLen;
         var seenExts = new HashSet<ExtensionType>();
         while (p < extEnd)
@@ -632,19 +700,34 @@ public static class HandshakeMessages
             if (!seenExts.Add(et))
                 throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate EncryptedExtensions extension: {et}");
             if (et == ExtensionType.EarlyData)
-                earlyData = true;
-            else if (et == ExtensionType.Alpn && ed.Length >= 4)
             {
+                if (ed.Length != 0)
+                    throw new TlsException(AlertDescription.DecodeError, "early_data EncryptedExtensions body must be empty");
+                earlyData = true;
+            }
+            else if (et == ExtensionType.Alpn)
+            {
+                EnsureRemaining(ed, 0, 3, "ALPN selected protocol");
+                ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                if (2 + listLen != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "ALPN EncryptedExtensions length mismatch");
                 int ap = 2; // skip list length
                 int pLen = ed[ap++];
+                if (pLen == 0 || ap + pLen != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "ALPN selected protocol must contain exactly one non-empty name");
                 alpn = System.Text.Encoding.ASCII.GetString(ed, ap, pLen);
             }
-            else if (et == ExtensionType.CertificateCompression && ed.Length >= 3)
+            else if (et == ExtensionType.CertificateCompression)
             {
+                EnsureRemaining(ed, 0, 3, "compress_certificate response");
+                if (ed.Length != 3 || ed[0] != 2)
+                    throw new TlsException(AlertDescription.DecodeError, "compress_certificate response must carry one algorithm");
                 certComp = BinaryHelper.ReadUInt16(ed.AsSpan(1));
             }
-            else if (et == ExtensionType.RecordSizeLimit && ed.Length >= 2)
+            else if (et == ExtensionType.RecordSizeLimit)
             {
+                if (ed.Length != 2)
+                    throw new TlsException(AlertDescription.DecodeError, "record_size_limit extension must be exactly 2 bytes");
                 recordSizeLimit = BinaryHelper.ReadUInt16(ed.AsSpan());
             }
             else if (et == ExtensionType.EncryptedClientHello)
@@ -652,6 +735,8 @@ public static class HandshakeMessages
                 echRetryConfigs = ed.ToArray(); // ECH retry_configs = an ECHConfigList
             }
         }
+        if (p != extEnd || p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "EncryptedExtensions length mismatch");
 
         return new ParsedEncryptedExtensions
         {
@@ -796,16 +881,23 @@ public static class HandshakeMessages
 
         var sigAlgs = new List<SignatureScheme>();
         var certSigAlgs = new List<SignatureScheme>();
+        var seenExts = new HashSet<ExtensionType>();
+        bool sawSignatureAlgorithms = false;
         while (p < extEnd)
         {
             var (et, ed, np) = ReadExtension(body, p); p = np;
+            if (!seenExts.Add(et))
+                throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate CertificateRequest extension: {et}");
             if (et == ExtensionType.SignatureAlgorithms)
             {
+                sawSignatureAlgorithms = true;
                 EnsureRemaining(ed, 0, 2, "signature_algorithms length");
                 ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
-                if ((algLen & 1) != 0)
-                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms length must be even");
+                if ((algLen & 1) != 0 || algLen == 0)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms length must be non-zero and even");
                 EnsureRemaining(ed, 2, algLen, "signature_algorithms list");
+                if (2 + algLen != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms extension has trailing data");
                 for (int i = 0; i < algLen / 2; i++)
                     sigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
             }
@@ -813,13 +905,30 @@ public static class HandshakeMessages
             {
                 EnsureRemaining(ed, 0, 2, "signature_algorithms_cert length");
                 ushort algLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
-                if ((algLen & 1) != 0)
-                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert length must be even");
+                if ((algLen & 1) != 0 || algLen == 0)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert length must be non-zero and even");
                 EnsureRemaining(ed, 2, algLen, "signature_algorithms_cert list");
+                if (2 + algLen != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "signature_algorithms_cert extension has trailing data");
                 for (int i = 0; i < algLen / 2; i++)
                     certSigAlgs.Add((SignatureScheme)BinaryHelper.ReadUInt16(ed.AsSpan(2 + i * 2)));
             }
+            else if (et == ExtensionType.CertificateCompression)
+            {
+                EnsureRemaining(ed, 0, 1, "compress_certificate length byte");
+                int algBytes = ed[0];
+                if ((algBytes & 1) != 0 || algBytes == 0)
+                    throw new TlsException(AlertDescription.DecodeError, "compress_certificate list length must be non-zero and even");
+                EnsureRemaining(ed, 1, algBytes, "compress_certificate algorithm list");
+                if (1 + algBytes != ed.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "compress_certificate extension has trailing data");
+            }
         }
+        if (p != extEnd || p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "CertificateRequest length mismatch");
+        if (!sawSignatureAlgorithms || sigAlgs.Count == 0)
+            throw new TlsException(AlertDescription.MissingExtension,
+                "CertificateRequest missing mandatory signature_algorithms extension");
 
         return (context, sigAlgs.ToArray(), certSigAlgs.Count > 0 ? certSigAlgs.ToArray() : null);
     }
@@ -950,6 +1059,8 @@ public static class HandshakeMessages
 
             entries.Add(new CertEntry { CertDer = certDer, OcspResponse = ocspResponse });
         }
+        if (p != listEnd || p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "Certificate message length mismatch");
 
         return (context, entries);
     }
@@ -973,6 +1084,8 @@ public static class HandshakeMessages
         var scheme = (SignatureScheme)BinaryHelper.ReadUInt16(body.AsSpan(0));
         ushort sigLen = BinaryHelper.ReadUInt16(body.AsSpan(2));
         EnsureRemaining(body, 4, sigLen, "CertificateVerify signature");
+        if (4 + sigLen != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "CertificateVerify has trailing data");
         return (scheme, body[4..(4 + sigLen)]);
     }
 
@@ -1126,10 +1239,14 @@ public static class HandshakeMessages
         {
             EnsureRemaining(data, p, 2, "PSK identity length");
             ushort idLen = BinaryHelper.ReadUInt16(data.AsSpan(p)); p += 2;
+            if (idLen == 0)
+                throw new TlsException(AlertDescription.DecodeError, "PSK identity cannot be empty");
             EnsureRemaining(data, p, idLen + 4, "PSK identity + obfuscated_age");
             identities.Add(data[p..(p + idLen)]); p += idLen;
             ages.Add(BinaryHelper.ReadUInt32(data.AsSpan(p))); p += 4;
         }
+        if (p != idsEnd)
+            throw new TlsException(AlertDescription.DecodeError, "PSK identities length mismatch");
 
         EnsureRemaining(data, p, 2, "PSK binders length");
         ushort bindersLen = BinaryHelper.ReadUInt16(data.AsSpan(p)); p += 2;
@@ -1140,9 +1257,15 @@ public static class HandshakeMessages
         {
             EnsureRemaining(data, p, 1, "PSK binder length");
             int bLen = data[p++];
+            if (bLen < 32)
+                throw new TlsException(AlertDescription.DecodeError, "PSK binder is too short");
             EnsureRemaining(data, p, bLen, "PSK binder data");
             binders.Add(data[p..(p + bLen)]); p += bLen;
         }
+        if (p != bindersEnd || p != data.Length)
+            throw new TlsException(AlertDescription.DecodeError, "PSK binders length mismatch");
+        if (binders.Count != identities.Count)
+            throw new TlsException(AlertDescription.DecodeError, "PSK identity and binder counts differ");
 
         return (identities.ToArray(), ages.ToArray(), binders.ToArray());
     }
@@ -1241,7 +1364,8 @@ public static class HandshakeMessages
         byte[]? echExtensionData = null,
         bool certWithExternPsk = false,
         SignatureScheme[]? offeredSigAlgs = null,
-        NamedGroup[]? offeredGroups = null)
+        NamedGroup[]? offeredGroups = null,
+        bool postHandshakeAuth = false)
     {
         // 768 B fits a typical ClientHello extensions block (a few hundred bytes of
         // groups/sigalgs + key_shares of various sizes). The writer grows if needed.
@@ -1385,6 +1509,9 @@ public static class HandshakeMessages
             BinaryHelper.WriteUInt16(rsl, (ushort)TlsConst.MaxPlaintextLength);
             WriteExtension(bw, ExtensionType.RecordSizeLimit, rsl);
         }
+
+        if (postHandshakeAuth)
+            WriteExtension(bw, ExtensionType.PostHandshakeAuth, ReadOnlySpan<byte>.Empty);
 
         // GREASE extension (RFC 8701): a reserved extension type with empty body
         WriteExtension(bw, (ExtensionType)Grease.Extension, ReadOnlySpan<byte>.Empty);
@@ -1552,8 +1679,20 @@ public static class HandshakeMessages
         uint uncompressedLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
         uint compressedLen = BinaryHelper.ReadUInt24(body.AsSpan(p)); p += 3;
         EnsureRemaining(body, p, (int)compressedLen, "CompressedCertificate payload");
+        if ((long)p + compressedLen != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "CompressedCertificate has trailing data");
         byte[] compressed = body[p..(p + (int)compressedLen)];
         return CertificateCompression.Decompress(compressed, algorithm, (int)uncompressedLen);
+    }
+
+    public static byte[] ParseCompressedCertificate(byte[] body, ushort[]? allowedAlgorithms)
+    {
+        EnsureRemaining(body, 0, 2, "CompressedCertificate algorithm");
+        ushort algorithm = BinaryHelper.ReadUInt16(body.AsSpan(0));
+        if (allowedAlgorithms == null || Array.IndexOf(allowedAlgorithms, algorithm) < 0)
+            throw new TlsException(AlertDescription.BadCertificate,
+                $"CompressedCertificate used an unadvertised algorithm: {algorithm}");
+        return ParseCompressedCertificate(body);
     }
 
     private static byte[] UInt16Bytes(ushort v) => new[] { (byte)(v >> 8), (byte)v };
@@ -1584,6 +1723,7 @@ public sealed class ParsedClientHello
     public bool IsOuterClientHello { get; init; }           // True if this is an ECH outer ClientHello
     public bool OffersPskDheKe { get; init; }               // RFC 8446 §4.2.9: client advertised psk_dhe_ke
     public bool OffersCertWithExternPsk { get; init; }      // draft-ietf-tls-8773bis: cert + external PSK
+    public bool OffersPostHandshakeAuth { get; init; }      // RFC 8446 §4.2.6
 }
 
 /// <summary>A certificate entry from a TLS Certificate message, with optional per-cert extensions.</summary>

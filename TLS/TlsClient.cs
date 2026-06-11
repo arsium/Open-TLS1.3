@@ -5,8 +5,8 @@ using System.Net.Sockets;
 /// <summary>TLS 1.3 client — Connect() to a TLS server and get a TlsStream.</summary>
 public sealed class TlsClient
 {
-    /// <summary>Handshake timeout in milliseconds. 0 = no timeout (default).</summary>
-    public int HandshakeTimeoutMs { get; set; }
+    /// <summary>Handshake timeout in milliseconds. 0 = no timeout.</summary>
+    public int HandshakeTimeoutMs { get; set; } = 10000;
 
     /// <summary>Session ticket store for PSK resumption. Set this to enable automatic ticket storage and resumption.</summary>
     public SessionTicketStore? TicketStore { get; set; }
@@ -19,6 +19,10 @@ public sealed class TlsClient
 
     /// <summary>Request OCSP stapling from the server via the status_request extension.</summary>
     public bool RequestOcspStapling { get; set; }
+
+    /// <summary>Advertise RFC 8446 post_handshake_auth and allow the server to request a client
+    /// certificate after the main handshake. Only meaningful when connecting with a client certificate.</summary>
+    public bool AllowPostHandshakeAuthentication { get; set; }
 
     /// <summary>Override the cipher suites offered in ClientHello (in preference order). Null = stack default.</summary>
     public CipherSuite[]? CipherSuites { get; set; }
@@ -173,6 +177,9 @@ public sealed class TlsClient
 
         if (RequestOcspStapling)
             conn.RequestOcspStapling();
+
+        if (AllowPostHandshakeAuthentication)
+            conn.EnablePostHandshakeAuth();
 
         if (CipherSuites != null)
             conn.SetOfferedCipherSuites(CipherSuites);

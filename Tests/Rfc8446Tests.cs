@@ -16,7 +16,11 @@ public static class Rfc8446Tests
     {
         Section("RFC 8446 hardening (2026-06-08 audit fixes)");
         CompressionMethodMustBeNull();
+        ProtectedRecordsMustUseApplicationDataOuterType();
+        ServerHelloCompressionMethodMustBeNull();
         ServerHelloRejectsUnsolicitedExtension();
+        CertificateRequestRequiresSignatureAlgorithms();
+        ClientHelloSignatureAlgorithmsMustBeExact();
         RsaPssCaChainVerifies();
         HelloRetryCh2Consistency();
     }
@@ -64,9 +68,43 @@ public static class Rfc8446Tests
         // extension check (no supported_versions), so it isn't a clean isolated control.
     }
 
+    private static void ProtectedRecordsMustUseApplicationDataOuterType()
+    {
+        byte[] plaintextHandshakeRecord =
+        {
+            (byte)ContentType.Handshake, 0x03, 0x03, 0x00, 0x01, 0x00
+        };
+        using var ms = new MemoryStream(plaintextHandshakeRecord);
+        using var record = new RecordLayer(ms);
+        record.SetReadCipher(new AeadCipher(new byte[16], new byte[12], AeadAlgorithm.AesGcm));
+        Check("record layer rejects plaintext handshake records after read keys are installed",
+            Throws(() => record.ReadRecord()));
+    }
+
+    private static void ServerHelloCompressionMethodMustBeNull()
+    {
+        Check("ServerHello with non-null legacy_compression_method rejected",
+            Throws(() => HandshakeMessages.ParseServerHello(ServerHelloBody(includeServerName: false, compression: 0x01))));
+    }
+
+    private static void CertificateRequestRequiresSignatureAlgorithms()
+    {
+        Check("CertificateRequest missing mandatory signature_algorithms rejected",
+            Throws(() => HandshakeMessages.ParseCertificateRequest(new byte[] { 0x00, 0x00, 0x00 })));
+    }
+
+    private static void ClientHelloSignatureAlgorithmsMustBeExact()
+    {
+        var exts = new List<byte>();
+        AddExtension(exts, ExtensionType.SupportedVersions, new byte[] { 0x02, 0x03, 0x04 });
+        AddExtension(exts, ExtensionType.SignatureAlgorithms, new byte[] { 0x00, 0x01, 0x04 });
+        Check("ClientHello with malformed signature_algorithms vector rejected",
+            Throws(() => HandshakeMessages.ParseClientHello(ClientHelloHead(new byte[] { 0x00 }, exts.ToArray()))));
+    }
+
     // Minimal ClientHello body: ...legacy_version, random, session_id, cipher_suites, compression,
     // then an empty extensions block. Enough to reach (and exercise) the compression-method check.
-    private static byte[] ClientHelloHead(byte[] compMethods)
+    private static byte[] ClientHelloHead(byte[] compMethods, byte[]? extensions = null)
     {
         var b = new List<byte>();
         b.AddRange(new byte[] { 0x03, 0x03 });               // legacy_version
@@ -75,7 +113,9 @@ public static class Rfc8446Tests
         b.AddRange(new byte[] { 0x00, 0x02, 0x13, 0x01 });   // cipher_suites: TLS_AES_128_GCM_SHA256
         b.Add((byte)compMethods.Length);                     // compression_methods length
         b.AddRange(compMethods);
-        b.AddRange(new byte[] { 0x00, 0x00 });               // extensions length 0
+        extensions ??= Array.Empty<byte>();
+        b.Add((byte)(extensions.Length >> 8)); b.Add((byte)extensions.Length);
+        b.AddRange(extensions);
         return b.ToArray();
     }
 
@@ -89,7 +129,7 @@ public static class Rfc8446Tests
             Throws(() => HandshakeMessages.ParseServerHello(ServerHelloBody(includeServerName: true))));
     }
 
-    private static byte[] ServerHelloBody(bool includeServerName)
+    private static byte[] ServerHelloBody(bool includeServerName, byte compression = 0x00)
     {
         var exts = new List<byte>();
         exts.AddRange(new byte[] { 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 });             // supported_versions = 0x0304
@@ -103,10 +143,19 @@ public static class Rfc8446Tests
         b.AddRange(new byte[32]);                     // random (all-zero → not the HRR sentinel)
         b.Add(0x00);                                  // session_id length 0
         b.AddRange(new byte[] { 0x13, 0x01 });        // cipher_suite
-        b.Add(0x00);                                  // compression
+        b.Add(compression);                           // compression
         b.Add((byte)(exts.Count >> 8)); b.Add((byte)exts.Count);
         b.AddRange(exts);
         return b.ToArray();
+    }
+
+    private static void AddExtension(List<byte> dst, ExtensionType type, byte[] body)
+    {
+        dst.Add((byte)((ushort)type >> 8));
+        dst.Add((byte)(ushort)type);
+        dst.Add((byte)(body.Length >> 8));
+        dst.Add((byte)body.Length);
+        dst.AddRange(body);
     }
 
     // #1 — RFC 4055 / RFC 8446 §4.4.2.4: a CA that signs with RSA-PSS (id-RSASSA-PSS, as most modern
