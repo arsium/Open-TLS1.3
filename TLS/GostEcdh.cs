@@ -57,8 +57,16 @@ internal static class GostEcdh
 
         var prime = CryptoUtils.UnsignedBigIntegerFromLittleEndian(c.Prime);
         var a = CryptoUtils.UnsignedBigIntegerFromLittleEndian(c.A!);
+        var b = CryptoUtils.UnsignedBigIntegerFromLittleEndian(c.B!);
         var cofactor = CryptoUtils.UnsignedBigIntegerFromLittleEndian(c.Cofactor!);
         var d = CryptoUtils.UnsignedBigIntegerFromLittleEndian(priv);
+
+        // Validate the peer point is on the GOST curve before the scalar multiply (invalid-curve
+        // defense). Coordinates are little-endian on the wire, consistent with prime/a/b above.
+        var px = CryptoUtils.UnsignedBigIntegerFromLittleEndian(peerPub[..size]);
+        var py = CryptoUtils.UnsignedBigIntegerFromLittleEndian(peerPub[size..(2 * size)]);
+        if (!IsOnCurve(px, py, a, b, prime))
+            throw new TlsException(AlertDescription.IllegalParameter, "GOST peer point is not on the curve");
 
         var peer = new BigIntegerPoint(new ECPoint
         {
@@ -67,5 +75,15 @@ internal static class GostEcdh
         });
         var shared = BigIntegerPoint.Multiply(peer, cofactor * d, prime, a);
         return CryptoUtils.ToLittleEndian(shared.X, size);
+    }
+
+    // y² ≡ x³ + ax + b (mod p), with both coordinates in [0, p). Rejects off-curve / out-of-range
+    // peer points (an affine wire encoding cannot represent the point at infinity).
+    private static bool IsOnCurve(BigInteger x, BigInteger y, BigInteger a, BigInteger b, BigInteger p)
+    {
+        if (x < BigInteger.Zero || x >= p || y < BigInteger.Zero || y >= p) return false;
+        BigInteger lhs = (y * y) % p;
+        BigInteger rhs = (((x * x) % p) * x + a * x + b) % p;
+        return ((lhs - rhs) % p) == BigInteger.Zero;
     }
 }

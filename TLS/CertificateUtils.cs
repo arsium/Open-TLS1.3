@@ -279,38 +279,160 @@ public static class CertificateUtils
         return HashAlgorithmName.SHA256; // 2.16.840.1.101.3.4.2.1 (SHA-256) or unknown
     }
 
-    /// <summary>Verify that a certificate was signed by the given CA certificate.</summary>
-    public static bool VerifyChain(TlsCertificate cert, TlsCertificate ca)
+    /// <summary>Verify that a certificate was signed directly by the given CA certificate (single
+    /// link). Back-compat overload; equivalent to a chain with no intermediates.</summary>
+    public static bool VerifyChain(TlsCertificate cert, TlsCertificate ca) =>
+        VerifyChain(cert, null, ca);
+
+    /// <summary>
+    /// Validate the presented certificate chain — leaf first, then the intermediates as sent by the
+    /// peer (RFC 8446 §4.4.2) — up to the pinned trust <paramref name="anchor"/>, enforcing the
+    /// RFC 5280 §6.1.4 issuer constraints at every link: the signature verifies, and each issuing
+    /// intermediate has basicConstraints cA=TRUE (§6.1.4(k)), keyUsage keyCertSign set when a
+    /// keyUsage extension is present (§6.1.4(n)), a current validity window, and a pathLenConstraint
+    /// that is not exceeded (§6.1.4(l)/(m)). The anchor is trusted a priori, so its own CA bits are
+    /// not re-examined — only that it signed the topmost presented certificate.
+    /// </summary>
+    public static bool VerifyChain(TlsCertificate leaf, IReadOnlyList<byte[]>? intermediates, TlsCertificate anchor)
     {
-        var (_, certSeqValue, _) = Asn1.ReadTlv(cert.DerData);
+        var chain = new List<byte[]> { leaf.DerData };
+        if (intermediates != null)
+            foreach (var der in intermediates) chain.Add(der);
+
+        // Bound adversarial nesting on every presented certificate before parsing (DoS defense).
+        foreach (var der in chain) Asn1.CheckDepth(der);
+
+        var now = DateTime.UtcNow;
+        for (int i = 0; i < chain.Count; i++)
+        {
+            byte[] issuerPubKey;
+            SignatureScheme issuerKeyType;
+
+            if (i + 1 >= chain.Count)
+            {
+                // Topmost presented cert must be signed by the pinned (pre-trusted) anchor.
+                issuerPubKey = anchor.PublicKey;
+                issuerKeyType = anchor.SignatureAlgorithm;
+            }
+            else
+            {
+                byte[] issuerDer = chain[i + 1];
+                // RFC 5280 §6.1.4 constraints on an intermediate issuer.
+                if (!IsCertCa(issuerDer, out int pathLen)) return false;        // (k) cA = TRUE
+                if (!HasKeyCertSign(issuerDer)) return false;                   // (n) keyCertSign
+                if (!IsWithinValidity(issuerDer, now)) return false;            // issuer not expired
+                int caCertsBelow = i;                                           // intermediates below this issuer
+                if (pathLen >= 0 && caCertsBelow > pathLen) return false;       // (l)/(m) pathLenConstraint
+                (issuerPubKey, issuerKeyType) = ParseCertificatePublicKey(issuerDer);
+            }
+
+            if (!VerifyCertSignedBy(chain[i], issuerPubKey, issuerKeyType)) return false;
+        }
+        return true;
+    }
+
+    // Verify subjectCert's TBS signature against an issuer public key of the given key type. The hash
+    // + padding come from the subject cert's own signatureAlgorithm (agility), not a hard-coded
+    // SHA-256/PKCS#1, so an issuer signing with SHA-384/512 or RSA-PSS verifies correctly.
+    private static bool VerifyCertSignedBy(byte[] subjectCertDer, byte[] issuerPubKey, SignatureScheme issuerKeyType)
+    {
+        var (_, certSeqValue, _) = Asn1.ReadTlv(subjectCertDer);
         var certItems = Asn1.ReadSequenceItems(certSeqValue);
-
         byte[] tbsCertDer = Asn1.Wrap(0x30, certItems[0].value);
-        byte[] sigBitString = certItems[2].value;
-        byte[] signature = sigBitString[1..]; // skip unused-bits byte
+        byte[] signature = certItems[2].value[1..]; // BIT STRING — skip unused-bits byte
 
-        if (MlDsaManaged.IsMlDsa(ca.SignatureAlgorithm))
-            // ML-DSA CA (fully-PQ chain): verify the leaf's TBS signature with the CA's ML-DSA key
-            // (no hash — pure ML-DSA, FIPS 204 / RFC 9881).
-            return MlDsaManaged.Verify(tbsCertDer, signature, ca.PublicKey, ca.SignatureAlgorithm);
+        if (MlDsaManaged.IsMlDsa(issuerKeyType))
+            // ML-DSA issuer (fully-PQ chain): pure ML-DSA over the TBS, no hash (FIPS 204 / RFC 9881).
+            return MlDsaManaged.Verify(tbsCertDer, signature, issuerPubKey, issuerKeyType);
 
-        // Hash + padding named in the cert's signatureAlgorithm, not a hard-coded SHA-256/PKCS#1, so a
-        // CA signing with SHA-384/512 — or with RSA-PSS (id-RSASSA-PSS), as most modern PKIs now do —
-        // verifies correctly instead of being rejected as a bad signature.
         var (hash, isPss) = SigAlgInfo(certItems[1].value);
 
-        if (ca.IsRsa)
+        if (issuerKeyType is SignatureScheme.RsaPssRsaeSha256 or SignatureScheme.RsaPssRsaeSha384)
         {
             using var rsa = RsaManaged.Create();
-            rsa.ImportRSAPublicKey(ca.PublicKey, out _);
+            rsa.ImportRSAPublicKey(issuerPubKey, out _);
             var padding = isPss ? RSASignaturePadding.Pss : RSASignaturePadding.Pkcs1;
             return rsa.VerifyData(tbsCertDer, signature, hash, padding);
         }
-        else
+
+        using var caEcdsa = ImportEcdsaPubKey(issuerPubKey);
+        return caEcdsa.VerifyDataDer(tbsCertDer, signature, hash);
+    }
+
+    // RFC 5280 §4.2.1.9 BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+    //                                                   pathLenConstraint INTEGER (0..MAX) OPTIONAL }.
+    // Returns cA; pathLen = the constraint, or -1 when absent (unbounded).
+    private static bool IsCertCa(byte[] certDer, out int pathLen)
+    {
+        pathLen = -1;
+        byte[]? bcRaw = FindExtension(certDer, OidBasicConstraints);
+        if (bcRaw == null) return false; // no basicConstraints → not a CA (§6.1.4(k))
+        var (_, bcContent, _) = Asn1.ReadTlv(bcRaw);
+        var items = Asn1.ReadSequenceItems(bcContent);
+        bool ca = false;
+        int idx = 0;
+        if (idx < items.Count && items[idx].tag == 0x01) // BOOLEAN cA
         {
-            using var caEcdsa = ImportEcdsaPubKey(ca.PublicKey);
-            return caEcdsa.VerifyDataDer(tbsCertDer, signature, hash);
+            ca = items[idx].value.Length > 0 && items[idx].value[0] != 0;
+            idx++;
         }
+        if (idx < items.Count && items[idx].tag == Asn1.TagInteger) // pathLenConstraint
+        {
+            int v = 0;
+            foreach (byte b in items[idx].value) v = (v << 8) | b;
+            pathLen = v;
+        }
+        return ca;
+    }
+
+    // RFC 5280 §4.2.1.3 KeyUsage. keyCertSign is bit 5 (digitalSignature=0 … keyCertSign=5), MSB-first.
+    // An absent keyUsage extension does not restrict usage (§6.1.4(n)).
+    private static bool HasKeyCertSign(byte[] certDer)
+    {
+        byte[]? kuRaw = FindExtension(certDer, OidKeyUsage);
+        if (kuRaw == null) return true;
+        var (tag, bits, _) = Asn1.ReadTlv(kuRaw);
+        if (tag != Asn1.TagBitString || bits.Length < 2) return false;
+        byte firstOctet = bits[1]; // bits[0] = unused-bit count
+        const int keyCertSign = 5;
+        return (firstOctet & (0x80 >> keyCertSign)) != 0;
+    }
+
+    private static bool IsWithinValidity(byte[] certDer, DateTime now)
+    {
+        try
+        {
+            var (notBefore, notAfter) = ParseCertificateValidity(certDer);
+            return now >= notBefore && now <= notAfter;
+        }
+        catch { return false; }
+    }
+
+    // Return the extnValue bytes (the inner TLV inside the extension's OCTET STRING) for the given
+    // extension OID, or null if the certificate has no such extension.
+    private static byte[]? FindExtension(byte[] certDer, string oid)
+    {
+        var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
+        var certItems = Asn1.ReadSequenceItems(certSeqValue);
+        var tbsItems = Asn1.ReadSequenceItems(certItems[0].value);
+
+        int extIdx = -1;
+        for (int i = 0; i < tbsItems.Count; i++)
+            if (tbsItems[i].tag == 0xA3) { extIdx = i; break; }
+        if (extIdx < 0) return null;
+
+        var (_, extSeqContent, _) = Asn1.ReadTlv(tbsItems[extIdx].value);
+        var extensions = Asn1.ReadSequenceItems(extSeqContent);
+        byte[] oidTlv = Asn1.Oid(oid);
+        foreach (var (_, extSeqValue) in extensions)
+        {
+            var extItems = Asn1.ReadSequenceItems(extSeqValue);
+            if (extItems.Count < 2) continue;
+            byte[] curOid = Asn1.Wrap(extItems[0].tag, extItems[0].value);
+            if (curOid.AsSpan().SequenceEqual(oidTlv))
+                return extItems[^1].value; // extnValue OCTET STRING content (an inner DER TLV)
+        }
+        return null;
     }
 
     // ================================================================
@@ -947,6 +1069,7 @@ public static class CertificateUtils
 
     public static (byte[] publicKey, SignatureScheme sigAlg) ParseCertificatePublicKey(byte[] certDer)
     {
+        Asn1.CheckDepth(certDer);
         var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
         var certItems = Asn1.ReadSequenceItems(certSeqValue);
         var tbsItems = Asn1.ReadSequenceItems(certItems[0].value);
@@ -1018,49 +1141,62 @@ public static class CertificateUtils
         return (notBefore, notAfter);
     }
 
-    /// <summary>Parse Subject Alternative Name dNSName entries from a DER certificate.</summary>
+    /// <summary>
+    /// Parse Subject Alternative Name dNSName entries from a DER certificate.
+    /// An <b>absent</b> SAN extension returns an empty list; a SAN extension that is <b>present but
+    /// malformed</b> throws <see cref="TlsException"/> (decode_error) rather than masquerading as
+    /// "no SANs" — the distinction is material to RFC 6125 §6.4.4 (CN fallback only when no DNS-ID
+    /// is present, which a malformed SAN is not).
+    /// </summary>
     public static List<string> ParseCertificateSAN(byte[] certDer)
     {
         var sans = new List<string>();
+        Asn1.CheckDepth(certDer);
+        var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
+        var certItems = Asn1.ReadSequenceItems(certSeqValue);
+        var tbsItems = Asn1.ReadSequenceItems(certItems[0].value);
+
+        // Find extensions ([3] EXPLICIT = tag 0xA3)
+        int extIdx = -1;
+        for (int i = 0; i < tbsItems.Count; i++)
+            if (tbsItems[i].tag == 0xA3) { extIdx = i; break; }
+        if (extIdx < 0) return sans; // no extensions block → SAN absent
+
+        // Strip the outer Extensions SEQUENCE wrapper before iterating individual extensions
+        var (_, extSeqContent, _) = Asn1.ReadTlv(tbsItems[extIdx].value);
+        var extensions = Asn1.ReadSequenceItems(extSeqContent);
+        byte[] sanOidTlv = Asn1.Oid(OidSubjectAltName);
+
+        byte[]? sanDer = null;
+        foreach (var (_, extSeqValue) in extensions)
+        {
+            var extItems = Asn1.ReadSequenceItems(extSeqValue);
+            if (extItems.Count < 2) continue;
+
+            byte[] oidTlv = Asn1.Wrap(extItems[0].tag, extItems[0].value);
+            if (!oidTlv.AsSpan().SequenceEqual(sanOidTlv)) continue;
+
+            // Last item is the OCTET STRING value containing the GeneralNames SEQUENCE.
+            sanDer = extItems[^1].value;
+            break;
+        }
+        if (sanDer == null) return sans; // SAN extension not present → absent (not malformed)
+
+        // SAN extension IS present: a malformed GeneralNames is a hard decode error, not "no SANs".
         try
         {
-            var (_, certSeqValue, _) = Asn1.ReadTlv(certDer);
-            var certItems = Asn1.ReadSequenceItems(certSeqValue);
-            var tbsItems = Asn1.ReadSequenceItems(certItems[0].value);
-
-            // Find extensions ([3] EXPLICIT = tag 0xA3)
-            int extIdx = -1;
-            for (int i = 0; i < tbsItems.Count; i++)
-                if (tbsItems[i].tag == 0xA3) { extIdx = i; break; }
-            if (extIdx < 0) return sans;
-
-            // Strip the outer Extensions SEQUENCE wrapper before iterating individual extensions
-            var (_, extSeqContent, _) = Asn1.ReadTlv(tbsItems[extIdx].value);
-            var extensions = Asn1.ReadSequenceItems(extSeqContent);
-            byte[] sanOidTlv = Asn1.Oid(OidSubjectAltName);
-
-            foreach (var (_, extSeqValue) in extensions)
+            var (_, sanSeqValue, _) = Asn1.ReadTlv(sanDer);
+            var sanEntries = Asn1.ReadSequenceItems(sanSeqValue);
+            foreach (var (tag, value) in sanEntries)
             {
-                var extItems = Asn1.ReadSequenceItems(extSeqValue);
-                if (extItems.Count < 2) continue;
-
-                byte[] oidTlv = Asn1.Wrap(extItems[0].tag, extItems[0].value);
-                if (!oidTlv.AsSpan().SequenceEqual(sanOidTlv)) continue;
-
-                // Last item is the OCTET STRING value containing GeneralNames SEQUENCE
-                byte[] sanDer = extItems[^1].value;
-                var (_, sanSeqValue, _) = Asn1.ReadTlv(sanDer);
-                var sanEntries = Asn1.ReadSequenceItems(sanSeqValue);
-
-                foreach (var (tag, value) in sanEntries)
-                {
-                    if (tag == 0x82) // dNSName [2] IMPLICIT IA5String
-                        sans.Add(System.Text.Encoding.ASCII.GetString(value));
-                }
-                break;
+                if (tag == 0x82) // dNSName [2] IMPLICIT IA5String
+                    sans.Add(System.Text.Encoding.ASCII.GetString(value));
             }
         }
-        catch { /* cert may be from external source with unexpected structure */ }
+        catch (Exception e) when (e is not TlsException)
+        {
+            throw new TlsException(AlertDescription.DecodeError, "Malformed subjectAltName extension");
+        }
         return sans;
     }
 

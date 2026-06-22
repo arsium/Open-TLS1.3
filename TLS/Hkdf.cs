@@ -38,6 +38,11 @@ public static class Hkdf
     /// the info on the stack (e.g. ExpandLabel) avoid the round-trip through a heap byte[].</summary>
     public static byte[] Expand(HashAlgorithmName hash, byte[] prk, ReadOnlySpan<byte> info, int length)
     {
+        int hashLen = HashLen(hash);
+        if (length < 0 || length > 255 * hashLen)
+            throw new ArgumentOutOfRangeException(
+                nameof(length), $"HKDF output length must be between 0 and 255*HashLen ({255 * hashLen})");
+
         // Streebog and SM3 still go through their one-shot HMACs — those don't expose an
         // incremental API. SHA-2 uses BC's HMac with Init-once / Reset-per-round so we
         // allocate the HMac + KeyParameter exactly once instead of every round.

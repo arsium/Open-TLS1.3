@@ -143,6 +143,9 @@ public static class HandshakeMessages
         byte[] clientRandom = body[p..(p + 32)]; p += 32;
 
         int sidLen = body[p++];
+        // RFC 8446 §4.1.2: legacy_session_id<0..32> — maximum 32 bytes.
+        if (sidLen > 32)
+            throw new TlsException(AlertDescription.DecodeError, "ClientHello legacy_session_id exceeds 32 bytes (RFC 8446 §4.1.2)");
         EnsureRemaining(body, p, sidLen + 2, "ClientHello session_id");
         byte[] sessionId = body[p..(p + sidLen)]; p += sidLen;
 
@@ -243,8 +246,14 @@ public static class HandshakeMessages
                     ushort serverNameListLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
                     if (serverNameListLen + 2 != ed.Length)
                         throw new TlsException(AlertDescription.DecodeError, "server_name extension length mismatch");
+                    // RFC 6066 §3: name_type must be host_name(0).
+                    if (ed[sp] != 0)
+                        throw new TlsException(AlertDescription.IllegalParameter, "server_name: unsupported name_type (must be host_name=0)");
                     sp++;       // skip name type
                     ushort nl = BinaryHelper.ReadUInt16(ed.AsSpan(sp)); sp += 2;
+                    // RFC 6066 §3: HostName<1..2^16-1> — zero-length is not permitted.
+                    if (nl == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "server_name: host_name length is zero");
                     EnsureRemaining(ed, sp, nl, "server_name host_name");
                     if (sp + nl != ed.Length)
                         throw new TlsException(AlertDescription.DecodeError, "server_name extension has trailing data");
@@ -256,6 +265,9 @@ public static class HandshakeMessages
                 }
                 else if (et == ExtensionType.EarlyData)
                 {
+                    // RFC 8446 §4.2.10: ClientHello EarlyDataIndication has an empty body (zero bytes).
+                    if (ed.Length != 0)
+                        throw new TlsException(AlertDescription.DecodeError, "ClientHello early_data extension must have an empty body");
                     offersEarlyData = true;
                 }
                 else if (et == ExtensionType.CertWithExternPsk)
@@ -271,6 +283,9 @@ public static class HandshakeMessages
                     var protos = new List<string>();
                     EnsureRemaining(ed, 0, 2, "ALPN list length");
                     ushort listLen = BinaryHelper.ReadUInt16(ed.AsSpan(0));
+                    // RFC 7301 §3.1: ProtocolNameList<2..2^16-1> — at least one entry required.
+                    if (listLen == 0)
+                        throw new TlsException(AlertDescription.DecodeError, "ALPN ProtocolNameList cannot be empty (RFC 7301 §3.1)");
                     EnsureRemaining(ed, 2, listLen, "ALPN protocol list");
                     if (2 + listLen != ed.Length)
                         throw new TlsException(AlertDescription.DecodeError, "ALPN extension has trailing data");
@@ -510,6 +525,9 @@ public static class HandshakeMessages
         bool isHrr = serverRandom.AsSpan().SequenceEqual(HrrSentinel);
 
         int sidLen = body[p++];
+        // RFC 8446 §4.1.3: legacy_session_id_echo<0..32> — maximum 32 bytes.
+        if (sidLen > 32)
+            throw new TlsException(AlertDescription.DecodeError, "ServerHello legacy_session_id_echo exceeds 32 bytes (RFC 8446 §4.1.3)");
         EnsureRemaining(body, p, sidLen + 2 + 1 + 2, "ServerHello session_id + suite + compression + ext_len");
         byte[] sessionId = body[p..(p + sidLen)]; p += sidLen;
 
@@ -1153,6 +1171,9 @@ public static class HandshakeMessages
         EnsureRemaining(body, p, nonceLen + 2, "NewSessionTicket nonce + ticket_len");
         byte[] nonce = body[p..(p + nonceLen)]; p += nonceLen;
         ushort ticketLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
+        // RFC 8446 §4.6.1: ticket<1..2^16-1> — zero-length ticket is not permitted.
+        if (ticketLen == 0)
+            throw new TlsException(AlertDescription.DecodeError, "NewSessionTicket: ticket length is zero");
         EnsureRemaining(body, p, ticketLen, "NewSessionTicket ticket");
         byte[] ticket = body[p..(p + ticketLen)]; p += ticketLen;
 
@@ -1162,13 +1183,25 @@ public static class HandshakeMessages
             ushort extLen = BinaryHelper.ReadUInt16(body.AsSpan(p)); p += 2;
             EnsureRemaining(body, p, extLen, "NewSessionTicket extensions");
             int extEnd = p + extLen;
+            var seenNstExts = new HashSet<ExtensionType>();
             while (p < extEnd)
             {
                 var (et, ed, np) = ReadExtension(body, p); p = np;
-                if (et == ExtensionType.EarlyData && ed.Length >= 4)
+                if (!seenNstExts.Add(et))
+                    throw new TlsException(AlertDescription.IllegalParameter, $"Duplicate NewSessionTicket extension: {et}");
+                if (et == ExtensionType.EarlyData)
+                {
+                    // RFC 8446 §4.6.1: max_early_data_size is a uint32 (exactly 4 bytes).
+                    if (ed.Length != 4)
+                        throw new TlsException(AlertDescription.DecodeError, "NewSessionTicket early_data extension must be exactly 4 bytes");
                     maxEarlyData = BinaryHelper.ReadUInt32(ed.AsSpan(0));
+                }
             }
+            if (p != body.Length)
+                throw new TlsException(AlertDescription.DecodeError, "NewSessionTicket has trailing data after extensions");
         }
+        else if (p != body.Length)
+            throw new TlsException(AlertDescription.DecodeError, "NewSessionTicket has trailing data");
 
         return new ParsedNewSessionTicket
         {
@@ -1466,6 +1499,10 @@ public static class HandshakeMessages
                 SignatureScheme.Ed25519,
                 SignatureScheme.RsaPssRsaeSha256,
                 SignatureScheme.RsaPssRsaeSha384,
+                // draft-ietf-tls-mldsa: ML-DSA certificate chain signatures
+                SignatureScheme.MlDsa44,
+                SignatureScheme.MlDsa65,
+                SignatureScheme.MlDsa87,
                 // RFC 9963 §3: Legacy RSASSA-PKCS1-v1_5 for certificate verification
                 SignatureScheme.RsaPkcs1Sha256,
                 SignatureScheme.RsaPkcs1Sha384,

@@ -206,4 +206,50 @@ public static class Asn1
         }
         return items;
     }
+
+    /// <summary>
+    /// Defensive bound against adversarially deep DER (stack-exhaustion DoS): walk the constructed
+    /// TLV tree, header-only (no value copies), and reject nesting deeper than <paramref name="maxDepth"/>
+    /// — or any malformed length — with decode_error. The walk's own recursion is bounded by
+    /// <paramref name="maxDepth"/>, so it cannot itself overflow. Call on untrusted (peer) DER before
+    /// parsing. A legitimate X.509 certificate nests only a handful of constructed levels.
+    /// </summary>
+    public static void CheckDepth(ReadOnlySpan<byte> data, int maxDepth = 40)
+    {
+        Walk(data, 0, maxDepth);
+
+        static void Walk(ReadOnlySpan<byte> data, int depth, int maxDepth)
+        {
+            if (depth > maxDepth)
+                throw new TlsException(AlertDescription.DecodeError, "ASN.1 nesting too deep");
+            int pos = 0;
+            while (pos < data.Length)
+            {
+                if (data.Length - pos < 2)
+                    throw new TlsException(AlertDescription.DecodeError, "ASN.1 TLV too short");
+                byte tag = data[pos++];
+                int length;
+                if ((data[pos] & 0x80) == 0)
+                {
+                    length = data[pos++];
+                }
+                else
+                {
+                    int numBytes = data[pos++] & 0x7F;
+                    if (numBytes == 0 || numBytes > 4 || pos + numBytes > data.Length)
+                        throw new TlsException(AlertDescription.DecodeError, "ASN.1 length bytes invalid");
+                    length = 0;
+                    for (int i = 0; i < numBytes; i++)
+                        length = (length << 8) | data[pos++];
+                }
+                if (length < 0 || pos + length > data.Length)
+                    throw new TlsException(AlertDescription.DecodeError, "ASN.1 length exceeds data");
+
+                // Recurse only into constructed values (tag bit 0x20); primitive values are opaque.
+                if ((tag & 0x20) != 0)
+                    Walk(data.Slice(pos, length), depth + 1, maxDepth);
+                pos += length;
+            }
+        }
+    }
 }

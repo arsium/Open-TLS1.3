@@ -92,7 +92,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort recordLen = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (recordLen > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (recordLen > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {recordLen}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -105,6 +106,9 @@ public sealed class RecordLayer : IDisposable
             // below throw a raw ArgumentOutOfRangeException up to the application.
             if (ctLen < 0)
                 throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+            // OTLS13-01: TLSInnerPlaintext (content + type byte + padding) MUST NOT exceed 2^14 + 1.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] encRented = ArrayPool<byte>.Shared.Rent(recordLen);
             byte[]? ptRented = null;
             try
@@ -197,7 +201,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort recordLen = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (recordLen > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (recordLen > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {recordLen}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -210,6 +215,9 @@ public sealed class RecordLayer : IDisposable
             // below throw a raw ArgumentOutOfRangeException up to the application.
             if (ctLen < 0)
                 throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+            // OTLS13-01: TLSInnerPlaintext (content + type byte + padding) MUST NOT exceed 2^14 + 1.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] encRented = ArrayPool<byte>.Shared.Rent(recordLen);
             byte[]? ptRented = null;
             try
@@ -319,7 +327,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (length > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (length > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -334,6 +343,9 @@ public sealed class RecordLayer : IDisposable
             // instead of throwing a raw ArgumentOutOfRangeException from ArrayPool.Rent below.
             if (ctLen < 0)
                 throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+            // OTLS13-01: TLSInnerPlaintext (content + type byte + padding) MUST NOT exceed 2^14 + 1.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] encRented = ArrayPool<byte>.Shared.Rent(length);
             byte[] ptRented = ArrayPool<byte>.Shared.Rent(ctLen);
             try
@@ -394,7 +406,12 @@ public sealed class RecordLayer : IDisposable
                 // single biggest per-record allocation on the encrypt path.
                 int innerLen = chunkLen + 1; // +1 for content type
                 if (PaddingBlockSize > 0)
+                {
                     innerLen = ((innerLen + PaddingBlockSize - 1) / PaddingBlockSize) * PaddingBlockSize;
+                    // RFC 8446 §5.4: TLSInnerPlaintext MUST NOT exceed 2^14 + 1 bytes.
+                    if (innerLen > TlsConst.MaxPlaintextLength + 1)
+                        innerLen = TlsConst.MaxPlaintextLength + 1;
+                }
                 byte[] innerRented = ArrayPool<byte>.Shared.Rent(innerLen);
                 try
                 {
@@ -479,7 +496,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (length > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (length > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -493,6 +511,9 @@ public sealed class RecordLayer : IDisposable
                 ArrayPool<byte>.Shared.Return(encRented);
                 return null;
             }
+            // OTLS13-01: TLSInnerPlaintext MUST NOT exceed 2^14 + 1 bytes.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] ptRented = ArrayPool<byte>.Shared.Rent(ctLen);
             try
             {
@@ -536,7 +557,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (length > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (length > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -550,6 +572,9 @@ public sealed class RecordLayer : IDisposable
                 ArrayPool<byte>.Shared.Return(encRented);
                 return null;
             }
+            // OTLS13-01: TLSInnerPlaintext MUST NOT exceed 2^14 + 1 bytes.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] ptRented = ArrayPool<byte>.Shared.Rent(ctLen);
             try
             {
@@ -597,7 +622,8 @@ public sealed class RecordLayer : IDisposable
         var outerType = (ContentType)header[0];
         ushort length = BinaryHelper.ReadUInt16(header.AsSpan(3));
 
-        if (length > TlsConst.MaxCiphertextLength)
+        // OTLS13-02: unencrypted records are bounded by 2^14 (§5.1); ciphertext by 2^14+256 (§5.2).
+        if (length > (_readCipher != null ? TlsConst.MaxCiphertextLength : TlsConst.MaxPlaintextLength))
             throw new TlsException(AlertDescription.RecordOverflow, $"Record too large: {length}");
 
         RejectPlaintextWhenProtected(outerType);
@@ -609,6 +635,9 @@ public sealed class RecordLayer : IDisposable
             // instead of throwing a raw ArgumentOutOfRangeException from ArrayPool.Rent below.
             if (ctLen < 0)
                 throw new TlsException(AlertDescription.BadRecordMac, "Record too short for AEAD tag");
+            // OTLS13-01: TLSInnerPlaintext (content + type byte + padding) MUST NOT exceed 2^14 + 1.
+            if (ctLen > TlsConst.MaxPlaintextLength + 1)
+                throw new TlsException(AlertDescription.RecordOverflow, "TLSInnerPlaintext exceeds RFC 8446 §5.4 limit");
             byte[] encRented = ArrayPool<byte>.Shared.Rent(length);
             byte[] ptRented = ArrayPool<byte>.Shared.Rent(ctLen);
             try
@@ -662,7 +691,12 @@ public sealed class RecordLayer : IDisposable
 
                 int innerLen = chunkLen + 1; // +1 for content type
                 if (PaddingBlockSize > 0)
+                {
                     innerLen = ((innerLen + PaddingBlockSize - 1) / PaddingBlockSize) * PaddingBlockSize;
+                    // RFC 8446 §5.4: TLSInnerPlaintext MUST NOT exceed 2^14 + 1 bytes.
+                    if (innerLen > TlsConst.MaxPlaintextLength + 1)
+                        innerLen = TlsConst.MaxPlaintextLength + 1;
+                }
 
                 // Mirror the sync path: pool BOTH the plaintext slot and the ciphertext
                 // slot. The encrypted buffer must live across the awaits; ArrayPool

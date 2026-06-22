@@ -37,26 +37,36 @@ public sealed class AeadCipher : IDisposable
     private readonly byte[] _iv; // nonce length: 12 (AES/ChaCha), 16 (Kuznyechik), 8 (Magma)
     private readonly AeadAlgorithm _alg;
     private readonly int _tagLen;
-    private readonly Mgm? _mgm;
+    private Mgm? _mgm;           // GOST: rebuilt per TLSTREE leaf (see EnsureGostRecordKey)
     private readonly Sm4Aead? _sm4;
     private readonly AegisAead? _aegis;
     private readonly ChaCha20Poly1305Managed? _chachaManaged;
     private readonly AesGcmManaged? _aesManaged;
     private ulong _seqNum;
 
-    public AeadCipher(byte[] key, byte[] iv, AeadAlgorithm alg = AeadAlgorithm.AesGcm)
+    // RFC 9367 §4.1.2/§4.1.3 GOST external re-keying (TLSTREE) state — active only for MGM suites.
+    private readonly bool _useTlsTree;
+    private readonly ulong _c1, _c2, _c3; // per-suite TLSTREE masks (Table 1)
+    private readonly ulong _gostSnmax;    // per-suite max records under one traffic key (SNMAX)
+    private ulong _gostLeaf;              // (seqnum & C_3) of the currently-built _mgm
+    private bool _gostMgmBuilt;
+
+    public AeadCipher(byte[] key, byte[] iv, AeadAlgorithm alg = AeadAlgorithm.AesGcm, CipherSuite suite = default)
     {
         _key = (byte[])key.Clone();
         _iv = (byte[])iv.Clone();
         _alg = alg;
         _seqNum = 0;
         _tagLen = alg == AeadAlgorithm.MgmMagma ? 8 : 16;
-        _mgm = alg switch
+
+        if (alg is AeadAlgorithm.MgmKuznyechik or AeadAlgorithm.MgmMagma)
         {
-            AeadAlgorithm.MgmKuznyechik => new Mgm(_key, kuznyechik: true, tagLen: 16),
-            AeadAlgorithm.MgmMagma => new Mgm(_key, kuznyechik: false, tagLen: 8),
-            _ => null
-        };
+            // GOST MGM record keys are re-derived per record from the traffic key via TLSTREE
+            // (RFC 9367 §4.1); the per-suite masks + SNMAX come from §4.1.2/§4.1.3. _mgm is built
+            // lazily in EnsureGostRecordKey when the leaf (seqnum & C_3) first appears or changes.
+            _useTlsTree = true;
+            (_c1, _c2, _c3, _gostSnmax) = GostTlsTreeParams(suite);
+        }
         _sm4 = alg switch
         {
             AeadAlgorithm.Sm4Gcm => new Sm4Aead(_key, ccm: false, tagLen: 16),
@@ -78,10 +88,37 @@ public sealed class AeadCipher : IDisposable
             ? new AesGcmManaged(_key, _tagLen)
             : null;
 
-        // Defence-in-depth: exactly one of the four backends must be wired. An unknown
-        // AeadAlgorithm enum value would otherwise produce a silent NRE on Encrypt/Decrypt.
-        if (_mgm == null && _sm4 == null && _chachaManaged == null && _aesManaged == null && _aegis == null)
+        // Defence-in-depth: exactly one backend must be wired (GOST counts via _useTlsTree). An
+        // unknown AeadAlgorithm enum value would otherwise produce a silent NRE on Encrypt/Decrypt.
+        if (!_useTlsTree && _sm4 == null && _chachaManaged == null && _aesManaged == null && _aegis == null)
             throw new ArgumentException($"Unsupported AEAD algorithm: {alg}", nameof(alg));
+    }
+
+    // RFC 9367 §4.1.2 Table 1 (TLSTREE C_1/C_2/C_3) + §4.1.3 (SNMAX), per GOST cipher suite.
+    private static (ulong c1, ulong c2, ulong c3, ulong snmax) GostTlsTreeParams(CipherSuite suite) => suite switch
+    {
+        CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_L =>
+            (0xf800000000000000UL, 0xfffffff000000000UL, 0xffffffffffffe000UL, ulong.MaxValue),   // 2^64-1
+        CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_L =>
+            (0xffe0000000000000UL, 0xffffffffc0000000UL, 0xffffffffffffff80UL, ulong.MaxValue),   // 2^64-1
+        CipherSuite.TLS_GOSTR341112_256_WITH_KUZNYECHIK_MGM_S =>
+            (0xffffffffe0000000UL, 0xffffffffffff0000UL, 0xfffffffffffffff8UL, (1UL << 42) - 1),  // 2^42-1
+        CipherSuite.TLS_GOSTR341112_256_WITH_MAGMA_MGM_S =>
+            (0xfffffffffc000000UL, 0xffffffffffffe000UL, 0xffffffffffffffffUL, (1UL << 39) - 1),  // 2^39-1
+        _ => throw new ArgumentException($"GOST MGM AEAD requires a GOST cipher suite, got {suite}", nameof(suite))
+    };
+
+    // Re-derive the per-record MGM key when the TLSTREE leaf (seqnum & C_3) changes (RFC 9367 §4.1).
+    // Within a leaf the key is constant, so the GrasshopperManaged/MagmaManaged schedule is reused.
+    private void EnsureGostRecordKey()
+    {
+        ulong leaf = _seqNum & _c3;
+        if (_gostMgmBuilt && _gostLeaf == leaf) return;
+        _mgm?.Dispose();
+        byte[] recordKey = GostKdf.TlsTree(_key, _seqNum, _c1, _c2, _c3);
+        _mgm = new Mgm(recordKey, kuznyechik: _alg == AeadAlgorithm.MgmKuznyechik, tagLen: _tagLen);
+        _gostLeaf = leaf;
+        _gostMgmBuilt = true;
     }
 
     /// <summary>AEAD tag length in bytes for this cipher (16 for AES-GCM/ChaCha/Kuznyechik, 8 for Magma).</summary>
@@ -119,6 +156,7 @@ public sealed class AeadCipher : IDisposable
     public void EncryptInto(ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> aad, Span<byte> output)
     {
         EnforceHardLimit();
+        if (_useTlsTree) EnsureGostRecordKey();
         if (output.Length != plaintext.Length + _tagLen)
             throw new ArgumentException($"output must be plaintext.Length + {_tagLen} bytes");
 
@@ -176,6 +214,7 @@ public sealed class AeadCipher : IDisposable
         // RFC 8446 §5.5: applies to the key not the direction — fail closed if the peer
         // pushed us past the AEAD safety budget without KeyUpdate.
         EnforceHardLimit();
+        if (_useTlsTree) EnsureGostRecordKey();
 
         int ctLen = encrypted.Length - _tagLen;
         if (ctLen < 0)
@@ -249,6 +288,7 @@ public sealed class AeadCipher : IDisposable
     public bool TryDecryptInto(ReadOnlySpan<byte> encrypted, ReadOnlySpan<byte> aad, Span<byte> plaintext)
     {
         EnforceHardLimit();
+        if (_useTlsTree) EnsureGostRecordKey();
         int ctLen = encrypted.Length - _tagLen;
         if (ctLen < 0 || plaintext.Length != ctLen) return false;
 
@@ -299,7 +339,7 @@ public sealed class AeadCipher : IDisposable
         {
             AeadAlgorithm.AesGcm           => AesGcmHardLimit,
             AeadAlgorithm.ChaCha20Poly1305 => ChachaHardLimit,
-            AeadAlgorithm.MgmKuznyechik or AeadAlgorithm.MgmMagma => MgmHardLimit,
+            AeadAlgorithm.MgmKuznyechik or AeadAlgorithm.MgmMagma => _gostSnmax,
             AeadAlgorithm.Sm4Gcm or AeadAlgorithm.Sm4Ccm          => Sm4HardLimit,
             AeadAlgorithm.Aegis128L or AeadAlgorithm.Aegis256     => AegisHardLimit,
             _ => ulong.MaxValue

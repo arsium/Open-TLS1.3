@@ -62,15 +62,29 @@ internal static class EcdhManaged
     public static byte[] DeriveRawSecret(string curveName, byte[] ourScalar, byte[] peerUncompressed)
     {
         var (p, domain) = GetCurve(curveName);
+        try
+        {
+            var ourPriv = new ECPrivateKeyParameters(new BcBigInteger(1, ourScalar), domain);
+            // DecodePoint validates the point lies on the curve (throws on a malformed/off-curve
+            // encoding); reject the identity explicitly. A bad peer key_share must surface as a
+            // clean illegal_parameter alert, not a raw ArgumentException out of the handshake.
+            BcECPoint peerQ = p.Curve.DecodePoint(peerUncompressed);
+            if (peerQ.IsInfinity)
+                throw new TlsException(AlertDescription.IllegalParameter, "Peer ECDH point is the identity");
+            var peerPub = new ECPublicKeyParameters(peerQ, domain);
 
-        var ourPriv = new ECPrivateKeyParameters(new BcBigInteger(1, ourScalar), domain);
-        BcECPoint peerQ = p.Curve.DecodePoint(peerUncompressed);
-        var peerPub = new ECPublicKeyParameters(peerQ, domain);
-
-        var agreement = new ECDHBasicAgreement();
-        agreement.Init(ourPriv);
-        BcBigInteger sharedX = agreement.CalculateAgreement(peerPub);
-        return EcdsaManaged.BigIntegerToFixedBytes(sharedX, (p.N.BitLength + 7) / 8);
+            var agreement = new ECDHBasicAgreement();
+            agreement.Init(ourPriv);
+            BcBigInteger sharedX = agreement.CalculateAgreement(peerPub);
+            return EcdsaManaged.BigIntegerToFixedBytes(sharedX, (p.N.BitLength + 7) / 8);
+        }
+        catch (TlsException) { throw; }
+        catch (Exception e) when (e is ArgumentException or ArithmeticException
+            or FormatException or InvalidOperationException)
+        {
+            throw new TlsException(AlertDescription.IllegalParameter,
+                $"Invalid peer ECDH key_share on {curveName}: {e.Message}");
+        }
     }
 
     private static string NormalizeName(string nameOrOid) => nameOrOid switch

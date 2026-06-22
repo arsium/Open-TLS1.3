@@ -385,8 +385,21 @@ public static class ChineseCrypto
             var c = Sm2P256;
             var px = FromBe(peerPub[1..33]);
             var py = FromBe(peerPub[33..65]);
+            // Validate the peer point is a non-identity affine point on curveSM2 before the scalar
+            // multiply (invalid-curve defense; matches the on-curve check the NIST ECDH path performs).
+            if (!IsValidPoint(c, px, py))
+                throw new TlsException(AlertDescription.IllegalParameter, "SM2 peer point is not on curveSM2");
             var p = Multiply(c, FromBe(privateKey), (px, py))!.Value;
             return ToBe(p.x, 32);
+        }
+
+        /// <summary>True when (x,y) is a non-identity affine point satisfying y² = x³ + ax + b (mod p).</summary>
+        private static bool IsValidPoint(Curve c, BigInteger x, BigInteger y)
+        {
+            if (x < BigInteger.Zero || x >= c.P || y < BigInteger.Zero || y >= c.P) return false;
+            BigInteger lhs = Mod(y * y, c.P);
+            BigInteger rhs = Mod(Mod(x * x, c.P) * x + c.A * x + c.B, c.P);
+            return lhs == rhs;
         }
 
         /// <summary>Compute the public key point X(32)‖Y(32) from a private scalar.</summary>

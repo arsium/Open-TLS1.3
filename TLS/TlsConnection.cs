@@ -414,7 +414,7 @@ public sealed class TlsConnection : IDisposable
 
     private void ValidateCertificateContext(byte[] actual, byte[] expected, string message)
     {
-        if (!actual.AsSpan().SequenceEqual(expected))
+        if (!CryptographicOperations.FixedTimeEquals(actual, expected))
             AlertAndThrow(AlertDescription.IllegalParameter, message);
     }
 
@@ -503,15 +503,33 @@ public sealed class TlsConnection : IDisposable
         s == CipherSuite.TLS_AES_256_GCM_SHA384 ? (HashAlgorithmName.SHA384, 48) : (HashAlgorithmName.SHA256, 32);
 
     // Server: overwrite ServerHello.random[24..32] (offset 30..38 in the framed message) with the
-    // ECH accept-confirmation, when ECH was accepted. No-op otherwise.
+    // ECH accept-confirmation, when ECH was accepted. No-op otherwise. RFC 9849 §7.2 requires the
+    // confirmation be taken over the transcript "up to and including the modified ServerHello" — for
+    // an HRR exchange that is message_hash(CH1inner) ‖ HRR ‖ CH2inner ‖ SH(zeroed), not a standalone
+    // ClientHelloInner ‖ SH. The running _transcript already holds exactly that prefix (it is the
+    // committed inner CH on a normal flow, and the message_hash/HRR/CH2 rewrite after a retry), so we
+    // clone it and append the zeroed ServerHello rather than re-deriving from a single inner CH.
     private void PatchEchAcceptConfirmation(byte[] shMsg)
     {
-        if (!EchAccepted || _echInnerChMsg == null || _echInnerRandom == null) return;
+        if (!EchAccepted || _echInnerRandom == null) return;
         byte[] shZeroed = (byte[])shMsg.Clone();
         Array.Clear(shZeroed, 30, 8);
-        byte[] conf = ComputeEchAcceptConfirmation(_echInnerChMsg, shZeroed, _echInnerRandom,
-            _keySchedule!.HashAlgorithm, _keySchedule.HashLen);
+        byte[] conf = ComputeEchConfFromTranscript(_transcript, shZeroed, _echInnerRandom);
         Buffer.BlockCopy(conf, 0, shMsg, 30, 8);
+    }
+
+    // RFC 9849 §7.2 accept_confirmation over the running handshake transcript: clone the transcript
+    // (so the live one is untouched), append the zeroed ServerHello, and key the HKDF off
+    // ClientHelloInner.random. Used on both sides for the ServerHello confirmation so the HRR and
+    // non-HRR cases fall out from whatever the transcript already contains.
+    private byte[] ComputeEchConfFromTranscript(TranscriptHash baseTranscript, byte[] shMsgZeroed, byte[] innerRandom)
+    {
+        var th = baseTranscript.Clone();
+        th.Update(shMsgZeroed);
+        byte[] confHash = th.GetHash();
+        var hash = _keySchedule!.HashAlgorithm;
+        byte[] secret = Hkdf.Extract(hash, new byte[_keySchedule.HashLen], innerRandom);
+        return Hkdf.ExpandLabel(hash, secret, "ech accept confirmation", confHash, 8);
     }
 
     // Server: patch the HRR accept-confirmation (draft §7.2.1) into the HRR's tail-8 bytes. No-op
@@ -1095,7 +1113,7 @@ public sealed class TlsConnection : IDisposable
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
             if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
-            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead, _keySchedule.Suite));
 
             // Write actual early data under early traffic keys
             if (_earlyData != null && _earlyData.Length > 0)
@@ -1278,6 +1296,20 @@ public sealed class TlsConnection : IDisposable
             CheckDowngradeSentinel(sh.ServerRandom);
             if (sh.CipherSuite != _keySchedule.Suite)
                 AlertAndThrow(AlertDescription.IllegalParameter, "Cipher suite changed after HRR");
+
+            // RFC 9849 §7.2: the post-HRR ServerHello also carries an ECH accept-confirmation, taken
+            // over the full transcript message_hash(CH1inner) ‖ HRR ‖ CH2inner ‖ SH(zeroed). When we
+            // attempted ECH and the HRR signalled acceptance, verify it matches (the running transcript
+            // already holds that prefix), so a server that accepted ECH must prove it consistently.
+            if (_echContext != null && EchAccepted)
+            {
+                byte[] shZeroed = (byte[])shMsg.Clone();
+                Array.Clear(shZeroed, 30, 8);
+                byte[] expected = ComputeEchConfFromTranscript(_transcript, shZeroed, _echContext.InnerRandom);
+                if (!CryptographicOperations.FixedTimeEquals(expected, shMsg.AsSpan(30, 8)))
+                    AlertAndThrow(AlertDescription.IllegalParameter,
+                        "ECH accept-confirmation mismatch in post-HRR ServerHello");
+            }
         }
 
         // 5. Set up key schedule (if not already from PSK/HRR)
@@ -1317,7 +1349,7 @@ public sealed class TlsConnection : IDisposable
 
         // 7. Install server handshake read cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
+        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead, _keySchedule.Suite));
 
         // 8. EncryptedExtensions
         byte[] eeMsg = NextHandshake(HandshakeType.EncryptedExtensions);
@@ -1369,7 +1401,7 @@ public sealed class TlsConnection : IDisposable
 
             // Now switch to handshake keys for Finished
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead, _keySchedule.Suite));
 
             byte[] cfVerify = _keySchedule.ComputeFinishedVerifyData(
                 _keySchedule.ClientHandshakeTrafficSecret!, _transcript.GetHash());
@@ -1432,7 +1464,10 @@ public sealed class TlsConnection : IDisposable
         if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
             PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
-        EnforceServerCertificateTrust(serverCertDer, serverName);
+        byte[][] serverIntermediates = new byte[serverCertEntries.Count - 1][];
+        for (int ci = 1; ci < serverCertEntries.Count; ci++)
+            serverIntermediates[ci - 1] = serverCertEntries[ci].CertDer;
+        EnforceServerCertificateTrust(serverCertDer, serverIntermediates, serverName);
         HandshakePhaseHook.Mark("client/after-Certificate-parsed");
 
         // 12. CertificateVerify
@@ -1480,7 +1515,7 @@ public sealed class TlsConnection : IDisposable
             _record.WriteChangeCipherSpec();
 
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
+        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead, _keySchedule.Suite));
 
         // 16. If mTLS: send client Certificate [+ CertificateVerify]
         if (certReqContext != null)
@@ -1809,7 +1844,7 @@ public sealed class TlsConnection : IDisposable
 
         // 11. Install server handshake write cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
+        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead, _keySchedule.Suite));
 
         // 12. EncryptedExtensions (with ALPN and cert compression negotiation)
         string? negotiatedAlpn = NegotiateAlpn(ch.AlpnProtocols);
@@ -1849,7 +1884,7 @@ public sealed class TlsConnection : IDisposable
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
                 if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
-                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
+                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead, _keySchedule.Suite));
 
                 // Read early data records until EndOfEarlyData
                 using var earlyBuf = new MemoryStream();
@@ -1878,7 +1913,7 @@ public sealed class TlsConnection : IDisposable
 
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
+            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead, _keySchedule.Suite));
 
             // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
             // When the client offered early_data but we rejected it, the client may have
@@ -1989,7 +2024,7 @@ public sealed class TlsConnection : IDisposable
 
         // 19. Install client handshake read cipher
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
+        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead, _keySchedule.Suite));
 
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
@@ -2029,7 +2064,10 @@ public sealed class TlsConnection : IDisposable
                         PublicKey = Array.Empty<byte>(),
                         SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
                     };
-                    if (!CertificateUtils.VerifyChain(clientCertObj, _caCertificate))
+                    byte[][] clientIntermediates = new byte[clientCertEntries.Count - 1][];
+                    for (int ci = 1; ci < clientCertEntries.Count; ci++)
+                        clientIntermediates[ci - 1] = clientCertEntries[ci].CertDer;
+                    if (!CertificateUtils.VerifyChain(clientCertObj, clientIntermediates, _caCertificate))
                         AlertAndThrow(AlertDescription.BadCertificate,
                             "Client certificate not signed by trusted CA");
                 }
@@ -2291,13 +2329,13 @@ public sealed class TlsConnection : IDisposable
         {
             _keySchedule!.UpdateServerAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
         }
         else
         {
             _keySchedule!.UpdateClientAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
         }
     }
 
@@ -2505,7 +2543,10 @@ public sealed class TlsConnection : IDisposable
                 PublicKey = Array.Empty<byte>(),
                 SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
             };
-            if (!CertificateUtils.VerifyChain(clientCertObj, _caCertificate))
+            byte[][] phaIntermediates = new byte[certEntries.Count - 1][];
+            for (int ci = 1; ci < certEntries.Count; ci++)
+                phaIntermediates[ci - 1] = certEntries[ci].CertDer;
+            if (!CertificateUtils.VerifyChain(clientCertObj, phaIntermediates, _caCertificate))
                 AlertAndThrow(AlertDescription.BadCertificate, "Post-handshake client cert not signed by trusted CA");
         }
 
@@ -2560,13 +2601,13 @@ public sealed class TlsConnection : IDisposable
         {
             _keySchedule!.UpdateClientAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
         }
         else
         {
             _keySchedule!.UpdateServerAppTrafficSecret();
             var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+            _record.SetReadCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
         }
 
         if (updateRequested) SendKeyUpdate(false);
@@ -2661,15 +2702,16 @@ public sealed class TlsConnection : IDisposable
         var (ck, ci) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
         var aead = _keySchedule.Aead;
 
+        var suite = _keySchedule.Suite;
         if (_isServer)
         {
-            _record.SetWriteCipher(new AeadCipher(sk, si, aead));
-            _record.SetReadCipher(new AeadCipher(ck, ci, aead));
+            _record.SetWriteCipher(new AeadCipher(sk, si, aead, suite));
+            _record.SetReadCipher(new AeadCipher(ck, ci, aead, suite));
         }
         else
         {
-            _record.SetReadCipher(new AeadCipher(sk, si, aead));
-            _record.SetWriteCipher(new AeadCipher(ck, ci, aead));
+            _record.SetReadCipher(new AeadCipher(sk, si, aead, suite));
+            _record.SetWriteCipher(new AeadCipher(ck, ci, aead, suite));
         }
     }
 
@@ -2981,9 +3023,12 @@ public sealed class TlsConnection : IDisposable
         if (ch.SignatureAlgorithms == null)
             AlertAndThrow(AlertDescription.MissingExtension,
                 "ClientHello for a certificate handshake is missing signature_algorithms (RFC 8446 §9.2)");
-        if (Array.IndexOf(ch.SignatureAlgorithms, _certificate!.SignatureAlgorithm) < 0)
+        // RFC 8446 §4.2.3: signature_algorithms_cert, if present, constrains certificate chain
+        // signature algorithms. If absent, signature_algorithms applies to both.
+        var certSigAlgs = ch.SignatureAlgorithmsCert ?? ch.SignatureAlgorithms;
+        if (Array.IndexOf(certSigAlgs, _certificate!.SignatureAlgorithm) < 0)
             AlertAndThrow(AlertDescription.HandshakeFailure,
-                "Client's signature_algorithms does not include the server certificate's signature scheme");
+                "Client's signature_algorithms_cert does not permit the server certificate's signature scheme");
     }
 
     private (NamedGroup group, byte[] key)? SelectKeyShare(
@@ -3151,19 +3196,34 @@ public sealed class TlsConnection : IDisposable
         }
     }
 
+    // RFC 6125 §6.4.3 / §7.2 wildcard matching. A wildcard is honoured ONLY as a complete
+    // left-most label, and never across a public-suffix-style 2-label name (so a presented
+    // "*.com" / "*.co" never matches). Embedded/partial wildcards ("*foo.example.com") and
+    // wildcards in a non-leftmost label are rejected. Trailing dots are normalised away.
     private static bool MatchHostname(string hostname, string pattern)
     {
-        hostname = hostname.ToLowerInvariant();
-        pattern = pattern.ToLowerInvariant();
+        hostname = hostname.ToLowerInvariant().TrimEnd('.');
+        pattern = pattern.ToLowerInvariant().TrimEnd('.');
+        if (hostname.Length == 0 || pattern.Length == 0) return false;
 
         if (pattern.StartsWith("*."))
         {
-            string suffix = pattern[1..];
-            int dot = hostname.IndexOf('.');
-            if (dot > 0 && hostname[dot..] == suffix)
-                return true;
+            string suffix = pattern[1..];          // ".example.com"
+            if (suffix.IndexOf('*') >= 0) return false; // only one wildcard, in the left-most label
+
+            // Require the suffix to span at least two labels (≥2 dots, i.e. the full pattern is
+            // *.<label>.<label>… with ≥3 labels) so a wildcard can never match a bare public suffix
+            // like *.com.
+            int dots = 0;
+            foreach (char ch in suffix) if (ch == '.') dots++;
+            if (dots < 2) return false;
+
+            int firstDot = hostname.IndexOf('.');
+            if (firstDot <= 0) return false;       // need a non-empty left-most label to replace
+            return hostname[firstDot..] == suffix; // left-most label is wildcarded; rest must match exactly
         }
 
+        if (pattern.IndexOf('*') >= 0) return false; // partial / non-leftmost wildcard → never matches
         return hostname == pattern;
     }
 
@@ -3171,7 +3231,7 @@ public sealed class TlsConnection : IDisposable
     // configured (permissive default). When a validator callback is set it is authoritative;
     // otherwise, when a trust anchor is set, the leaf must be signed by it, be within its validity
     // window, and (when a host was supplied) match a SAN — any failure aborts the handshake.
-    private void EnforceServerCertificateTrust(byte[] serverCertDer, string? serverName)
+    private void EnforceServerCertificateTrust(byte[] serverCertDer, byte[][] intermediates, string? serverName)
     {
         if (_isServer) return;
 
@@ -3193,7 +3253,7 @@ public sealed class TlsConnection : IDisposable
             PublicKey = Array.Empty<byte>(),
             SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
         };
-        if (!CertificateUtils.VerifyChain(leaf, _serverCaCertificate))
+        if (!CertificateUtils.VerifyChain(leaf, intermediates, _serverCaCertificate))
             AlertAndThrow(AlertDescription.UnknownCa,
                 "Server certificate is not signed by the configured trust anchor");
 
@@ -3504,13 +3564,13 @@ public sealed class TlsConnection : IDisposable
             {
                 _keySchedule!.UpdateServerAppTrafficSecret();
                 var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerAppTrafficSecret!);
-                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
             }
             else
             {
                 _keySchedule!.UpdateClientAppTrafficSecret();
                 var (k, iv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientAppTrafficSecret!);
-                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead));
+                _record.SetWriteCipher(new AeadCipher(k, iv, _keySchedule.Aead, _keySchedule.Suite));
             }
         }
         finally { _writeLock.Release(); }
@@ -3722,7 +3782,7 @@ public sealed class TlsConnection : IDisposable
             byte[] earlySecret = _keySchedule.DeriveClientEarlyTrafficSecret(chHash);
             if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlySecret);
             var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlySecret);
-            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(ek, eiv, _keySchedule.Aead, _keySchedule.Suite));
 
             if (_earlyData != null && _earlyData.Length > 0)
             {
@@ -3901,6 +3961,20 @@ public sealed class TlsConnection : IDisposable
             CheckDowngradeSentinel(sh.ServerRandom);
             if (sh.CipherSuite != _keySchedule.Suite)
                 AlertAndThrow(AlertDescription.IllegalParameter, "Cipher suite changed after HRR");
+
+            // RFC 9849 §7.2: the post-HRR ServerHello also carries an ECH accept-confirmation, taken
+            // over the full transcript message_hash(CH1inner) ‖ HRR ‖ CH2inner ‖ SH(zeroed). When we
+            // attempted ECH and the HRR signalled acceptance, verify it matches (the running transcript
+            // already holds that prefix), so a server that accepted ECH must prove it consistently.
+            if (_echContext != null && EchAccepted)
+            {
+                byte[] shZeroed = (byte[])shMsg.Clone();
+                Array.Clear(shZeroed, 30, 8);
+                byte[] expected = ComputeEchConfFromTranscript(_transcript, shZeroed, _echContext.InnerRandom);
+                if (!CryptographicOperations.FixedTimeEquals(expected, shMsg.AsSpan(30, 8)))
+                    AlertAndThrow(AlertDescription.IllegalParameter,
+                        "ECH accept-confirmation mismatch in post-HRR ServerHello");
+            }
         }
 
         // 5. Set up key schedule
@@ -3935,7 +4009,7 @@ public sealed class TlsConnection : IDisposable
 
         // 7. Install server handshake read cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
+        _record.SetReadCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead, _keySchedule.Suite));
 
         // 8. EncryptedExtensions
         byte[] eeMsg = await NextHandshakeAsync(HandshakeType.EncryptedExtensions, ct).ConfigureAwait(false);
@@ -3978,7 +4052,7 @@ public sealed class TlsConnection : IDisposable
             }
 
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
+            _record.SetWriteCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead, _keySchedule.Suite));
 
             byte[] cfVerify = _keySchedule.ComputeFinishedVerifyData(
                 _keySchedule.ClientHandshakeTrafficSecret!, _transcript.GetHash());
@@ -4038,7 +4112,10 @@ public sealed class TlsConnection : IDisposable
         if (_requestOcspStapling && serverCertEntries[0].OcspResponse != null)
             PeerOcspResponse = serverCertEntries[0].OcspResponse;
         ValidatePeerCertificate(serverCertDer, serverName);
-        EnforceServerCertificateTrust(serverCertDer, serverName);
+        byte[][] serverIntermediates = new byte[serverCertEntries.Count - 1][];
+        for (int ci = 1; ci < serverCertEntries.Count; ci++)
+            serverIntermediates[ci - 1] = serverCertEntries[ci].CertDer;
+        EnforceServerCertificateTrust(serverCertDer, serverIntermediates, serverName);
 
         // 12. CertificateVerify
         byte[] preCvHash = _transcript.GetHash();
@@ -4077,7 +4154,7 @@ public sealed class TlsConnection : IDisposable
             await _record.WriteChangeCipherSpecAsync(ct).ConfigureAwait(false);
 
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
+        _record.SetWriteCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead, _keySchedule.Suite));
 
         // 16. If mTLS: send client Certificate [+ CertificateVerify]
         if (certReqContext != null)
@@ -4367,7 +4444,7 @@ public sealed class TlsConnection : IDisposable
 
         // 11. Install server handshake write cipher
         var (sKey, sIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ServerHandshakeTrafficSecret!);
-        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead));
+        _record.SetWriteCipher(new AeadCipher(sKey, sIv, _keySchedule.Aead, _keySchedule.Suite));
 
         // 12. EncryptedExtensions (with ALPN and cert compression negotiation)
         string? negotiatedAlpn = NegotiateAlpn(ch.AlpnProtocols);
@@ -4399,7 +4476,7 @@ public sealed class TlsConnection : IDisposable
                 byte[] earlyTrafficSecret = _keySchedule.DeriveClientEarlyTrafficSecret(earlyTranscript.GetHash());
                 if (_clientRandom != null) KeyLogger.LogEarlyTrafficSecret(_clientRandom, earlyTrafficSecret);
                 var (ek, eiv) = _keySchedule.DeriveKeyAndIv(earlyTrafficSecret);
-                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead));
+                _record.SetReadCipher(new AeadCipher(ek, eiv, _keySchedule.Aead, _keySchedule.Suite));
 
                 using var earlyBuf = new MemoryStream();
                 bool gotEndOfEarlyData = false;
@@ -4427,7 +4504,7 @@ public sealed class TlsConnection : IDisposable
 
             // 15. Install client handshake read cipher
             var (cKey, cIv) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead));
+            _record.SetReadCipher(new AeadCipher(cKey, cIv, _keySchedule.Aead, _keySchedule.Suite));
 
             // 15b. Skip rejected 0-RTT early data via trial decryption (RFC 8446 §4.2.10)
             if (!accept0Rtt && ch.OffersEarlyData)
@@ -4528,7 +4605,7 @@ public sealed class TlsConnection : IDisposable
 
         // 19. Install client handshake read cipher
         var (cKey2, cIv2) = _keySchedule.DeriveKeyAndIv(_keySchedule.ClientHandshakeTrafficSecret!);
-        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead));
+        _record.SetReadCipher(new AeadCipher(cKey2, cIv2, _keySchedule.Aead, _keySchedule.Suite));
 
         // 20. If mTLS: receive client Certificate [+ CertificateVerify]
         if (_requireClientCert)
@@ -4568,7 +4645,10 @@ public sealed class TlsConnection : IDisposable
                         PublicKey = Array.Empty<byte>(),
                         SignatureAlgorithm = SignatureScheme.EcdsaSecp256r1Sha256
                     };
-                    if (!CertificateUtils.VerifyChain(clientCertObj, _caCertificate))
+                    byte[][] clientIntermediates = new byte[clientCertEntries.Count - 1][];
+                    for (int ci = 1; ci < clientCertEntries.Count; ci++)
+                        clientIntermediates[ci - 1] = clientCertEntries[ci].CertDer;
+                    if (!CertificateUtils.VerifyChain(clientCertObj, clientIntermediates, _caCertificate))
                         AlertAndThrow(AlertDescription.BadCertificate,
                             "Client certificate not signed by trusted CA");
                 }

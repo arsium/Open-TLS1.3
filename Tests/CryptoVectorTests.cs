@@ -26,6 +26,65 @@ public static class CryptoVectorTests
         HpkeKnownAnswer();
         AegisKat();
         MlDsaRoundTrip();
+        TlsTreeKat();
+        Release21Regressions();
+    }
+
+    // RFC 9367 §4.1.2 TLSTREE known-answer test, from RFC 9367 Appendix A (Kuznyechik_MGM_S, whose
+    // C_3 = 0x..fff8 puts seqnums 0-7 in one leaf and 8 in the next). Validates the KDF framing,
+    // STR_8 endianness, and the per-leaf re-keying that the GOST loopback (same impl both ends)
+    // cannot prove on its own.
+    private static void TlsTreeKat()
+    {
+        Section("TLSTREE (RFC 9367 §4.1.2 / Appendix A)");
+        byte[] k = H("475E4C514CC6318C3A5F000F1265BD1AB5F0DE1AF357ED0079EC5FF0AFBD030C");
+        const ulong c1 = 0xffffffffe0000000UL, c2 = 0xffffffffffff0000UL, c3 = 0xfffffffffffffff8UL;
+        Eq("TLSTREE(K,0) Kuznyechik_S", X(GostKdf.TlsTree(k, 0, c1, c2, c3)),
+            "c8fc93d7c586f2b0a3101baa6a979e4e3886706551e81187e97880409c7e8ee9");
+        Eq("TLSTREE(K,8) crosses C_3 leaf", X(GostKdf.TlsTree(k, 8, c1, c2, c3)),
+            "d3cd87d5687407823978344c06b928a85898b739a31d3de5ff2b788ef39196ed");
+        Check("TLSTREE 0..7 share a leaf", Eqb(GostKdf.TlsTree(k, 0, c1, c2, c3), GostKdf.TlsTree(k, 7, c1, c2, c3)));
+        Check("TLSTREE re-keys at 8", !Eqb(GostKdf.TlsTree(k, 0, c1, c2, c3), GostKdf.TlsTree(k, 8, c1, c2, c3)));
+    }
+
+    // Regression coverage for the 2.1.0 security fixes (chain validation, national-ECDH point
+    // validation, DER depth bound). The happy paths are already exercised by the loopback suite;
+    // these lock in the negative cases the fixes introduced.
+    private static void Release21Regressions()
+    {
+        Section("2.1.0 regression fixes");
+
+        // C-01: chain walk + RFC 5280 §6.1.4 issuer checks.
+        var root = CertificateUtils.GenerateCA("Test Root", 365);
+        var other = CertificateUtils.GenerateCA("Other Root", 365);
+        var leafA = CertificateUtils.IssueCertificate("a.example.com", root, CertificateProfile.Server, 365);
+        var leafB = CertificateUtils.IssueCertificate("b.example.com", root, CertificateProfile.Server, 365);
+        Check("C-01 leaf signed by anchor verifies", CertificateUtils.VerifyChain(leafA, root));
+        Check("C-01 wrong anchor rejected", !CertificateUtils.VerifyChain(leafA, other));
+        // A CA:FALSE leaf presented as an intermediate must be rejected (§6.1.4(k) cA=TRUE).
+        Check("C-01 non-CA intermediate rejected",
+            !CertificateUtils.VerifyChain(leafA, new[] { leafB.DerData }, root));
+
+        // NAT-06: SM2 ECDH rejects an off-curve peer point.
+        var (privA, _) = ChineseCrypto.SM2.EcdhGenerateKeyPair();
+        var (_, pubB) = ChineseCrypto.SM2.EcdhGenerateKeyPair();
+        Check("NAT-06 valid SM2 point accepted", ChineseCrypto.SM2.EcdhSharedSecret(privA, pubB).Length == 32);
+        byte[] offCurve = (byte[])pubB.Clone();
+        offCurve[40] ^= 0x01; // perturb a Y byte → no longer on curveSM2
+        bool sm2Rejected = false;
+        try { ChineseCrypto.SM2.EcdhSharedSecret(privA, offCurve); }
+        catch (TlsException) { sm2Rejected = true; }
+        Check("NAT-06 off-curve SM2 point rejected", sm2Rejected);
+
+        // C-05: ASN.1 depth bound rejects pathologically nested DER, accepts normal certs.
+        byte[] nested = new byte[] { 0x05, 0x00 }; // NULL
+        for (int i = 0; i < 100; i++) nested = Asn1.Wrap(0x30, nested);
+        bool depthRejected = false;
+        try { Asn1.CheckDepth(nested); } catch (TlsException) { depthRejected = true; }
+        Check("C-05 over-deep DER rejected", depthRejected);
+        bool shallowOk = true;
+        try { Asn1.CheckDepth(root.DerData); } catch { shallowOk = false; }
+        Check("C-05 normal certificate accepted", shallowOk);
     }
 
     // ML-DSA (FIPS 204) via the BouncyCastle-backed wrapper: fixed key/signature sizes per parameter
